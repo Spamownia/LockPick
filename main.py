@@ -75,7 +75,7 @@ if not log_files:
 
 # --- PRZETWARZANIE WSZYSTKICH PLIKÓW ---
 data = {}
-user_lock_times = defaultdict(lambda: defaultdict(list))
+player_summary = {}  # <--- SUMARYCZNE DANE POD PODIUM
 
 for log_file in log_files:
     print(f"[INFO] Przetwarzanie: {log_file}")
@@ -107,7 +107,18 @@ for log_file in log_files:
             data[key]["failed_attempts"] += 1
 
         data[key]["times"].append(elapsed)
-        user_lock_times[nick][lock_type].append(elapsed)
+
+        # --- SUMARYCZNE POD PODIUM ---
+        if nick not in player_summary:
+            player_summary[nick] = {
+                "all_attempts": 0,
+                "successful_attempts": 0,
+                "times": []
+            }
+        player_summary[nick]["all_attempts"] += 1
+        if success == "Yes":
+            player_summary[nick]["successful_attempts"] += 1
+        player_summary[nick]["times"].append(elapsed)
 
 ftp.quit()
 
@@ -181,20 +192,22 @@ for row in admin_csv_rows[1:]:
 summary_block += "```"
 send_discord(summary_block, WEBHOOK_TABLE2)
 
-# --- TABELA PODIUM ---
+# --- TABELA PODIUM (SUMARYCZNE PER GRACZ) ---
 podium_block = "```\n"
 podium_block += "           🏆 PODIUM           \n"
 podium_block += "--------------------------------\n"
 podium_block += f"{'Miejsce':<8} {'Nick':<10} {'Skuteczność':<12} {'Średni czas':<10}\n"
 
+# --- PRZYGOTOWANIE PODIUM ---
 podium = []
-for (nick, lock_type), stats in sorted_data:
+for nick, stats in player_summary.items():
     all_attempts = stats["all_attempts"]
-    succ = stats["successful_attempts"]
-    eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
+    successful_attempts = stats["successful_attempts"]
+    eff = round(100 * successful_attempts / all_attempts, 2) if all_attempts else 0
     avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
     podium.append((nick, eff, avg))
 
+# Sortowanie: skuteczność malejąco, średni czas rosnąco
 podium = sorted(podium, key=lambda x: (-x[1], x[2]))[:5]
 medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
 
