@@ -18,6 +18,7 @@ import statistics
 import requests
 import base64
 import os
+import time
 from collections import defaultdict
 from ftplib import FTP
 from io import BytesIO
@@ -28,7 +29,7 @@ def send_discord(content, webhook_url):
     requests.post(webhook_url, json={"content": content})
 
 # --- FUNKCJA AKTUALIZACJI PLIKU W GITHUB ---
-def update_github_file(repo, path, message, new_content, branch="main"):
+def append_github_file(repo, path, message, append_content, branch="main"):
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         print("[ERROR] Brak GITHUB_TOKEN w zmiennych środowiskowych")
@@ -41,14 +42,15 @@ def update_github_file(repo, path, message, new_content, branch="main"):
 
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
 
-    # Pobierz SHA aktualnego pliku (wymagane do zapisu)
+    # Pobierz SHA i aktualną zawartość
     r = requests.get(url, headers=headers, params={"ref": branch})
     if r.status_code == 200:
         sha = r.json()["sha"]
         existing_content = base64.b64decode(r.json()["content"]).decode("utf-8")
-        new_content = existing_content + "\n" + new_content  # dopisz nowe dane
+        new_content = existing_content + "\n" + append_content
     elif r.status_code == 404:
-        sha = None  # plik nie istnieje
+        sha = None
+        new_content = append_content
     else:
         print(f"[ERROR] Nie można pobrać pliku: {r.status_code} {r.text}")
         return
@@ -95,8 +97,8 @@ pattern = re.compile(
 lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
 
 # --- FUNKCJA GŁÓWNA ---
-def process_all_logs():
-    print("[DEBUG] Rozpoczynam pobieranie wszystkich logów...")
+def process_new_entries(seen_lines):
+    print("[DEBUG] Sprawdzam nowe linie logu...")
 
     ftp = FTP()
     ftp.connect(FTP_IP, FTP_PORT)
@@ -110,17 +112,30 @@ def process_all_logs():
     if not log_files:
         print("[ERROR] Brak plików gameplay_*.log na FTP.")
         ftp.quit()
-        return
+        return seen_lines
 
-    data = {}
+    latest_log = log_files[-1]
+    print(f"[INFO] Najnowszy log: {latest_log}")
+
+    with BytesIO() as bio:
+        ftp.retrbinary(f"RETR {latest_log}", bio.write)
+        log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
+
+    ftp.quit()
+
+    new_lines = [line for line in log_text.splitlines() if line not in seen_lines]
+    if not new_lines:
+        print("[INFO] Brak nowych linii.")
+        return seen_lines
+
+    print(f"[INFO] Znaleziono {len(new_lines)} nowych linii.")
+
+    data_rows = []
     user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
 
-    for log_name in log_files:
-        print(f"[INFO] Przetwarzanie logu: {log_name}")
-        with BytesIO() as bio:
-            ftp.retrbinary(f"RETR {log_name}", bio.write)
-            log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
-        for match in pattern.finditer(log_text):
+    for line in new_lines:
+        match = pattern.search(line)
+        if match:
             nick = match.group("nick")
             lock_type = match.group("lock_type")
             success = match.group("success")
@@ -131,48 +146,35 @@ def process_all_logs():
             if success == "Yes":
                 user_summary[nick]["success"] += 1
 
-            key = (nick, lock_type)
-            if key not in data:
-                data[key] = {"all_attempts": 0, "successful_attempts": 0, "failed_attempts": 0, "times": []}
+            all_attempts = 1
+            succ = 1 if success == "Yes" else 0
+            fail = 1 - succ
+            avg = round(elapsed,2)
+            eff = round(100 * succ / all_attempts, 2)
 
-            data[key]["all_attempts"] += 1
-            if success == "Yes":
-                data[key]["successful_attempts"] += 1
-            else:
-                data[key]["failed_attempts"] += 1
-            data[key]["times"].append(elapsed)
+            data_rows.append([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
 
-    ftp.quit()
+    # --- Generowanie CSV append ---
+    csv_append = ""
+    for row in data_rows:
+        csv_append += ",".join(map(str, row)) + "\n"
 
-    # --- GENEROWANIE CSV ---
-    csv_rows = []
-    sorted_data = sorted(data.items(), key=lambda x: (x[0][0], lock_order.get(x[0][1], 99)))
-    for (nick, lock_type), stats in sorted_data:
-        all_attempts = stats["all_attempts"]
-        succ = stats["successful_attempts"]
-        fail = stats["failed_attempts"]
-        avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
-        eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
-        csv_rows.append([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
-
-    csv_content = "Nick,Rodzaj zamka,Ilość wszystkich prób,Ilość udanych prób,Ilość nieudanych prób,Skuteczność,Śr. czas\n"
-    for row in csv_rows:
-        csv_content += ",".join(map(str, row)) + "\n"
-
-    # --- ZAPIS DO GITHUB ---
-    update_github_file(
-        repo="Spamownia/LockPick",  # <<<<<< ZMIEŃ NA SWOJE
+    # --- Append do GitHub ---
+    append_github_file(
+        repo="Spamownia/LockPick",  # <<<< ZMIEŃ NA SWOJE
         path="stats/logi.csv",
-        message="Aktualizacja logi.csv przez Render",
-        new_content=csv_content
+        message="Append nowych logów",
+        append_content=csv_append
     )
 
-    # --- WYSYŁKA TABEL NA DISCORD ---
-    # Tutaj możesz wstawić swoje funkcje generujące i wysyłające table_block, admin_block, podium_block
+    # --- Wysyłka Discord (opcjonalna) ---
     # send_discord(table_block, WEBHOOK_TABLE1)
-    # send_discord(admin_block, WEBHOOK_TABLE2)
-    # send_discord(podium_block, WEBHOOK_TABLE3)
 
-# --- URUCHOMIENIE ---
+    return seen_lines + new_lines
+
+# --- PĘTLA ---
 if __name__ == "__main__":
-    process_all_logs()
+    seen_lines = []
+    while True:
+        seen_lines = process_new_entries(seen_lines)
+        time.sleep(60)
