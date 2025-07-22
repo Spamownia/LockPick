@@ -244,3 +244,18 @@ while True:
 
     print("[INFO] Wysłano zaktualizowane tabele. Oczekiwanie 60s...")
     time.sleep(60)
+
+# 🔷 Flask server setup
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Alive"
+
+if __name__ == "__main__":
+    # Uruchom główną pętlę w osobnym wątku
+    t = threading.Thread(target=main_loop, daemon=True)
+    t.start()
+
+    # Uruchom serwer Flask na 0.0.0.0:10000
+    app.run(host='0.0.0.0', port=10000)
