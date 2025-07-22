@@ -33,9 +33,9 @@ FTP_PASS = "LXNdGShY"
 FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
 
 # --- WEBHOOKI ---
-WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE2 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE3 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/..."
+WEBHOOK_TABLE2 = WEBHOOK_TABLE1
+WEBHOOK_TABLE3 = WEBHOOK_TABLE1
 
 # --- WZORZEC ---
 pattern = re.compile(
@@ -71,7 +71,7 @@ def process_all_logs():
     print(f"[INFO] Znaleziono {len(log_files)} logów.")
 
     data = {}
-    user_lock_times = defaultdict(lambda: defaultdict(list))
+    user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
 
     for log_name in log_files:
         print(f"[INFO] Przetwarzanie logu: {log_name}")
@@ -85,6 +85,13 @@ def process_all_logs():
             success = match.group("success")
             elapsed = float(match.group("elapsed"))
 
+            # Sumowanie dla tabeli podium
+            user_summary[nick]["total"] += 1
+            user_summary[nick]["times"].append(elapsed)
+            if success == "Yes":
+                user_summary[nick]["success"] += 1
+
+            # Dane szczegółowe per nick + lock_type
             key = (nick, lock_type)
             if key not in data:
                 data[key] = {
@@ -101,7 +108,6 @@ def process_all_logs():
                 data[key]["failed_attempts"] += 1
 
             data[key]["times"].append(elapsed)
-            user_lock_times[nick][lock_type].append(elapsed)
 
     ftp.quit()
     print(f"[DEBUG] Zebrano dane z {len(data)} rekordów.")
@@ -171,12 +177,14 @@ def process_all_logs():
     # --- TABELA PODIUM ---
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
     ranking = []
-    for nick in user_lock_times:
-        times_all = [t for lock in user_lock_times[nick].values() for t in lock]
-        total_attempts = len(times_all)
-        total_success = sum(len(lock) for lock in user_lock_times[nick].values())
+    for nick, summary in user_summary.items():
+        total_attempts = summary["total"]
+        total_success = summary["success"]
+        times_all = summary["times"]
+
         eff = round(100 * total_success / total_attempts, 2) if total_attempts else 0
-        avg = round(statistics.mean(times_all), 2) if total_attempts else 0
+        avg = round(statistics.mean(times_all), 2) if times_all else 0
+
         ranking.append((nick, eff, avg))
 
     ranking = sorted(ranking, key=lambda x: (-x[1], x[2]))[:5]
