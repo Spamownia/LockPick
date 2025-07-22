@@ -1,14 +1,12 @@
 # --- AUTOMATYCZNA INSTALACJA (cicho) ---
 import subprocess
 import sys
-
 def silent_install(package):
     try:
         __import__(package)
     except ImportError:
         subprocess.run([sys.executable, "-m", "pip", "install", package],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
 silent_install("requests")
 
 # --- IMPORTY ---
@@ -19,11 +17,39 @@ import requests
 from collections import defaultdict
 from ftplib import FTP
 from io import BytesIO
+import os
 
 # --- FUNKCJA WYSYŁANIA NA DISCORD ---
 def send_discord(content, webhook_url):
     print("[DEBUG] Wysyłanie na webhook...")
     requests.post(webhook_url, json={"content": content})
+
+# --- FUNKCJA GIT COMMIT & PUSH ---
+def git_commit_push(files, message):
+    GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+    if not GITHUB_TOKEN:
+        print("[ERROR] Brak GITHUB_TOKEN w zmiennych środowiskowych.")
+        return
+
+    try:
+        # Ustaw usera
+        subprocess.run(["git", "config", "--global", "user.email", "twojemail@example.com"])
+        subprocess.run(["git", "config", "--global", "user.name", "Twoje Imie"])
+
+        # Pobierz aktualny remote url
+        repo_url = subprocess.check_output(["git", "config", "--get", "remote.origin.url"]).decode().strip()
+        if "@" not in repo_url:
+            repo_url = repo_url.replace("https://", f"https://{GITHUB_TOKEN}@")
+            subprocess.run(["git", "remote", "set-url", "origin", repo_url], check=True)
+
+        # Add, commit, push
+        subprocess.run(["git", "add"] + files, check=True)
+        subprocess.run(["git", "commit", "-m", message], check=True)
+        subprocess.run(["git", "push"], check=True)
+
+        print("[INFO] Zmiany zostały wypchnięte do GitHuba.")
+    except subprocess.CalledProcessError as e:
+        print(f"[ERROR] Błąd git: {e}")
 
 # --- KONFIGURACJA FTP ---
 FTP_IP = "176.57.174.10"
@@ -53,45 +79,34 @@ lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock":
 # --- FUNKCJA GŁÓWNA ---
 def process_all_logs():
     print("[DEBUG] Rozpoczynam pobieranie wszystkich logów...")
-
     ftp = FTP()
     ftp.connect(FTP_IP, FTP_PORT)
     ftp.login(FTP_USER, FTP_PASS)
     ftp.cwd(FTP_PATH)
-
     log_files = []
     ftp.retrlines("MLSD", lambda line: log_files.append(line.split(";")[-1].strip()))
     log_files = sorted([f for f in log_files if f.startswith("gameplay_") and f.endswith(".log")])
-
     if not log_files:
         print("[ERROR] Brak plików gameplay_*.log na FTP.")
         ftp.quit()
         return
-
     print(f"[INFO] Znaleziono {len(log_files)} logów.")
-
     data = {}
     user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
-
     for log_name in log_files:
         print(f"[INFO] Przetwarzanie logu: {log_name}")
         with BytesIO() as bio:
             ftp.retrbinary(f"RETR {log_name}", bio.write)
             log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
-
         for match in pattern.finditer(log_text):
             nick = match.group("nick")
             lock_type = match.group("lock_type")
             success = match.group("success")
             elapsed = float(match.group("elapsed"))
-
-            # Sumowanie dla tabeli podium
             user_summary[nick]["total"] += 1
             user_summary[nick]["times"].append(elapsed)
             if success == "Yes":
                 user_summary[nick]["success"] += 1
-
-            # Dane szczegółowe per nick + lock_type
             key = (nick, lock_type)
             if key not in data:
                 data[key] = {
@@ -100,43 +115,35 @@ def process_all_logs():
                     "failed_attempts": 0,
                     "times": [],
                 }
-
             data[key]["all_attempts"] += 1
             if success == "Yes":
                 data[key]["successful_attempts"] += 1
             else:
                 data[key]["failed_attempts"] += 1
-
             data[key]["times"].append(elapsed)
-
     ftp.quit()
     print(f"[DEBUG] Zebrano dane z {len(data)} rekordów.")
-
     # --- TABELA GŁÓWNA ---
     sorted_data = sorted(
         data.items(),
         key=lambda x: (x[0][0], lock_order.get(x[0][1], 99))
     )
-
     csv_rows = []
     last_nick = None
     for (nick, lock_type), stats in sorted_data:
         if last_nick and nick != last_nick:
             csv_rows.append([""] * 7)
         last_nick = nick
-
         all_attempts = stats["all_attempts"]
         succ = stats["successful_attempts"]
         fail = stats["failed_attempts"]
         avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
         eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
-
         csv_rows.append([
             nick, lock_type, all_attempts, succ, fail,
             f"{eff}%", f"{avg}s"
         ])
-
-    # --- ZAPIS CSV (pełna historia) ---
+    # --- ZAPIS CSV ---
     with open("logi.csv", "w", newline='', encoding="utf-8") as f:
         writer = csv.writer(f)
         writer.writerow([
@@ -144,9 +151,9 @@ def process_all_logs():
             "Ilość nieudanych prób", "Skuteczność", "Śr. czas"
         ])
         writer.writerows(csv_rows)
-
     print("[INFO] Zapisano pełną historię w logi.csv.")
-
+    # --- COMMIT & PUSH ---
+    git_commit_push(["logi.csv"], "Aktualizacja statystyk lockpick")
     # --- WYSYŁKA TABELI GŁÓWNEJ ---
     table_block = "```\n"
     table_block += f"{'Nick':<10} {'Zamek':<10} {'Wszystkie':<12} {'Udane':<6} {'Nieudane':<9} {'Skut.':<8} {'Śr. czas':<8}\n"
@@ -159,7 +166,6 @@ def process_all_logs():
     table_block += "```"
     send_discord(table_block, WEBHOOK_TABLE1)
     print("[INFO] Wysłano tabelę główną.")
-
     # --- TABELA ADMIN ---
     admin_block = "```\n"
     admin_block += f"{'Nick':<10} {'Zamek':<10} {'Skut.':<10} {'Śr. czas':<10}\n"
@@ -173,7 +179,6 @@ def process_all_logs():
     admin_block += "```"
     send_discord(admin_block, WEBHOOK_TABLE2)
     print("[INFO] Wysłano tabelę admin.")
-
     # --- TABELA PODIUM ---
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
     ranking = []
@@ -181,19 +186,14 @@ def process_all_logs():
         total_attempts = summary["total"]
         total_success = summary["success"]
         times_all = summary["times"]
-
         eff = round(100 * total_success / total_attempts, 2) if total_attempts else 0
         avg = round(statistics.mean(times_all), 2) if times_all else 0
-
         ranking.append((nick, eff, avg))
-
     ranking = sorted(ranking, key=lambda x: (-x[1], x[2]))[:5]
-
     col_widths = [2, 10, 14, 14]
     podium_block = "```\n"
     podium_block += f"{'':<{col_widths[0]}}{'Nick':^{col_widths[1]}}{'Skuteczność':^{col_widths[2]}}{'Śr. czas':^{col_widths[3]}}\n"
     podium_block += "-" * sum(col_widths) + "\n"
-
     for i, (nick, eff, avg) in enumerate(ranking):
         medal = medals[i]
         podium_block += f"{medal:<{col_widths[0]}}{nick:^{col_widths[1]}}{(str(eff)+'%'):^{col_widths[2]}}{(str(avg)+'s'):^{col_widths[3]}}\n"
