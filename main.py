@@ -1,9 +1,5 @@
 # --- AUTOMATYCZNA INSTALACJA (cicho) ---
-import subprocess
-import sys
-import os
-import time
-import threading
+import subprocess, sys
 
 def silent_install(package):
     try:
@@ -12,8 +8,8 @@ def silent_install(package):
         subprocess.run([sys.executable, "-m", "pip", "install", package],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
-silent_install("requests")
-silent_install("flask")
+for pkg in ["requests", "flask"]:
+    silent_install(pkg)
 
 # --- IMPORTY ---
 import re
@@ -23,14 +19,16 @@ import requests
 from collections import defaultdict
 from ftplib import FTP
 from io import BytesIO
+import os
+import time
 from flask import Flask
 
-# --- SERWER FLASK ---
+# --- FLASK PING ---
 app = Flask(__name__)
 
 @app.route('/')
 def index():
-    return "Alive"
+    return "Alive", 200
 
 # --- FUNKCJA WYSYŁANIA NA DISCORD ---
 def send_discord(content, webhook_url):
@@ -44,9 +42,7 @@ FTP_PASS = "LXNdGShY"
 FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
 
 # --- WEBHOOKI ---
-WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE2 = WEBHOOK_TABLE1
-WEBHOOK_TABLE3 = WEBHOOK_TABLE1
+WEBHOOK_TABLE1 = WEBHOOK_TABLE2 = WEBHOOK_TABLE3 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 # --- WZORZEC ---
 pattern = re.compile(
@@ -58,174 +54,136 @@ pattern = re.compile(
     r"Lock type: (?P<lock_type>\w+)\."
 )
 
-# --- KOLEJNOŚĆ ZAMKÓW ---
 lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
+STATE_FILE = "last_state.txt"
 
-# --- GŁÓWNA PĘTLA ---
-def main_loop():
-    STATE_FILE = "last_log_state.txt"
-    CSV_FILE = "logi.csv"
+# --- POBRANIE WSZYSTKICH LOGÓW PRZY PIERWSZYM URUCHOMIENIU ---
+if not os.path.exists("logi.csv"):
+    ftp = FTP()
+    ftp.connect(FTP_IP, FTP_PORT)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.cwd(FTP_PATH)
+    log_files = []
+    ftp.retrlines("MLSD", lambda line: log_files.append(line.split(";")[-1].strip()))
+    log_files = [f for f in log_files if f.startswith("gameplay_") and f.endswith(".log")]
+    log_files.sort()
 
-    # --- WCZYTANIE STANU ---
-    if os.path.exists(STATE_FILE):
-        with open(STATE_FILE, "r") as f:
-            last_log_name = f.readline().strip()
-            last_line_count = int(f.readline().strip())
-    else:
-        last_log_name = ""
-        last_line_count = 0
+    data = defaultdict(lambda: {"all_attempts":0, "successful_attempts":0, "failed_attempts":0, "times":[]})
 
-    while True:
-        print("[INFO] Sprawdzanie logów...")
+    for log_file in log_files:
+        print(f"[INFO] Pierwsze pobieranie: {log_file}")
+        with BytesIO() as bio:
+            ftp.retrbinary(f"RETR {log_file}", bio.write)
+            log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
 
-        # --- POBIERANIE LISTY LOGÓW ---
-        try:
-            ftp = FTP()
-            ftp.connect(FTP_IP, FTP_PORT)
-            ftp.login(FTP_USER, FTP_PASS)
-            ftp.cwd(FTP_PATH)
-
-            log_files = []
-            ftp.retrlines("MLSD", lambda line: log_files.append(line.split(";")[-1].strip()))
-            ftp.quit()
-        except Exception as e:
-            print(f"[ERROR] FTP: {e}")
-            time.sleep(60)
-            continue
-
-        log_files = [f for f in log_files if f.startswith("gameplay_") and f.endswith(".log")]
-        if not log_files:
-            print("[ERROR] Brak plików gameplay_*.log na FTP.")
-            time.sleep(60)
-            continue
-
-        latest_log = sorted(log_files)[-1]
-
-        # --- POBRANIE NAJNOWSZEGO LOGU ---
-        try:
-            ftp = FTP()
-            ftp.connect(FTP_IP, FTP_PORT)
-            ftp.login(FTP_USER, FTP_PASS)
-            ftp.cwd(FTP_PATH)
-            with BytesIO() as bio:
-                ftp.retrbinary(f"RETR {latest_log}", bio.write)
-                log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
-            ftp.quit()
-        except Exception as e:
-            print(f"[ERROR] Pobieranie logu: {e}")
-            time.sleep(60)
-            continue
-
-        lines = log_text.splitlines()
-
-        # --- SPRAWDZANIE NOWYCH LINII ---
-        if latest_log == last_log_name:
-            new_lines = lines[last_line_count:]
-        else:
-            new_lines = lines
-            last_log_name = latest_log
-            last_line_count = 0
-
-        if not new_lines:
-            print("[INFO] Brak nowych zdarzeń w logu.")
-            time.sleep(60)
-            continue
-
-        # --- PARSOWANIE NOWYCH LINII I DODAWANIE DO CSV ---
-        parsed_rows = []
-        for match in pattern.finditer("\n".join(new_lines)):
+        for match in pattern.finditer(log_text):
             nick = match.group("nick")
             lock_type = match.group("lock_type")
             success = match.group("success")
-            failed_attempts = int(match.group("failed_attempts"))
             elapsed = float(match.group("elapsed"))
-
-            parsed_rows.append([
-                nick, lock_type, success, failed_attempts, elapsed
-            ])
-
-        if not parsed_rows:
-            print("[INFO] Nie znaleziono pasujących nowych wpisów.")
-            time.sleep(60)
-            continue
-
-        with open(CSV_FILE, "a", newline='', encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerows(parsed_rows)
-
-        print(f"[INFO] Dodano {len(parsed_rows)} nowych wpisów do {CSV_FILE}.")
-
-        # --- WCZYTANIE CAŁEGO CSV DO GENEROWANIA TABEL ---
-        all_data = []
-        with open(CSV_FILE, "r", newline='', encoding="utf-8") as f:
-            reader = csv.reader(f)
-            for row in reader:
-                if row:
-                    all_data.append(row)
-
-        # --- PRZETWARZANIE PEŁNYCH STATYSTYK ---
-        data = {}
-        player_summary = {}
-
-        for row in all_data:
-            nick, lock_type, success, failed_attempts, elapsed = row
-            failed_attempts = int(failed_attempts)
-            elapsed = float(elapsed)
+            failed_attempts = int(match.group("failed_attempts"))
 
             key = (nick, lock_type)
-            if key not in data:
-                data[key] = {
-                    "all_attempts": 0,
-                    "successful_attempts": 0,
-                    "failed_attempts": 0,
-                    "times": [],
-                }
-
             data[key]["all_attempts"] += 1
             if success == "Yes":
                 data[key]["successful_attempts"] += 1
             else:
                 data[key]["failed_attempts"] += 1
-
             data[key]["times"].append(elapsed)
 
-            # --- SUMARYCZNE DLA PODIUM ---
-            if nick not in player_summary:
-                player_summary[nick] = {
-                    "all_attempts": 0,
-                    "successful_attempts": 0,
-                    "times": []
-                }
-            player_summary[nick]["all_attempts"] += 1
-            if success == "Yes":
-                player_summary[nick]["successful_attempts"] += 1
-            player_summary[nick]["times"].append(elapsed)
+    ftp.quit()
 
-        sorted_data = sorted(
-            data.items(),
-            key=lambda x: (x[0][0], lock_order.get(x[0][1], 99))
-        )
-
-        # --- TABELA GŁÓWNA ---
-        table_block = "```\n"
-        table_block += f"{'Nick':<10} {'Zamek':<10} {'Wszystkie':<12} {'Udane':<6} {'Nieudane':<9} {'Skut.':<8} {'Śr. czas':<8}\n"
-        table_block += "-" * 70 + "\n"
-        for (nick, lock_type), stats in sorted_data:
+    # --- ZAPIS DO CSV (bez nagłówka na stałe) ---
+    with open("logi.csv", "w", newline='', encoding="utf-8") as f:
+        writer = csv.writer(f)
+        for (nick, lock_type), stats in data.items():
             all_attempts = stats["all_attempts"]
             successful_attempts = stats["successful_attempts"]
             failed_attempts = stats["failed_attempts"]
-            avg_time = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
-            effectiveness = round(100 * successful_attempts / all_attempts, 2) if all_attempts else 0
+            avg_time = round(statistics.mean(stats["times"]),2)
+            effectiveness = round(100 * successful_attempts / all_attempts,2)
+            writer.writerow([nick, lock_type, all_attempts, successful_attempts, failed_attempts, effectiveness, avg_time])
 
-            table_block += f"{nick:<10} {lock_type:<10} {all_attempts:<12} {successful_attempts:<6} {failed_attempts:<9} {effectiveness:<8}% {avg_time:<8}s\n"
+# --- GŁÓWNA PĘTLA SPRAWDZANIA NOWYCH ZDARZEŃ ---
+def main_loop():
+    while True:
+        ftp = FTP()
+        ftp.connect(FTP_IP, FTP_PORT)
+        ftp.login(FTP_USER, FTP_PASS)
+        ftp.cwd(FTP_PATH)
+        log_files = []
+        ftp.retrlines("MLSD", lambda line: log_files.append(line.split(";")[-1].strip()))
+        log_files = [f for f in log_files if f.startswith("gameplay_") and f.endswith(".log")]
+        log_files.sort()
+        latest_log = log_files[-1]
+
+        with BytesIO() as bio:
+            ftp.retrbinary(f"RETR {latest_log}", bio.write)
+            log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
+        ftp.quit()
+
+        lines = log_text.splitlines()
+        last_line = 0
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, "r") as f:
+                state = f.read().strip().split("\n")
+                if state[0] == latest_log:
+                    last_line = int(state[1])
+
+        new_lines = lines[last_line:]
+        if not new_lines:
+            print("[INFO] Brak nowych zdarzeń w logu.")
+            time.sleep(60)
+            continue
+
+        # --- PRZETWARZANIE NOWYCH ZDARZEŃ ---
+        with open("logi.csv", "a", newline='', encoding="utf-8") as f:
+            writer = csv.writer(f)
+            new_events = 0
+            for line in new_lines:
+                match = pattern.search(line)
+                if match:
+                    nick = match.group("nick")
+                    lock_type = match.group("lock_type")
+                    success = match.group("success")
+                    elapsed = float(match.group("elapsed"))
+                    failed_attempts = int(match.group("failed_attempts"))
+                    all_attempts = 1
+                    successful_attempts = 1 if success == "Yes" else 0
+                    failed = 0 if success == "Yes" else 1
+                    effectiveness = 100 if success == "Yes" else 0
+                    writer.writerow([nick, lock_type, all_attempts, successful_attempts, failed, effectiveness, elapsed])
+                    new_events += 1
+
+        with open(STATE_FILE, "w") as f:
+            f.write(f"{latest_log}\n{len(lines)}")
+
+        print(f"[INFO] Dodano {new_events} nowych zdarzeń. Generowanie tabel i wysyłka.")
+
+        # --- GENEROWANIE I WYSYŁKA TABEL I PODIUM ---
+        csv_rows = []
+        with open("logi.csv", "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            csv_rows = list(reader)
+
+        table_block = "```\n"
+        table_block += f"{'Nick':<10} {'Zamek':<10} {'Wszystkie':<12} {'Udane':<6} {'Nieudane':<9} {'Skut.':<8} {'Śr. czas':<8}\n"
+        table_block += "-" * 70 + "\n"
+        for row in csv_rows:
+            table_block += f"{row[0]:<10} {row[1]:<10} {row[2]:<12} {row[3]:<6} {row[4]:<9} {row[5]:<8} {row[6]:<8}\n"
         table_block += "```"
         send_discord(table_block, WEBHOOK_TABLE1)
 
-        # --- TABELA PODIUM ---
-        podium_block = "```\n"
-        podium_block += "           🏆 PODIUM           \n"
-        podium_block += "--------------------------------\n"
-        podium_block += f"{'Miejsce':<8} {'Nick':<10} {'Skuteczność':<12} {'Średni czas':<10}\n"
+        # --- PODIUM ---
+        player_summary = defaultdict(lambda: {"all_attempts":0, "successful_attempts":0, "times":[]})
+        for row in csv_rows:
+            nick, lock_type, all_attempts, successful_attempts, failed_attempts, effectiveness, avg_time = row
+            all_attempts = int(all_attempts)
+            successful_attempts = int(successful_attempts)
+            avg_time = float(avg_time)
+            player_summary[nick]["all_attempts"] += all_attempts
+            player_summary[nick]["successful_attempts"] += successful_attempts
+            player_summary[nick]["times"].append(avg_time)
 
         podium = []
         for nick, stats in player_summary.items():
@@ -238,22 +196,20 @@ def main_loop():
         podium = sorted(podium, key=lambda x: (-x[1], x[2]))[:5]
         medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
 
+        podium_block = "```\n"
+        podium_block += "           🏆 PODIUM           \n"
+        podium_block += "--------------------------------\n"
+        podium_block += f"{'Miejsce':<8} {'Nick':<10} {'Skuteczność':<12} {'Średni czas':<10}\n"
         for i, (nick, eff, avg) in enumerate(podium):
-            podium_block += f"{medals[i]} {i+1:<6} {nick:<10} {eff:<12}% {avg:<10}s\n"
-
+            podium_block += f"{medals[i]} {i+1:<6} {nick:<10} {eff:<12} {avg:<10}\n"
         podium_block += "```"
         send_discord(podium_block, WEBHOOK_TABLE3)
 
-        # --- ZAPIS STANU ---
-        last_line_count = len(lines)
-        with open(STATE_FILE, "w") as f:
-            f.write(f"{latest_log}\n{last_line_count}\n")
-
-        print("[INFO] Wysłano zaktualizowane tabele. Oczekiwanie 60s...")
         time.sleep(60)
 
 # --- START SERWERA I PĘTLI ---
 if __name__ == "__main__":
+    import threading
     threading.Thread(target=main_loop).start()
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
