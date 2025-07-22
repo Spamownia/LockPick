@@ -10,6 +10,7 @@ def silent_install(package):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 silent_install("requests")
+silent_install("flask")  # dodano flask
 
 # --- IMPORTY ---
 import re
@@ -19,9 +20,18 @@ import requests
 import base64
 import os
 import time
+import threading
 from collections import defaultdict
 from ftplib import FTP
 from io import BytesIO
+from flask import Flask
+
+# --- FLASK APP ---
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "Alive"
 
 # --- FUNKCJA WYSYŁANIA NA DISCORD ---
 def send_discord(content, webhook_url):
@@ -172,9 +182,18 @@ def process_new_entries(seen_lines):
 
     return seen_lines + new_lines
 
-# --- PĘTLA ---
-if __name__ == "__main__":
+# --- FUNKCJA PĘTLI ---
+def main_loop():
     seen_lines = []
     while True:
         seen_lines = process_new_entries(seen_lines)
         time.sleep(60)
+
+# --- START ---
+if __name__ == "__main__":
+    # uruchom pętlę w wątku
+    threading.Thread(target=main_loop, daemon=True).start()
+
+    # uruchom Flask
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
