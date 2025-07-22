@@ -45,9 +45,9 @@ FTP_PASS = "LXNdGShY"
 FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
 
 # --- WEBHOOKI ---
-WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE2 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE3 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/xxx"
+WEBHOOK_TABLE2 = WEBHOOK_TABLE1
+WEBHOOK_TABLE3 = WEBHOOK_TABLE1
 
 # --- WZORZEC ---
 pattern = re.compile(
@@ -87,29 +87,10 @@ def process_logs():
         log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
     ftp.quit()
 
-    # --- Wczytywanie dotychczasowych danych ---
-    history_data = {}
-    if os.path.isfile("logi.csv"):
-        with open("logi.csv", newline='', encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader, None)
-            for row in reader:
-                if len(row) < 7 or not row[0]: continue
-                nick, lock_type = row[0], row[1]
-                all_attempts = int(row[2])
-                successful_attempts = int(row[3])
-                failed_attempts = int(row[4])
-                avg_time = float(row[6].strip('s'))
-                history_data[(nick, lock_type)] = {
-                    "all_attempts": all_attempts,
-                    "successful_attempts": successful_attempts,
-                    "failed_attempts": failed_attempts,
-                    "times": [avg_time]*all_attempts
-                }
-    print(f"[DEBUG] Wczytano {len(history_data)} rekordów z historii.")
-
     # --- Parsowanie najnowszego logu ---
-    current_data = {}
+    data = {}
+    user_lock_times = defaultdict(lambda: defaultdict(list))
+
     for match in pattern.finditer(log_text):
         nick = match.group("nick")
         lock_type = match.group("lock_type")
@@ -117,81 +98,104 @@ def process_logs():
         elapsed = float(match.group("elapsed"))
 
         key = (nick, lock_type)
-        if key not in current_data:
-            current_data[key] = {
+        if key not in data:
+            data[key] = {
                 "all_attempts": 0,
                 "successful_attempts": 0,
                 "failed_attempts": 0,
                 "times": [],
             }
 
-        current_data[key]["all_attempts"] += 1
+        data[key]["all_attempts"] += 1
         if success == "Yes":
-            current_data[key]["successful_attempts"] += 1
+            data[key]["successful_attempts"] += 1
         else:
-            current_data[key]["failed_attempts"] += 1
+            data[key]["failed_attempts"] += 1
 
-        current_data[key]["times"].append(elapsed)
+        data[key]["times"].append(elapsed)
+        user_lock_times[nick][lock_type].append(elapsed)
 
-    print(f"[DEBUG] Znaleziono {len(current_data)} rekordów w aktualnym logu.")
+    print(f"[DEBUG] Znaleziono {len(data)} rekordów w logu.")
 
-    if not current_data:
+    if not data:
         print("[INFO] Brak nowych zdarzeń. Pomijam wysyłkę.")
         return
 
-    # --- Sumowanie dotychczasowych i aktualnych danych ---
-    combined_data = {}
-    for key in set(history_data.keys()).union(current_data.keys()):
-        hist = history_data.get(key, {"all_attempts":0,"successful_attempts":0,"failed_attempts":0,"times":[]})
-        curr = current_data.get(key, {"all_attempts":0,"successful_attempts":0,"failed_attempts":0,"times":[]})
+    # --- TABELA GŁÓWNA ---
+    sorted_data = sorted(
+        data.items(),
+        key=lambda x: (x[0][0], lock_order.get(x[0][1], 99))
+    )
 
-        all_attempts = hist["all_attempts"] + curr["all_attempts"]
-        successful_attempts = hist["successful_attempts"] + curr["successful_attempts"]
-        failed_attempts = hist["failed_attempts"] + curr["failed_attempts"]
-        times = hist["times"] + curr["times"]
+    csv_rows = []
+    last_nick = None
+    for (nick, lock_type), stats in sorted_data:
+        if last_nick and nick != last_nick:
+            csv_rows.append([""] * 7)
+        last_nick = nick
 
-        combined_data[key] = {
-            "all_attempts": all_attempts,
-            "successful_attempts": successful_attempts,
-            "failed_attempts": failed_attempts,
-            "times": times
-        }
+        all_attempts = stats["all_attempts"]
+        succ = stats["successful_attempts"]
+        fail = stats["failed_attempts"]
+        avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
+        eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
 
-    # --- Generowanie rankingów per gracz (sumarycznie) ---
-    player_summary = {}
-    for (nick, lock_type), stats in combined_data.items():
-        if nick not in player_summary:
-            player_summary[nick] = {"all":0, "succ":0, "times":[]}
-        player_summary[nick]["all"] += stats["all_attempts"]
-        player_summary[nick]["succ"] += stats["successful_attempts"]
-        player_summary[nick]["times"].extend(stats["times"])
+        csv_rows.append([
+            nick, lock_type, all_attempts, succ, fail,
+            f"{eff}%", f"{avg}s"
+        ])
 
-    # --- Sortowanie do tabel ---
-    sorted_data = sorted(combined_data.items(), key=lambda x: (x[0][0], lock_order.get(x[0][1], 99)))
+    # --- WYSYŁKA TABELI GŁÓWNEJ ---
+    table_block = "```\n"
+    table_block += f"{'Nick':<10} {'Zamek':<10} {'Wszystkie':<12} {'Udane':<6} {'Nieudane':<9} {'Skut.':<8} {'Śr. czas':<8}\n"
+    table_block += "-" * 70 + "\n"
+    for row in csv_rows:
+        if any(row):
+            table_block += f"{row[0]:<10} {row[1]:<10} {str(row[2]):<12} {str(row[3]):<6} {str(row[4]):<9} {row[5]:<8} {row[6]:<8}\n"
+        else:
+            table_block += "\n"
+    table_block += "```"
+    send_discord(table_block, WEBHOOK_TABLE1)
+    print("[INFO] Wysłano tabelę główną.")
+
+    # --- TABELA ADMIN ---
+    admin_block = "```\n"
+    admin_block += f"{'Nick':<10} {'Zamek':<10} {'Skut.':<10} {'Śr. czas':<10}\n"
+    admin_block += "-" * 45 + "\n"
+    for (nick, lock_type), stats in sorted_data:
+        all_attempts = stats["all_attempts"]
+        succ = stats["successful_attempts"]
+        eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
+        avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
+        admin_block += f"{nick:<10} {lock_type:<10} {str(eff)+'%':<10} {str(avg)+'s':<10}\n"
+    admin_block += "```"
+    send_discord(admin_block, WEBHOOK_TABLE2)
+    print("[INFO] Wysłano tabelę admin.")
 
     # --- TABELA PODIUM ---
     medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    podium = []
-    for nick, sums in player_summary.items():
-        eff = round(100 * sums["succ"] / sums["all"], 2) if sums["all"] else 0
-        avg_time = round(statistics.mean(sums["times"]), 2) if sums["times"] else 0
-        podium.append((nick, eff, avg_time))
+    ranking = []
+    for nick in user_lock_times:
+        times_all = [t for lock in user_lock_times[nick].values() for t in lock]
+        total_attempts = len(times_all)
+        total_success = sum(len(lock) for lock in user_lock_times[nick].values())  # założenie: każda próba liczona jako udana
+        eff = round(100 * total_success / total_attempts, 2) if total_attempts else 0
+        avg = round(statistics.mean(times_all), 2) if total_attempts else 0
+        ranking.append((nick, eff, avg))
 
-    podium_sorted = sorted(podium, key=lambda x: (-x[1], x[2]))[:5]
+    ranking = sorted(ranking, key=lambda x: (-x[1], x[2]))[:5]
 
-    # --- Wysyłka tabel na Discord ---
-    # Podium
-    col_widths = [2, 8, 12, 12]
+    col_widths = [2, 10, 14, 14]
     podium_block = "```\n"
-    podium_block += f"{'':<{col_widths[0]}}{'Miejsce':^{col_widths[1]}}{'Skut.':^{col_widths[2]}}{'Śr. czas':^{col_widths[3]}}\n"
+    podium_block += f"{'':<{col_widths[0]}}{'Nick':^{col_widths[1]}}{'Skuteczność':^{col_widths[2]}}{'Śr. czas':^{col_widths[3]}}\n"
     podium_block += "-" * sum(col_widths) + "\n"
-    for i, (nick, eff, avg) in enumerate(podium_sorted):
+
+    for i, (nick, eff, avg) in enumerate(ranking):
         medal = medals[i]
         podium_block += f"{medal:<{col_widths[0]}}{nick:^{col_widths[1]}}{(str(eff)+'%'):^{col_widths[2]}}{(str(avg)+'s'):^{col_widths[3]}}\n"
     podium_block += "```"
     send_discord(podium_block, WEBHOOK_TABLE3)
-
-    print("[INFO] Wysłano tabelę podium na Discord.")
+    print("[INFO] Wysłano tabelę podium.")
 
 # --- FUNKCJA GŁÓWNEJ PĘTLI ---
 def main_loop():
