@@ -45,8 +45,6 @@ FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
 
 # --- WEBHOOKI ---
 WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE2 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE3 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 # --- WZORZEC ---
 pattern = re.compile(
@@ -90,29 +88,36 @@ def process_logs():
         log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
     ftp.quit()
 
-    # --- Wczytywanie dotychczasowych danych ---
-    history_data = {}
-    if os.path.isfile("logi.csv"):
-        with open("logi.csv", newline='', encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader, None)  # skip header
-            for row in reader:
-                if len(row) < 7 or not row[0]: continue
-                nick, lock_type = row[0], row[1]
-                all_attempts = int(row[2])
-                successful_attempts = int(row[3])
-                failed_attempts = int(row[4])
-                avg_time = float(row[6].strip('s'))
-                history_data[(nick, lock_type)] = {
-                    "all_attempts": all_attempts,
-                    "successful_attempts": successful_attempts,
-                    "failed_attempts": failed_attempts,
-                    "times": [avg_time]*all_attempts  # przybliżenie
-                }
+    log_lines = log_text.splitlines()
 
-    # --- Parsowanie najnowszego logu ---
+    # --- Wczytywanie ostatnio przetworzonej linii ---
+    last_line_file = "last_processed_line.txt"
+    last_processed_line = None
+    if os.path.isfile(last_line_file):
+        with open(last_line_file, "r", encoding="utf-8") as f:
+            last_processed_line = f.read().strip()
+
+    # --- Znajdowanie pozycji ostatniej przetworzonej linii ---
+    start_index = 0
+    if last_processed_line:
+        for i, line in enumerate(log_lines):
+            if last_processed_line in line:
+                start_index = i + 1
+                break
+
+    # --- Wyodrębnianie tylko nowych linii ---
+    new_lines = log_lines[start_index:]
+    if not new_lines:
+        print("[INFO] Brak nowych zdarzeń w najnowszym logu. Nie wysyłam tabel.")
+        return
+
+    # --- Parsowanie tylko nowych linii ---
     current_data = {}
-    for match in pattern.finditer(log_text):
+    for line in new_lines:
+        match = pattern.search(line)
+        if not match:
+            continue
+
         nick = match.group("nick")
         lock_type = match.group("lock_type")
         success = match.group("success")
@@ -136,13 +141,32 @@ def process_logs():
 
         current_data[key]["times"].append(elapsed)
 
-    # --- Sprawdzanie czy są nowe zdarzenia ---
     total_new_events = sum(d["all_attempts"] for d in current_data.values())
     if total_new_events == 0:
-        print("[INFO] Brak nowych zdarzeń w najnowszym logu. Nie wysyłam tabel.")
+        print("[INFO] Brak nowych zdarzeń parsowanych regexem. Nie wysyłam tabel.")
         return
 
     print(f"[INFO] Znaleziono {total_new_events} nowych zdarzeń. Aktualizuję statystyki i wysyłam tabele.")
+
+    # --- Wczytywanie dotychczasowych danych ---
+    history_data = {}
+    if os.path.isfile("logi.csv"):
+        with open("logi.csv", newline='', encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # skip header
+            for row in reader:
+                if len(row) < 7 or not row[0]: continue
+                nick, lock_type = row[0], row[1]
+                all_attempts = int(row[2])
+                successful_attempts = int(row[3])
+                failed_attempts = int(row[4])
+                avg_time = float(row[6].strip('s'))
+                history_data[(nick, lock_type)] = {
+                    "all_attempts": all_attempts,
+                    "successful_attempts": successful_attempts,
+                    "failed_attempts": failed_attempts,
+                    "times": [avg_time]*all_attempts  # przybliżenie
+                }
 
     # --- Sumowanie dotychczasowych i aktualnych danych ---
     combined_data = {}
@@ -194,7 +218,7 @@ def process_logs():
 
     print("[DEBUG] Zapisano plik logi.csv.")
 
-    # --- WYSYŁKA NA DISCORD (tylko jeśli były nowe zdarzenia) ---
+    # --- WYSYŁKA NA DISCORD ---
     table_block = "```\n"
     table_block += f"{'Nick':<10} {'Zamek':<10} {'Wszystkie':<12} {'Udane':<6} {'Nieudane':<9} {'Skut.':<8} {'Śr. czas':<8}\n"
     table_block += "-" * 70 + "\n"
@@ -207,6 +231,12 @@ def process_logs():
     send_discord(table_block, WEBHOOK_TABLE1)
 
     print("[DEBUG] Wysłano tabelę główną na Discord.")
+
+    # --- Zapisanie ostatniej przetworzonej linii ---
+    if new_lines:
+        with open(last_line_file, "w", encoding="utf-8") as f:
+            f.write(new_lines[-1])
+
     print("[INFO] Zakończono przetwarzanie logów i wysyłkę.")
 
 # --- FUNKCJA GŁÓWNEJ PĘTLI ---
