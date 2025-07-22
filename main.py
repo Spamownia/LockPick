@@ -10,15 +10,31 @@ def silent_install(package):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 silent_install("requests")
+silent_install("flask")
 
 # --- IMPORTY ---
 import re
 import csv
 import statistics
+import requests
 from collections import defaultdict
 from ftplib import FTP
 from io import BytesIO
 import os
+import threading
+import time
+from flask import Flask
+
+# --- KONFIGURACJA FLASK ---
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Alive"
+
+# --- FUNKCJA WYSYŁANIA NA DISCORD ---
+def send_discord(content, webhook_url):
+    requests.post(webhook_url, json={"content": content})
 
 # --- KONFIGURACJA FTP ---
 FTP_IP = "176.57.174.10"
@@ -26,6 +42,11 @@ FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
+
+# --- WEBHOOKI ---
+WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+WEBHOOK_TABLE2 = WEBHOOK_TABLE1
+WEBHOOK_TABLE3 = WEBHOOK_TABLE1
 
 # --- WZORZEC ---
 pattern = re.compile(
@@ -41,116 +62,161 @@ pattern = re.compile(
 lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
 
 # --- FUNKCJA GŁÓWNA ---
-def import_all_logs():
-    print("[DEBUG] Rozpoczynam import WSZYSTKICH logów...")
+def process_logs():
+    print("[DEBUG] Rozpoczynam przetwarzanie logów...")
 
-    # --- Wczytanie danych historycznych ---
-    history_data = {}
-    if os.path.isfile("logi.csv"):
-        with open("logi.csv", newline='', encoding="utf-8") as f:
-            reader = csv.reader(f)
-            next(reader, None)  # nagłówki
-            for row in reader:
-                if not any(row): continue
-                nick, lock_type = row[0], row[1]
-                all_attempts = int(row[2])
-                successful_attempts = int(row[3])
-                failed_attempts = int(row[4])
-                avg_time = float(row[6].replace("s",""))
-
-                history_data[(nick, lock_type)] = {
-                    "all_attempts": all_attempts,
-                    "successful_attempts": successful_attempts,
-                    "failed_attempts": failed_attempts,
-                    "times": [avg_time]*all_attempts  # przybliżenie
-                }
-                print(f"[DEBUG] Wczytano z CSV: {nick}, {lock_type}, próby: {all_attempts}, udane: {successful_attempts}")
-
-    # --- Połączenie FTP ---
     ftp = FTP()
     ftp.connect(FTP_IP, FTP_PORT)
     ftp.login(FTP_USER, FTP_PASS)
     ftp.cwd(FTP_PATH)
 
     log_files = []
-    ftp.retrlines("MLSD", lambda line: log_files.append(line.split(";")[-1].strip()))
+    try:
+        ftp.retrlines("MLSD", lambda line: log_files.append(line.split(";")[-1].strip()))
+    except Exception as e:
+        print(f"[ERROR] Nie udało się pobrać listy plików: {e}")
+
     log_files = [f for f in log_files if f.startswith("gameplay_") and f.endswith(".log")]
-    log_files.sort()
+    if not log_files:
+        print("[ERROR] Brak plików gameplay_*.log na FTP.")
+        ftp.quit()
+        return
 
-    current_data = {}
+    latest_log = sorted(log_files)[-1]
+    print(f"[INFO] Przetwarzanie najnowszego logu: {latest_log}")
 
-    for log_file in log_files:
-        print(f"[INFO] Przetwarzanie: {log_file}")
+    with BytesIO() as bio:
+        ftp.retrbinary(f"RETR {latest_log}", bio.write)
+        log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
+    ftp.quit()
 
-        with BytesIO() as bio:
-            ftp.retrbinary(f"RETR {log_file}", bio.write)
-            log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
-
-        for match in pattern.finditer(log_text):
-            nick = match.group("nick")
-            lock_type = match.group("lock_type")
-            success = match.group("success")
-            failed_attempts = int(match.group("failed_attempts"))
-            elapsed = float(match.group("elapsed"))
-
-            print(f"[DEBUG] Log {log_file}: {nick}, {lock_type}, success={success}, elapsed={elapsed}")
-
-            key = (nick, lock_type)
-            if key not in current_data:
-                current_data[key] = {
-                    "all_attempts": 0,
-                    "successful_attempts": 0,
-                    "failed_attempts": 0,
-                    "times": [],
+    # --- Wczytywanie dotychczasowych danych ---
+    history_data = {}
+    if os.path.isfile("logi.csv"):
+        with open("logi.csv", newline='', encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # skip header
+            for row in reader:
+                if len(row) < 7 or not row[0]: continue
+                nick, lock_type = row[0], row[1]
+                all_attempts = int(row[2])
+                successful_attempts = int(row[3])
+                failed_attempts = int(row[4])
+                avg_time = float(row[6].strip('s'))
+                history_data[(nick, lock_type)] = {
+                    "all_attempts": all_attempts,
+                    "successful_attempts": successful_attempts,
+                    "failed_attempts": failed_attempts,
+                    "times": [avg_time]*all_attempts  # przybliżenie
                 }
 
-            current_data[key]["all_attempts"] += 1
-            if success == "Yes":
-                current_data[key]["successful_attempts"] += 1
-            else:
-                current_data[key]["failed_attempts"] += 1
+    # --- Parsowanie najnowszego logu ---
+    current_data = {}
+    for match in pattern.finditer(log_text):
+        nick = match.group("nick")
+        lock_type = match.group("lock_type")
+        success = match.group("success")
+        failed_attempts = int(match.group("failed_attempts"))
+        elapsed = float(match.group("elapsed"))
 
-            current_data[key]["times"].append(elapsed)
+        key = (nick, lock_type)
+        if key not in current_data:
+            current_data[key] = {
+                "all_attempts": 0,
+                "successful_attempts": 0,
+                "failed_attempts": 0,
+                "times": [],
+            }
 
-    ftp.quit()
-    print("[DEBUG] Pobieranie logów zakończone.")
+        current_data[key]["all_attempts"] += 1
+        if success == "Yes":
+            current_data[key]["successful_attempts"] += 1
+        else:
+            current_data[key]["failed_attempts"] += 1
 
-    # --- SUMOWANIE historycznych + aktualnych ---
-    final_data = {}
+        current_data[key]["times"].append(elapsed)
+
+    # --- Sprawdzanie czy są nowe zdarzenia ---
+    total_new_events = sum(d["all_attempts"] for d in current_data.values())
+    if total_new_events == 0:
+        print("[INFO] Brak nowych zdarzeń w najnowszym logu. Nie wysyłam tabel.")
+        return
+
+    print(f"[INFO] Znaleziono {total_new_events} nowych zdarzeń. Aktualizuję statystyki i wysyłam tabele.")
+
+    # --- Sumowanie dotychczasowych i aktualnych danych ---
+    combined_data = {}
     for key in set(history_data.keys()).union(current_data.keys()):
-        h = history_data.get(key, {"all_attempts":0,"successful_attempts":0,"failed_attempts":0,"times":[]})
-        c = current_data.get(key, {"all_attempts":0,"successful_attempts":0,"failed_attempts":0,"times":[]})
+        hist = history_data.get(key, {"all_attempts":0,"successful_attempts":0,"failed_attempts":0,"times":[]})
+        curr = current_data.get(key, {"all_attempts":0,"successful_attempts":0,"failed_attempts":0,"times":[]})
 
-        merged = {
-            "all_attempts": h["all_attempts"] + c["all_attempts"],
-            "successful_attempts": h["successful_attempts"] + c["successful_attempts"],
-            "failed_attempts": h["failed_attempts"] + c["failed_attempts"],
-            "times": h["times"] + c["times"],
+        all_attempts = hist["all_attempts"] + curr["all_attempts"]
+        successful_attempts = hist["successful_attempts"] + curr["successful_attempts"]
+        failed_attempts = hist["failed_attempts"] + curr["failed_attempts"]
+        times = hist["times"] + curr["times"]
+
+        combined_data[key] = {
+            "all_attempts": all_attempts,
+            "successful_attempts": successful_attempts,
+            "failed_attempts": failed_attempts,
+            "times": times
         }
 
-        final_data[key] = merged
+    # --- Sortowanie danych do tabel ---
+    sorted_data = sorted(combined_data.items(), key=lambda x: (x[0][0], lock_order.get(x[0][1], 99)))
 
-    # --- ZAPIS CSV ---
-    sorted_data = sorted(final_data.items(), key=lambda x: (x[0][0], lock_order.get(x[0][1],99)))
+    # --- Generowanie tabeli głównej ---
     csv_rows = []
-
+    last_nick = None
     for (nick, lock_type), stats in sorted_data:
-        all_attempts = stats["all_attempts"]
-        succ = stats["successful_attempts"]
-        fail = stats["failed_attempts"]
-        avg = round(statistics.mean(stats["times"]),2) if stats["times"] else 0
-        eff = round(100 * succ / all_attempts,2) if all_attempts else 0
+        if last_nick and nick != last_nick:
+            csv_rows.append([""] * 7)
+        last_nick = nick
 
-        csv_rows.append([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
-        print(f"[DEBUG] Zapis: {nick}, {lock_type}, próby: {all_attempts}, udane: {succ}, nieudane: {fail}, skuteczność: {eff}%, avg: {avg}s")
+        all_attempts = stats["all_attempts"]
+        successful_attempts = stats["successful_attempts"]
+        failed_attempts = stats["failed_attempts"]
+        avg_time = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
+        effectiveness = round(100 * successful_attempts / all_attempts, 2) if all_attempts else 0
+
+        csv_rows.append([
+            nick, lock_type, all_attempts, successful_attempts, failed_attempts,
+            f"{effectiveness}%", f"{avg_time}s"
+        ])
 
     with open("logi.csv", "w", newline='', encoding="utf-8") as f:
         writer = csv.writer(f)
-        writer.writerow(["Nick","Rodzaj zamka","Ilość wszystkich prób","Ilość udanych prób","Ilość nieudanych prób","Skuteczność","Śr. czas"])
+        writer.writerow([
+            "Nick", "Rodzaj zamka", "Ilość wszystkich prób", "Ilość udanych prób",
+            "Ilość nieudanych prób", "Skuteczność", "Śr. czas"
+        ])
         writer.writerows(csv_rows)
 
-    print("[INFO] Import zakończony – plik logi.csv zaktualizowany.")
+    print("[DEBUG] Zapisano plik logi.csv.")
 
-# --- START ---
+    # --- WYSYŁKA NA DISCORD (tylko jeśli były nowe zdarzenia) ---
+    table_block = "```\n"
+    table_block += f"{'Nick':<10} {'Zamek':<10} {'Wszystkie':<12} {'Udane':<6} {'Nieudane':<9} {'Skut.':<8} {'Śr. czas':<8}\n"
+    table_block += "-" * 70 + "\n"
+    for row in csv_rows:
+        if any(row):
+            table_block += f"{row[0]:<10} {row[1]:<10} {str(row[2]):<12} {str(row[3]):<6} {str(row[4]):<9} {row[5]:<8} {row[6]:<8}\n"
+        else:
+            table_block += "\n"
+    table_block += "```"
+    send_discord(table_block, WEBHOOK_TABLE1)
+
+    print("[DEBUG] Wysłano tabelę główną na Discord.")
+    print("[INFO] Zakończono przetwarzanie logów i wysyłkę.")
+
+# --- FUNKCJA GŁÓWNEJ PĘTLI ---
+def main_loop():
+    while True:
+        process_logs()
+        time.sleep(60)
+
+# --- START SERWERA I PĘTLI ---
 if __name__ == "__main__":
-    import_all_logs()
+    threading.Thread(target=main_loop, daemon=True).start()
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
