@@ -66,6 +66,14 @@ lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock":
 def process_logs():
     print("[DEBUG] Rozpoczynam przetwarzanie logów...")
 
+    # --- Pobierz ostatnio przetworzony log ---
+    last_log_file = "last_processed.txt"
+    last_processed = ""
+    if os.path.isfile(last_log_file):
+        with open(last_log_file, "r") as f:
+            last_processed = f.read().strip()
+    print(f"[DEBUG] Ostatnio przetworzony log: {last_processed}")
+
     ftp = FTP()
     ftp.connect(FTP_IP, FTP_PORT)
     ftp.login(FTP_USER, FTP_PASS)
@@ -80,14 +88,20 @@ def process_logs():
         return
 
     latest_log = sorted(log_files)[-1]
-    print(f"[INFO] Przetwarzanie najnowszego logu: {latest_log}")
+    print(f"[INFO] Najnowszy log: {latest_log}")
+
+    # --- Sprawdź, czy to nowy log ---
+    if latest_log == last_processed:
+        print("[INFO] Log został już przetworzony. Pomijam.")
+        ftp.quit()
+        return
 
     with BytesIO() as bio:
         ftp.retrbinary(f"RETR {latest_log}", bio.write)
         log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
     ftp.quit()
 
-    # --- Parsowanie najnowszego logu ---
+    # --- Parsowanie logu ---
     data = {}
     user_lock_times = defaultdict(lambda: defaultdict(list))
 
@@ -145,6 +159,19 @@ def process_logs():
             f"{eff}%", f"{avg}s"
         ])
 
+    # --- ZAPIS CSV (dopisywanie) ---
+    file_exists = os.path.isfile("logi.csv")
+    with open("logi.csv", "a", newline='', encoding="utf-8") as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow([
+                "Nick", "Rodzaj zamka", "Ilość wszystkich prób", "Ilość udanych prób",
+                "Ilość nieudanych prób", "Skuteczność", "Śr. czas"
+            ])
+        writer.writerows(csv_rows)
+
+    print("[INFO] Zaktualizowano plik logi.csv.")
+
     # --- WYSYŁKA TABELI GŁÓWNEJ ---
     table_block = "```\n"
     table_block += f"{'Nick':<10} {'Zamek':<10} {'Wszystkie':<12} {'Udane':<6} {'Nieudane':<9} {'Skut.':<8} {'Śr. czas':<8}\n"
@@ -178,7 +205,7 @@ def process_logs():
     for nick in user_lock_times:
         times_all = [t for lock in user_lock_times[nick].values() for t in lock]
         total_attempts = len(times_all)
-        total_success = sum(len(lock) for lock in user_lock_times[nick].values())  # założenie: każda próba liczona jako udana
+        total_success = sum(len(lock) for lock in user_lock_times[nick].values())
         eff = round(100 * total_success / total_attempts, 2) if total_attempts else 0
         avg = round(statistics.mean(times_all), 2) if total_attempts else 0
         ranking.append((nick, eff, avg))
@@ -196,6 +223,11 @@ def process_logs():
     podium_block += "```"
     send_discord(podium_block, WEBHOOK_TABLE3)
     print("[INFO] Wysłano tabelę podium.")
+
+    # --- ZAPIS NAZWY OSTATNIEGO LOGU ---
+    with open(last_log_file, "w") as f:
+        f.write(latest_log)
+    print(f"[DEBUG] Zapisano ostatnio przetworzony log: {latest_log}")
 
 # --- FUNKCJA GŁÓWNEJ PĘTLI ---
 def main_loop():
