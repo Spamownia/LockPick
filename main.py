@@ -10,27 +10,15 @@ def silent_install(package):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 silent_install("requests")
-silent_install("flask")
 
 # --- IMPORTY ---
 import re
 import csv
 import statistics
 import requests
-from collections import defaultdict
 from ftplib import FTP
 from io import BytesIO
 import os
-import threading
-import time
-from flask import Flask
-
-# --- KONFIGURACJA FLASK ---
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Alive"
 
 # --- FUNKCJA WYSYŁANIA NA DISCORD ---
 def send_discord(content, webhook_url):
@@ -43,10 +31,8 @@ FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
 
-# --- WEBHOOKI ---
+# --- WEBHOOK ---
 WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE2 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE3 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 # --- WZORZEC ---
 pattern = re.compile(
@@ -61,9 +47,9 @@ pattern = re.compile(
 # --- KOLEJNOŚĆ ZAMKÓW ---
 lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
 
-# --- FUNKCJA GŁÓWNA ---
-def process_logs():
-    print("[DEBUG] Rozpoczynam przetwarzanie logów...")
+# --- GŁÓWNA FUNKCJA ---
+def process_all_logs():
+    print("[DEBUG] Rozpoczynam przetwarzanie WSZYSTKICH logów...")
 
     ftp = FTP()
     ftp.connect(FTP_IP, FTP_PORT)
@@ -82,13 +68,7 @@ def process_logs():
         ftp.quit()
         return
 
-    latest_log = sorted(log_files)[-1]
-    print(f"[INFO] Przetwarzanie najnowszego logu: {latest_log}")
-
-    with BytesIO() as bio:
-        ftp.retrbinary(f"RETR {latest_log}", bio.write)
-        log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
-    ftp.quit()
+    print(f"[INFO] Znaleziono {len(log_files)} logów do przetworzenia.")
 
     # --- Wczytywanie dotychczasowych danych ---
     history_data = {}
@@ -111,31 +91,41 @@ def process_logs():
                     "times": [avg_time]*all_attempts  # przybliżenie
                 }
 
-    # --- Parsowanie najnowszego logu ---
+    # --- Parsowanie WSZYSTKICH logów ---
     current_data = {}
-    for match in pattern.finditer(log_text):
-        nick = match.group("nick")
-        lock_type = match.group("lock_type")
-        success = match.group("success")
-        failed_attempts = int(match.group("failed_attempts"))
-        elapsed = float(match.group("elapsed"))
+    for log_file in sorted(log_files):
+        print(f"[INFO] Przetwarzanie: {log_file}")
 
-        key = (nick, lock_type)
-        if key not in current_data:
-            current_data[key] = {
-                "all_attempts": 0,
-                "successful_attempts": 0,
-                "failed_attempts": 0,
-                "times": [],
-            }
+        with BytesIO() as bio:
+            ftp.retrbinary(f"RETR {log_file}", bio.write)
+            log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
 
-        current_data[key]["all_attempts"] += 1
-        if success == "Yes":
-            current_data[key]["successful_attempts"] += 1
-        else:
-            current_data[key]["failed_attempts"] += 1
+        for match in pattern.finditer(log_text):
+            nick = match.group("nick")
+            lock_type = match.group("lock_type")
+            success = match.group("success")
+            failed_attempts = int(match.group("failed_attempts"))
+            elapsed = float(match.group("elapsed"))
 
-        current_data[key]["times"].append(elapsed)
+            key = (nick, lock_type)
+            if key not in current_data:
+                current_data[key] = {
+                    "all_attempts": 0,
+                    "successful_attempts": 0,
+                    "failed_attempts": 0,
+                    "times": [],
+                }
+
+            current_data[key]["all_attempts"] += 1
+            if success == "Yes":
+                current_data[key]["successful_attempts"] += 1
+            else:
+                current_data[key]["failed_attempts"] += 1
+
+            current_data[key]["times"].append(elapsed)
+
+    ftp.quit()
+    print("[DEBUG] Pobieranie wszystkich logów zakończone.")
 
     # --- Sumowanie dotychczasowych i aktualnych danych ---
     combined_data = {}
@@ -200,16 +190,8 @@ def process_logs():
     send_discord(table_block, WEBHOOK_TABLE1)
 
     print("[DEBUG] Wysłano tabelę główną na Discord.")
-    print("[INFO] Zakończono przetwarzanie logów i wysyłkę.")
+    print("[INFO] Zakończono przetwarzanie WSZYSTKICH logów i wysyłkę.")
 
-# --- FUNKCJA GŁÓWNEJ PĘTLI ---
-def main_loop():
-    while True:
-        process_logs()
-        time.sleep(60)
-
-# --- START SERWERA I PĘTLI ---
+# --- URUCHOMIENIE JEDNORAZOWE ---
 if __name__ == "__main__":
-    threading.Thread(target=main_loop, daemon=True).start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    process_all_logs()
