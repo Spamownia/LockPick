@@ -1,7 +1,10 @@
 services:
-  - type: worker
-    name: LockPick
+  - type: web
+    name: killer-stats-ping
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python main.py"
     plan: free
+    envVars:
+      - key: PORT
+        value: 10000
