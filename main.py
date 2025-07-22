@@ -6,7 +6,7 @@ def silent_install(package):
     try:
         __import__(package)
     except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "pip", "install", package],
+        subprocess.run([sys.executable, "-m", "pip", "install", package],
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 silent_install("requests")
@@ -23,6 +23,7 @@ from io import BytesIO
 import os
 import threading
 import time
+import json
 from flask import Flask
 
 # --- KONFIGURACJA FLASK ---
@@ -62,11 +63,18 @@ pattern = re.compile(
 # --- KOLEJNOŚĆ ZAMKÓW ---
 lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
 
-# --- ŚLEDZENIE PRZETWORZONYCH LINII ---
-processed_lines = set()
+# --- ŁADOWANIE PRZETWORZONYCH LINII Z PLIKU ---
+processed_lines_file = "processed_lines.json"
+if os.path.isfile(processed_lines_file):
+    with open(processed_lines_file, "r", encoding="utf-8") as f:
+        processed_lines = set(json.load(f))
+else:
+    processed_lines = set()
 
 # --- FUNKCJA GŁÓWNA ---
 def process_logs():
+    global processed_lines
+
     print("[DEBUG] Rozpoczynam przetwarzanie logów...")
 
     ftp = FTP()
@@ -181,6 +189,10 @@ def process_logs():
     podium_block += "```"
     send_discord(podium_block, WEBHOOK_TABLE3)
     print("[INFO] Wysłano tabelę podium.")
+
+    # --- ZAPIS PRZETWORZONYCH LINII DO PLIKU ---
+    with open(processed_lines_file, "w", encoding="utf-8") as f:
+        json.dump(list(processed_lines), f, ensure_ascii=False)
 
 # --- FUNKCJA GŁÓWNEJ PĘTLI ---
 def main_loop():
