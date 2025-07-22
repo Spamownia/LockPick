@@ -61,20 +61,8 @@ pattern = re.compile(
 # --- KOLEJNOŚĆ ZAMKÓW ---
 lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
 
-# --- FUNKCJA TWORZENIA PLIKÓW JEŚLI BRAK ---
-def create_if_missing(filename, headers):
-    if not os.path.isfile(filename):
-        with open(filename, "w", newline='', encoding="utf-8") as f:
-            writer = csv.writer(f)
-            writer.writerow(headers)
-        print(f"[INFO] Utworzono brakujący plik {filename}.")
-
-# --- GLOBALNE ---
-last_processed_lines = set()
-
-# --- GŁÓWNA FUNKCJA PRZETWARZAJĄCA LOGI ---
+# --- FUNKCJA GŁÓWNA ---
 def process_logs():
-    global last_processed_lines
     print("[DEBUG] Rozpoczynam przetwarzanie logów...")
 
     ftp = FTP()
@@ -95,29 +83,36 @@ def process_logs():
         return
 
     latest_log = sorted(log_files)[-1]
-    print(f"[INFO] Najnowszy log: {latest_log}")
+    print(f"[INFO] Przetwarzanie najnowszego logu: {latest_log}")
 
     with BytesIO() as bio:
         ftp.retrbinary(f"RETR {latest_log}", bio.write)
         log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
-
     ftp.quit()
 
-    # --- SPRAWDZENIE NOWYCH LINII ---
-    current_lines = set(pattern.findall(log_text))
-    new_lines = current_lines - last_processed_lines
+    # --- Wczytywanie dotychczasowych danych ---
+    history_data = {}
+    if os.path.isfile("logi.csv"):
+        with open("logi.csv", newline='', encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader, None)  # skip header
+            for row in reader:
+                if len(row) < 7 or not row[0]: continue
+                nick, lock_type = row[0], row[1]
+                all_attempts = int(row[2])
+                successful_attempts = int(row[3])
+                failed_attempts = int(row[4])
+                effectiveness = float(row[5].strip('%'))
+                avg_time = float(row[6].strip('s'))
+                history_data[(nick, lock_type)] = {
+                    "all_attempts": all_attempts,
+                    "successful_attempts": successful_attempts,
+                    "failed_attempts": failed_attempts,
+                    "times": [avg_time]*all_attempts  # przybliżenie
+                }
 
-    if not new_lines:
-        print("[INFO] Brak nowych wpisów w logu.")
-        return
-    else:
-        print(f"[INFO] Wykryto {len(new_lines)} nowych wpisów.")
-        last_processed_lines = current_lines
-
-    # --- PARSOWANIE ---
-    data = {}
-    player_summary = {}
-
+    # --- Parsowanie najnowszego logu ---
+    current_data = {}
     for match in pattern.finditer(log_text):
         nick = match.group("nick")
         lock_type = match.group("lock_type")
@@ -126,56 +121,73 @@ def process_logs():
         elapsed = float(match.group("elapsed"))
 
         key = (nick, lock_type)
-        if key not in data:
-            data[key] = {
+        if key not in current_data:
+            current_data[key] = {
                 "all_attempts": 0,
                 "successful_attempts": 0,
                 "failed_attempts": 0,
                 "times": [],
             }
 
-        data[key]["all_attempts"] += 1
+        current_data[key]["all_attempts"] += 1
         if success == "Yes":
-            data[key]["successful_attempts"] += 1
+            current_data[key]["successful_attempts"] += 1
         else:
-            data[key]["failed_attempts"] += 1
+            current_data[key]["failed_attempts"] += 1
 
-        data[key]["times"].append(elapsed)
+        current_data[key]["times"].append(elapsed)
 
-        if nick not in player_summary:
-            player_summary[nick] = {
-                "all_attempts": 0,
-                "successful_attempts": 0,
-                "times": []
-            }
-        player_summary[nick]["all_attempts"] += 1
-        if success == "Yes":
-            player_summary[nick]["successful_attempts"] += 1
-        player_summary[nick]["times"].append(elapsed)
+    # --- Sumowanie dotychczasowych i aktualnych danych ---
+    combined_data = {}
+    for key in set(history_data.keys()).union(current_data.keys()):
+        hist = history_data.get(key, {"all_attempts":0,"successful_attempts":0,"failed_attempts":0,"times":[]})
+        curr = current_data.get(key, {"all_attempts":0,"successful_attempts":0,"failed_attempts":0,"times":[]})
 
-    # --- GENEROWANIE I WYSYŁKA TRZECH TABEL ---
-    # Tabela główna
-    sorted_data = sorted(
-        data.items(),
-        key=lambda x: (x[0][0], lock_order.get(x[0][1], 99))
-    )
+        all_attempts = hist["all_attempts"] + curr["all_attempts"]
+        successful_attempts = hist["successful_attempts"] + curr["successful_attempts"]
+        failed_attempts = hist["failed_attempts"] + curr["failed_attempts"]
+        times = hist["times"] + curr["times"]
+
+        combined_data[key] = {
+            "all_attempts": all_attempts,
+            "successful_attempts": successful_attempts,
+            "failed_attempts": failed_attempts,
+            "times": times
+        }
+
+    # --- Sortowanie danych do tabel ---
+    sorted_data = sorted(combined_data.items(), key=lambda x: (x[0][0], lock_order.get(x[0][1], 99)))
+
+    # --- Generowanie tabeli głównej ---
     csv_rows = []
     last_nick = None
     for (nick, lock_type), stats in sorted_data:
         if last_nick and nick != last_nick:
             csv_rows.append([""] * 7)
         last_nick = nick
+
         all_attempts = stats["all_attempts"]
         successful_attempts = stats["successful_attempts"]
         failed_attempts = stats["failed_attempts"]
         avg_time = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
         effectiveness = round(100 * successful_attempts / all_attempts, 2) if all_attempts else 0
+
         csv_rows.append([
             nick, lock_type, all_attempts, successful_attempts, failed_attempts,
             f"{effectiveness}%", f"{avg_time}s"
         ])
 
-    # Wysyłka tabeli głównej
+    with open("logi.csv", "w", newline='', encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            "Nick", "Rodzaj zamka", "Ilość wszystkich prób", "Ilość udanych prób",
+            "Ilość nieudanych prób", "Skuteczność", "Śr. czas"
+        ])
+        writer.writerows(csv_rows)
+
+    print("[DEBUG] Zapisano plik logi.csv.")
+
+    # --- WYSYŁKA NA DISCORD ---
     table_block = "```\n"
     table_block += f"{'Nick':<10} {'Zamek':<10} {'Wszystkie':<12} {'Udane':<6} {'Nieudane':<9} {'Skut.':<8} {'Śr. czas':<8}\n"
     table_block += "-" * 70 + "\n"
@@ -187,42 +199,8 @@ def process_logs():
     table_block += "```"
     send_discord(table_block, WEBHOOK_TABLE1)
 
-    # Tabela admin
-    admin_block = "```\n"
-    admin_block += f"{'Nick':<10} {'Zamek':<10} {'Skut.':<10} {'Śr. czas':<10}\n"
-    admin_block += "-" * 45 + "\n"
-    for (nick, lock_type), stats in sorted_data:
-        all_attempts = stats["all_attempts"]
-        succ = stats["successful_attempts"]
-        eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
-        avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
-        admin_block += f"{nick:<10} {lock_type:<10} {str(eff)+'%':<10} {str(avg)+'s':<10}\n"
-    admin_block += "```"
-    send_discord(admin_block, WEBHOOK_TABLE2)
-
-    # Podium
-    ranking = []
-    for nick in player_summary:
-        times_all = player_summary[nick]["times"]
-        total_attempts = player_summary[nick]["all_attempts"]
-        total_success = player_summary[nick]["successful_attempts"]
-        effectiveness = round(100 * total_success / total_attempts, 2) if total_attempts else 0
-        avg_time = round(statistics.mean(times_all), 2) if total_attempts else 0
-        ranking.append((nick, effectiveness, avg_time))
-    ranking = sorted(ranking, key=lambda x: (-x[1], x[2]))[:5]
-
-    podium_block = "```\n"
-    podium_block += "🏆 PODIUM\n"
-    podium_block += "-" * 50 + "\n"
-    podium_block += f"{'Miejsce':<8}{'Nick':<12}{'Skut.':<10}{'Śr. czas':<10}\n"
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    for i, (nick, eff, avg) in enumerate(ranking):
-        medal = medals[i]
-        podium_block += f"{medal:<2}{str(i+1):<6}{nick:<12}{str(eff)+'%':<10}{str(avg)+'s':<10}\n"
-    podium_block += "```"
-    send_discord(podium_block, WEBHOOK_TABLE3)
-
-    print("[INFO] Zakończono przetwarzanie logu i wysyłkę.")
+    print("[DEBUG] Wysłano tabelę główną na Discord.")
+    print("[INFO] Zakończono przetwarzanie logów i wysyłkę.")
 
 # --- FUNKCJA GŁÓWNEJ PĘTLI ---
 def main_loop():
