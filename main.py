@@ -19,6 +19,8 @@ CSV_FILE = 'logi.csv'
 
 # --- FUNKCJA FORMATUJĄCA TABELĘ ---
 def format_table(headers, rows):
+    if not rows:
+        return "Brak danych."
     col_widths = [max(len(h), *(len(str(r[i])) for r in rows)) + 2 for i, h in enumerate(headers)]
     lines = []
 
@@ -76,33 +78,50 @@ def generate_tables(data):
 # --- WYSYŁKA DO WEBHOOKA ---
 def send_webhook(admin_table, stats_table, podium_table):
     message = f"**ADMIN**\n```{admin_table}```\n**STATYSTYKI**\n```{stats_table}```\n**PODIUM**\n```{podium_table}```"
-    requests.post(WEBHOOK_URL, json={"content": message})
+    response = requests.post(WEBHOOK_URL, json={"content": message})
+    print(f"[WEBHOOK] Status: {response.status_code}")
 
 # --- WCZYTYWANIE CSV ---
 def read_csv():
-    with open(CSV_FILE, newline='', encoding='utf-8') as csvfile:
-        reader = csv.reader(csvfile)
-        next(reader)  # pomiń nagłówek
-        data = [row for row in reader if row]
-    return data
+    try:
+        with open(CSV_FILE, newline='', encoding='utf-8') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # pomiń nagłówek
+            data = [row for row in reader if row]
+        return data
+    except Exception as e:
+        print(f"[ERROR] Błąd wczytywania CSV: {e}")
+        return []
 
 # --- MONITOROWANIE PLIKU CSV ---
 def process_loop():
     prev_lines = read_csv()
+    print(f"[START] Wczytano {len(prev_lines)} linii z pliku CSV.")
     admin, stats, podium = generate_tables(prev_lines)
     send_webhook(admin, stats, podium)
+    print("[INFO] Wysłano tabele startowe.")
 
     while True:
         time.sleep(60)
+        print("[LOOP] Sprawdzanie nowych wpisów...")
         current_lines = read_csv()
+        print(f"[LOOP] Liczba linii w CSV: {len(current_lines)}")
+
         if len(current_lines) == len(prev_lines):
             print("[INFO] Brak nowych wpisów.")
-        else:
+        elif len(current_lines) > len(prev_lines):
             new_entries = current_lines[len(prev_lines):]
+            print(f"[INFO] Znaleziono {len(new_entries)} nowych wpisów.")
             prev_lines += new_entries
             admin, stats, podium = generate_tables(prev_lines)
             send_webhook(admin, stats, podium)
             print("[INFO] Wysłano zaktualizowane tabele.")
+        else:
+            print("[WARNING] Liczba linii w CSV zmniejszyła się. Aktualizuję cały plik.")
+            prev_lines = current_lines
+            admin, stats, podium = generate_tables(prev_lines)
+            send_webhook(admin, stats, podium)
+            print("[INFO] Wysłano tabele po przeładowaniu pliku.")
 
 # --- FLASK KEEPALIVE ---
 @app.route('/')
