@@ -53,6 +53,23 @@ def center(text, width):
 
 def process_loop():
     seen_lines = set()
+    data_dict = {}
+
+    # 1. Wczytanie istniejącego pliku CSV jako bazowej bazy danych
+    if os.path.exists("logi.csv"):
+        with open("logi.csv", "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            next(reader, None)
+            for row in reader:
+                if len(row) < 7: continue
+                nick, lock_type, all_attempts, succ, fail, eff, avg = row
+                key = (nick, lock_type)
+                data_dict[key] = {
+                    "all_attempts": int(all_attempts),
+                    "successful_attempts": int(succ),
+                    "failed_attempts": int(fail),
+                    "times": [float(avg.rstrip('s'))] * int(all_attempts)
+                }
 
     while True:
         ftp = FTP()
@@ -82,24 +99,6 @@ def process_loop():
             time.sleep(60)
             continue
 
-        data_dict = {}
-        if os.path.exists("logi.csv"):
-            with open("logi.csv", "r", encoding="utf-8") as f:
-                reader = csv.reader(f)
-                next(reader, None)
-                for row in reader:
-                    if len(row) < 7: continue
-                    nick, lock_type, all_attempts, succ, fail, eff, avg = row
-                    key = (nick, lock_type)
-                    data_dict[key] = {
-                        "all_attempts": int(all_attempts),
-                        "successful_attempts": int(succ),
-                        "failed_attempts": int(fail),
-                        "times": [float(avg.rstrip('s'))] * int(all_attempts)
-                    }
-
-        user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
-
         for line in new_lines:
             match = pattern.search(line)
             if match:
@@ -124,11 +123,7 @@ def process_loop():
                     data_dict[key]["failed_attempts"] += 1
                 data_dict[key]["times"].append(elapsed)
 
-                user_summary[nick]["total"] += 1
-                user_summary[nick]["times"].append(elapsed)
-                if success == "Yes":
-                    user_summary[nick]["success"] += 1
-
+        # 2. Zapis pełnej zaktualizowanej bazy do pliku CSV
         with open("logi.csv", "w", newline='', encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["Nick", "Rodzaj zamka", "Ilość wszystkich prób", "Ilość udanych prób",
@@ -141,11 +136,10 @@ def process_loop():
                 eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
                 writer.writerow([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
 
-        # Tabela główna
+        # 3. Generowanie tabeli do webhooka
         headers = ["Nick", "Zamek", "Wszystkie", "Udane", "Nieudane", "Skut.", "Śr. czas"]
-
-        # Przygotowanie wszystkich wierszy jako list list
         table_rows = []
+
         for (nick, lock_type), stats in data_dict.items():
             all_attempts = stats["all_attempts"]
             succ = stats["successful_attempts"]
@@ -162,7 +156,6 @@ def process_loop():
                 f"{avg}s"
             ])
 
-        # Obliczenie szerokości kolumn na podstawie nagłówków i danych
         col_widths = []
         for i in range(len(headers)):
             max_len = len(headers[i])
@@ -171,7 +164,6 @@ def process_loop():
                     max_len = max(max_len, len(str(row[i])))
             col_widths.append(max_len + 2)
 
-        # Generowanie tabeli
         table_block = "```\n"
         table_block += "".join([center(headers[i], col_widths[i]) for i in range(len(headers))]) + "\n"
         table_block += "-" * sum(col_widths) + "\n"
