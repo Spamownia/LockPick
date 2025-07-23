@@ -1,169 +1,184 @@
-# --- AUTOMATYCZNA INSTALACJA (cicho) ---
-import subprocess
-import sys
-import os
+import ftplib
 import re
+import json
+import os
 import csv
 import statistics
 import requests
-from collections import defaultdict
-from ftplib import FTP
-from io import BytesIO
 import threading
 import time
-import json
-from flask import Flask
+from flask import Flask, request
 
-def silent_install(package):
-    try:
-        __import__(package)
-    except ImportError:
-        subprocess.run([sys.executable, "-m", "pip", "install", package],
-                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-
-silent_install("requests")
-silent_install("flask")
-
-# --- KONFIGURACJA ---
-FTP_IP = "176.57.174.10"
+# Konfiguracja FTP
+FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
 
-WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE2 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE3 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-
-# Ścieżki zapisu - katalog /tmp jest zapisem w Render i większości chmur
+# Katalog na lokalne tymczasowe pliki
 BASE_DIR = "/tmp"
 CSV_FILE = os.path.join(BASE_DIR, "logi.csv")
-PROCESSED_FILE = os.path.join(BASE_DIR, "processed_lines.json")
+PROCESSED_JSON = os.path.join(BASE_DIR, "processed_lines.json")
 
-# --- WZORZEC ---
-pattern = re.compile(
-    r"User: (?P<nick>[\w\d]+) \(\d+, [\d]+\)\. "
-    r"Success: (?P<success>Yes|No)\. "
-    r"Elapsed time: (?P<elapsed>[\d\.]+)\. "
-    r"Failed attempts: (?P<failed_attempts>\d+)\. "
-    r"Target object: [^\)]+\)\. "
-    r"Lock type: (?P<lock_type>\w+)\."
-)
+# Webhook Discord (3 osobne wiadomości)
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# --- FLASK ---
 app = Flask(__name__)
 
-@app.route('/')
-def index():
-    return "Alive"
+def connect_ftp():
+    ftp = ftplib.FTP()
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+    ftp.login(FTP_USER, FTP_PASS)
+    return ftp
 
-# --- FUNKCJA WYSYŁANIA NA DISCORD ---
-def send_discord(content, webhook_url):
-    print("[DEBUG] Wysyłanie na webhook...")
+def list_log_files(ftp):
+    files = ftp.nlst()
+    # Filtruj pliki gameplay_*.log
+    log_files = [f for f in files if re.match(r"gameplay_\d{14}\.log", f)]
+    return sorted(log_files)  # sortuj rosnąco
+
+def download_log(ftp, filename):
+    lines = []
     try:
-        r = requests.post(webhook_url, json={"content": content})
-        if r.status_code != 204 and r.status_code != 200:
-            print(f"[WARNING] Webhook zwrócił status {r.status_code}")
+        ftp.retrlines(f"RETR {filename}", callback=lines.append)
+        print(f"[INFO] Pobieram log: {filename}")
     except Exception as e:
-        print(f"[ERROR] Błąd wysyłania webhooka: {e}")
+        print(f"[ERROR] Błąd pobierania {filename}: {e}")
+    return lines
 
-# --- Ładowanie przetworzonych linii ---
-def load_processed():
-    if os.path.isfile(PROCESSED_FILE):
-        try:
-            with open(PROCESSED_FILE, "r", encoding="utf-8") as f:
-                return set(json.load(f))
-        except Exception as e:
-            print(f"[ERROR] Błąd odczytu przetworzonych linii: {e}")
+def parse_line(line):
+    # Przykładowy format (do dopasowania do Twoich logów):
+    # <Timestamp> Nick RodzajZamka Czas [SUCCESS/FAIL]
+    # Przykład:
+    # 2025.07.23-12.34.56: Player1 Padlock 12.5 SUCCESS
+
+    # Dopasowanie regex:
+    pattern = re.compile(r"""
+        ^\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\s+       # Timestamp
+        (?P<nick>\w+)\s+
+        (?P<lock_type>[^\s]+)\s+
+        (?P<time>[0-9]*\.?[0-9]+)\s+
+        (?P<result>SUCCESS|FAIL)$
+    """, re.VERBOSE)
+
+    m = pattern.match(line)
+    if not m:
+        return None
+    return {
+        "Nick": m.group("nick"),
+        "Rodzaj zamka": m.group("lock_type"),
+        "Czas": float(m.group("time")),
+        "Wynik": m.group("result")
+    }
+
+def load_processed_lines():
+    if os.path.exists(PROCESSED_JSON):
+        with open(PROCESSED_JSON, "r", encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+                print(f"[INFO] Wczytano {len(data)} przetworzonych linii z JSON")
+                return set(data)
+            except Exception as e:
+                print(f"[ERROR] Błąd wczytywania JSON: {e}")
     return set()
 
-# --- Zapis przetworzonych linii ---
-def save_processed(processed_lines):
+def save_processed_lines(lines_set):
     try:
-        with open(PROCESSED_FILE, "w", encoding="utf-8") as f:
-            json.dump(list(processed_lines), f, ensure_ascii=False)
-        print(f"[INFO] Zapisano plik JSON: {PROCESSED_FILE}")
+        with open(PROCESSED_JSON, "w", encoding="utf-8") as f:
+            json.dump(list(lines_set), f)
+        print(f"[INFO] Zapisano plik JSON: {PROCESSED_JSON}")
     except Exception as e:
-        print(f"[ERROR] Nie udało się zapisać pliku JSON: {e}")
+        print(f"[ERROR] Błąd zapisu JSON: {e}")
 
-# --- Funkcja do pobierania wszystkich logów z FTP i zwracania wszystkich unikalnych nowych linii ---
-def fetch_all_logs():
-    print("[DEBUG] Łączenie z FTP...")
-    ftp = FTP()
-    ftp.connect(FTP_IP, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(FTP_PATH)
-
-    log_files = []
-    ftp.retrlines("MLSD", lambda line: log_files.append(line.split(";")[-1].strip()))
-    log_files = sorted([f for f in log_files if f.startswith("gameplay_") and f.endswith(".log")])
-
-    if not log_files:
-        print("[ERROR] Brak plików gameplay_*.log na FTP.")
-        ftp.quit()
-        return []
-
-    all_new_lines = []
-    processed_lines = load_processed()
-
-    for log_file in log_files:
-        print(f"[INFO] Pobieram log: {log_file}")
-        with BytesIO() as bio:
-            ftp.retrbinary(f"RETR {log_file}", bio.write)
-            log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
-        for line in log_text.splitlines():
-            if line not in processed_lines:
-                all_new_lines.append(line)
-                processed_lines.add(line)
-
-    ftp.quit()
-
-    save_processed(processed_lines)
-    print(f"[DEBUG] Łącznie nowych unikalnych linii: {len(all_new_lines)}")
-    return all_new_lines
-
-# --- Parsowanie i agregacja danych ---
-def parse_and_aggregate(lines):
+def aggregate_data(parsed_lines):
+    # Struktura: data[(nick, lock_type)] = {"all_attempts": int, "successful_attempts": int, "failed_attempts": int, "times": [float]}
     data = {}
-    user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
-
-    for entry in lines:
-        match = pattern.search(entry)
-        if not match:
-            continue
-        nick = match.group("nick")
-        lock_type = match.group("lock_type")
-        success = match.group("success")
-        elapsed = float(match.group("elapsed"))
-
-        # Podsumowanie per user
-        user_summary[nick]["total"] += 1
-        user_summary[nick]["times"].append(elapsed)
-        if success == "Yes":
-            user_summary[nick]["success"] += 1
-
-        key = (nick, lock_type)
+    for entry in parsed_lines:
+        key = (entry["Nick"], entry["Rodzaj zamka"])
         if key not in data:
             data[key] = {
                 "all_attempts": 0,
                 "successful_attempts": 0,
                 "failed_attempts": 0,
-                "times": [],
+                "times": []
             }
-
         data[key]["all_attempts"] += 1
-        if success == "Yes":
+        if entry["Wynik"] == "SUCCESS":
             data[key]["successful_attempts"] += 1
         else:
             data[key]["failed_attempts"] += 1
-        data[key]["times"].append(elapsed)
+        data[key]["times"].append(entry["Czas"])
+    return data
 
-    return data, user_summary
+def generate_admin_table(data):
+    lines = []
+    lines.append("**Admin**")
+    header = "Nick | Rodzaj zamka | Wszystkie podjęte próby | Udane | Nieudane | Skuteczność | Średni czas"
+    lines.append(header)
+    # Sortuj po nicku, potem rodzaju zamka
+    for (nick, lock), stats in sorted(data.items(), key=lambda x: (x[0][0].lower(), x[0][1].lower())):
+        all_attempts = stats["all_attempts"]
+        succ = stats["successful_attempts"]
+        fail = stats["failed_attempts"]
+        avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
+        eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
+        line = f"{nick} | {lock} | {all_attempts} | {succ} | {fail} | {eff}% | {avg}s"
+        lines.append(line)
+    return "\n".join(lines)
 
-# --- Zapis danych do CSV ---
+def generate_stats_table(data):
+    lines = []
+    lines.append("**Statystyki**")
+    header = "Nick | Zamek | Skuteczność | Średni czas"
+    lines.append(header)
+    for (nick, lock), stats in sorted(data.items(), key=lambda x: (x[0][0].lower(), x[0][1].lower())):
+        all_attempts = stats["all_attempts"]
+        succ = stats["successful_attempts"]
+        avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
+        eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
+        line = f"{nick} | {lock} | {eff}% | {avg}s"
+        lines.append(line)
+    return "\n".join(lines)
+
+def generate_podium_table(data):
+    lines = []
+    lines.append("**Podium**")
+    header = "   | Nick | Skuteczność | Średni czas"
+    lines.append(header)
+    # Agreguj per nick: suma skuteczności * liczba zamków (dla ważenia) i średni czas średni ważony
+    agg = {}
+    for (nick, lock), stats in data.items():
+        all_attempts = stats["all_attempts"]
+        succ = stats["successful_attempts"]
+        avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
+        eff = (succ / all_attempts) if all_attempts else 0
+        if nick not in agg:
+            agg[nick] = {"eff_sum": 0, "time_sum": 0, "count": 0}
+        agg[nick]["eff_sum"] += eff
+        agg[nick]["time_sum"] += avg
+        agg[nick]["count"] += 1
+
+    # Oblicz średnie na nick
+    podium_list = []
+    for nick, vals in agg.items():
+        eff_avg = round(100 * (vals["eff_sum"] / vals["count"]), 2) if vals["count"] else 0
+        time_avg = round(vals["time_sum"] / vals["count"], 2) if vals["count"] else 0
+        podium_list.append((nick, eff_avg, time_avg))
+
+    # Sortuj po skuteczności malejąco
+    podium_list.sort(key=lambda x: x[1], reverse=True)
+
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (nick, eff, time_avg) in enumerate(podium_list):
+        medal = medals[i] if i < 3 else ""
+        line = f"{medal} | {nick} | {eff}% | {time_avg}s"
+        lines.append(line)
+    return "\n".join(lines)
+
 def save_csv(data):
     os.makedirs(BASE_DIR, exist_ok=True)
     try:
+        print(f"[DEBUG] Próba zapisu CSV do: {CSV_FILE}")
         with open(CSV_FILE, "w", encoding="utf-8", newline='') as f:
             fieldnames = ["Nick", "Rodzaj zamka", "Wszystkie podjęte próby", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
             writer = csv.DictWriter(f, fieldnames=fieldnames)
@@ -184,114 +199,144 @@ def save_csv(data):
                     "Średni czas": f"{avg}s"
                 })
         print(f"[INFO] Zapisano plik CSV: {CSV_FILE}")
+        print(f"[DEBUG] Zawartość katalogu {BASE_DIR}: {os.listdir(BASE_DIR)}")
     except Exception as e:
         print(f"[ERROR] Nie udało się zapisać pliku CSV: {e}")
 
-# --- Generowanie tabel do Discorda ---
-def generate_tables(data, user_summary):
-    # Tabela Admin
-    admin_lines = []
-    header_admin = "Nick | Rodzaj zamka | Wszystkie podjęte próby | Udane | Nieudane | Skuteczność | Średni czas"
-    admin_lines.append(header_admin)
-    for (nick, lock_type), stats in sorted(data.items(), key=lambda x: (x[0][0].lower(), x[0][1].lower())):
-        all_attempts = stats["all_attempts"]
-        succ = stats["successful_attempts"]
-        fail = stats["failed_attempts"]
-        avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
-        eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
-        line = f"{nick} | {lock_type} | {all_attempts} | {succ} | {fail} | {eff}% | {avg}s"
-        admin_lines.append(line)
+def send_webhook(message):
+    data = {"content": message}
+    try:
+        response = requests.post(WEBHOOK_URL, json=data)
+        if response.status_code == 204:
+            print("[INFO] Wysłano wiadomość na webhook.")
+        else:
+            print(f"[WARNING] Webhook zwrócił status {response.status_code}: {response.text}")
+    except Exception as e:
+        print(f"[ERROR] Błąd wysyłania webhook: {e}")
 
-    admin_table = "```\n" + "\n".join(admin_lines) + "\n```"
+def initial_load_and_send():
+    ftp = None
+    try:
+        ftp = connect_ftp()
+        log_files = list_log_files(ftp)
+        all_lines = []
+        for log_file in log_files:
+            lines = download_log(ftp, log_file)
+            all_lines.extend(lines)
+        ftp.quit()
+    except Exception as e:
+        print(f"[ERROR] Błąd podczas łączenia/pobierania logów FTP: {e}")
+        if ftp:
+            ftp.quit()
+        return None
 
-    # Tabela Statystyki
-    stats_lines = []
-    header_stats = "Nick | Zamek | Skuteczność | Średni czas"
-    stats_lines.append(header_stats)
-    for (nick, lock_type), stats in sorted(data.items(), key=lambda x: (x[0][0].lower(), x[0][1].lower())):
-        all_attempts = stats["all_attempts"]
-        succ = stats["successful_attempts"]
-        avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
-        eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
-        line = f"{nick} | {lock_type} | {eff}% | {avg}s"
-        stats_lines.append(line)
+    processed_lines_set = load_processed_lines()
 
-    stats_table = "```\n" + "\n".join(stats_lines) + "\n```"
+    new_lines = []
+    parsed_entries = []
+    for line in all_lines:
+        if line in processed_lines_set:
+            continue
+        parsed = parse_line(line)
+        if parsed:
+            parsed_entries.append(parsed)
+            new_lines.append(line)
 
-    # Tabela Podium
-    medals = ["🥇", "🥈", "🥉"]
-    ranking = []
-    for nick, summary in user_summary.items():
-        total_attempts = summary["total"]
-        total_success = summary["success"]
-        times_all = summary["times"]
-        eff = round(100 * total_success / total_attempts, 2) if total_attempts else 0
-        avg = round(statistics.mean(times_all), 2) if times_all else 0
-        ranking.append((nick, eff, avg))
-
-    ranking = sorted(ranking, key=lambda x: (-x[1], x[2]))[:5]
-
-    podium_lines = ["", "Nick | Skuteczność | Średni czas"]
-    for i, (nick, eff, avg) in enumerate(ranking):
-        medal = medals[i] if i < 3 else "4️⃣" if i == 3 else "5️⃣"
-        podium_lines.append(f"{medal} | {nick} | {eff}% | {avg}s")
-
-    podium_table = "```\n" + "\n".join(podium_lines) + "\n```"
-
-    return admin_table, stats_table, podium_table
-
-# --- Proces aktualizacji (pobranie, przetworzenie, zapis, wysłanie) ---
-def process_all():
-    print("[DEBUG] Pobieram wszystkie nowe logi i parsuję...")
-    new_lines = fetch_all_logs()
     if not new_lines:
-        print("[INFO] Brak nowych wpisów do przetworzenia.")
-        return
+        print("[INFO] Brak nowych wpisów przy początkowym ładowaniu.")
+        return None
 
-    data, user_summary = parse_and_aggregate(new_lines)
+    # Dodaj nowe linie do setu
+    processed_lines_set.update(new_lines)
+    save_processed_lines(processed_lines_set)
+
+    data = aggregate_data(parsed_entries)
     save_csv(data)
 
-    admin_table, stats_table, podium_table = generate_tables(data, user_summary)
+    admin_table = generate_admin_table(data)
+    stats_table = generate_stats_table(data)
+    podium_table = generate_podium_table(data)
 
-    send_discord(admin_table, WEBHOOK_TABLE1)
-    send_discord(stats_table, WEBHOOK_TABLE2)
-    send_discord(podium_table, WEBHOOK_TABLE3)
-    print("[INFO] Wysłano wszystkie trzy tabele.")
+    # Wyślij trzy osobne wiadomości na webhook
+    send_webhook(admin_table)
+    send_webhook(stats_table)
+    send_webhook(podium_table)
 
-# --- Główna pętla co 60s, pobiera tylko nowe wpisy i aktualizuje plik ---
-def main_loop():
-    processed_lines = load_processed()
+    return processed_lines_set, data
+
+def check_new_logs_loop(processed_lines_set, data):
     while True:
-        print("[DEBUG] Sprawdzam nowe logi...")
-        new_lines = fetch_all_logs()
-        if not new_lines:
-            print("[INFO] Brak nowych wpisów w pętli.")
-        else:
-            print(f"[DEBUG] Nowych wpisów: {len(new_lines)}")
-            data, user_summary = parse_and_aggregate(new_lines)
+        try:
+            print("[DEBUG] Sprawdzam nowe logi...")
+            ftp = connect_ftp()
+            log_files = list_log_files(ftp)
+            new_lines = []
+            parsed_entries = []
 
-            # Wczytaj istniejący CSV i dołącz dane - ale uprościmy: 
-            # Dla uniknięcia komplikacji i by mieć poprawne dane, załadujemy wszystkie wpisy z processed_lines i ponownie przetworzymy
+            for log_file in log_files:
+                lines = download_log(ftp, log_file)
+                for line in lines:
+                    if line not in processed_lines_set:
+                        parsed = parse_line(line)
+                        if parsed:
+                            parsed_entries.append(parsed)
+                            new_lines.append(line)
+            ftp.quit()
 
-            # Pobierz wszystkie linie z processed_lines, przetwórz je
-            print("[DEBUG] Odtwarzam pełne dane z processed_lines...")
-            # Przetwórz przetworzone linie (w tym nowe)
-            all_processed_lines = list(processed_lines) + new_lines
-            data_full, user_summary_full = parse_and_aggregate(all_processed_lines)
+            if not new_lines:
+                print("[INFO] Brak nowych wpisów w pętli.")
+            else:
+                print(f"[DEBUG] Nowych wpisów: {len(new_lines)}")
+                processed_lines_set.update(new_lines)
+                save_processed_lines(processed_lines_set)
 
-            save_csv(data_full)
+                # Dodaj nowe dane do istniejącej agregacji
+                for entry in parsed_entries:
+                    key = (entry["Nick"], entry["Rodzaj zamka"])
+                    if key not in data:
+                        data[key] = {
+                            "all_attempts": 0,
+                            "successful_attempts": 0,
+                            "failed_attempts": 0,
+                            "times": []
+                        }
+                    data[key]["all_attempts"] += 1
+                    if entry["Wynik"] == "SUCCESS":
+                        data[key]["successful_attempts"] += 1
+                    else:
+                        data[key]["failed_attempts"] += 1
+                    data[key]["times"].append(entry["Czas"])
 
-            admin_table, stats_table, podium_table = generate_tables(data_full, user_summary_full)
+                save_csv(data)
 
-            send_discord(admin_table, WEBHOOK_TABLE1)
-            send_discord(stats_table, WEBHOOK_TABLE2)
-            send_discord(podium_table, WEBHOOK_TABLE3)
-            print("[INFO] Wysłano tabele po aktualizacji.")
+                admin_table = generate_admin_table(data)
+                stats_table = generate_stats_table(data)
+                podium_table = generate_podium_table(data)
+
+                send_webhook(admin_table)
+                send_webhook(stats_table)
+                send_webhook(podium_table)
+
+                print("[INFO] Wysłano tabele po aktualizacji.")
+
+        except Exception as e:
+            print(f"[ERROR] Błąd w pętli sprawdzającej logi: {e}")
+
+        time.sleep(60)  # 60 sekund przerwy
+
+@app.route("/", methods=["HEAD", "GET"])
+def index():
+    return "", 200
+
+def main_loop():
+    processed_lines_set, data = initial_load_and_send()
+    if processed_lines_set is None or data is None:
+        print("[ERROR] Początkowe ładowanie nie powiodło się, próbuję ponownie za 60s...")
         time.sleep(60)
+        main_loop()
+        return
+    check_new_logs_loop(processed_lines_set, data)
 
-# --- START ---
 if __name__ == "__main__":
-    # Start serwera Flask
     threading.Thread(target=main_loop, daemon=True).start()
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=10000, debug=False)
