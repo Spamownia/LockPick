@@ -143,28 +143,41 @@ def process_loop():
 
         # Tabela główna
         headers = ["Nick", "Zamek", "Wszystkie", "Udane", "Nieudane", "Skut.", "Śr. czas"]
-        col_widths = [max(len(h), max((len(str(r[i])) for r in data_dict), default=0)) + 2 for i, h in enumerate(headers)]
 
-        table_block = "```\n"
-        table_block += "".join([center(h, len(h)+4) for h in headers]) + "\n"
-        table_block += "-" * sum(col_widths) + "\n"
-
+        # Przygotowanie wszystkich wierszy jako list list
+        table_rows = []
         for (nick, lock_type), stats in data_dict.items():
             all_attempts = stats["all_attempts"]
             succ = stats["successful_attempts"]
             fail = stats["failed_attempts"]
             avg = round(statistics.mean(stats["times"]), 2)
             eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
-            row = [
-                center(nick, len(headers[0])+4),
-                center(lock_type, len(headers[1])+4),
-                center(str(all_attempts), len(headers[2])+4),
-                center(str(succ), len(headers[3])+4),
-                center(str(fail), len(headers[4])+4),
-                center(f"{eff}%", len(headers[5])+4),
-                center(f"{avg}s", len(headers[6])+4)
-            ]
-            table_block += "".join(row) + "\n"
+            table_rows.append([
+                nick,
+                lock_type,
+                str(all_attempts),
+                str(succ),
+                str(fail),
+                f"{eff}%",
+                f"{avg}s"
+            ])
+
+        # Obliczenie szerokości kolumn na podstawie nagłówków i danych
+        col_widths = []
+        for i in range(len(headers)):
+            max_len = len(headers[i])
+            for row in table_rows:
+                if i < len(row):
+                    max_len = max(max_len, len(str(row[i])))
+            col_widths.append(max_len + 2)
+
+        # Generowanie tabeli
+        table_block = "```\n"
+        table_block += "".join([center(headers[i], col_widths[i]) for i in range(len(headers))]) + "\n"
+        table_block += "-" * sum(col_widths) + "\n"
+
+        for row in table_rows:
+            table_block += "".join([center(row[i], col_widths[i]) for i in range(len(headers))]) + "\n"
 
         table_block += "```"
 
