@@ -71,131 +71,132 @@ if os.path.isfile(processed_lines_file):
 else:
     processed_lines = set()
 
-# --- TWORZENIE PLIKU CSV Z NAGŁÓWKAMI, JEŚLI NIE ISTNIEJE ---
-if not os.path.isfile("logi.csv"):
-    with open("logi.csv", "w", newline='', encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "Nick", "Rodzaj zamka", "Ilość wszystkich prób", "Ilość udanych prób",
-            "Ilość nieudanych prób", "Skuteczność", "Śr. czas"
-        ])
+# --- BLOKADA DLA JEDNOCZESNEGO PRZETWARZANIA ---
+process_lock = threading.Lock()
 
 # --- FUNKCJA GŁÓWNA ---
 def process_logs():
-    global processed_lines
+    with process_lock:
+        global processed_lines
 
-    print("[DEBUG] Rozpoczynam przetwarzanie logów...")
+        print("[DEBUG] Rozpoczynam przetwarzanie logów...")
 
-    ftp = FTP()
-    ftp.connect(FTP_IP, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(FTP_PATH)
+        ftp = FTP()
+        ftp.connect(FTP_IP, FTP_PORT)
+        ftp.login(FTP_USER, FTP_PASS)
+        ftp.cwd(FTP_PATH)
 
-    log_files = []
-    ftp.retrlines("MLSD", lambda line: log_files.append(line.split(";")[-1].strip()))
-    log_files = sorted([f for f in log_files if f.startswith("gameplay_") and f.endswith(".log")])
+        log_files = []
+        ftp.retrlines("MLSD", lambda line: log_files.append(line.split(";")[-1].strip()))
+        log_files = sorted([f for f in log_files if f.startswith("gameplay_") and f.endswith(".log")])
 
-    if not log_files:
-        print("[ERROR] Brak plików gameplay_*.log na FTP.")
+        if not log_files:
+            print("[ERROR] Brak plików gameplay_*.log na FTP.")
+            ftp.quit()
+            return
+
+        latest_log = log_files[-1]
+        print(f"[INFO] Przetwarzanie logu: {latest_log}")
+
+        with BytesIO() as bio:
+            ftp.retrbinary(f"RETR {latest_log}", bio.write)
+            log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
         ftp.quit()
-        return
 
-    latest_log = log_files[-1]
-    print(f"[INFO] Przetwarzanie logu: {latest_log}")
+        new_events = []
+        for line in log_text.splitlines():
+            if line not in processed_lines:
+                processed_lines.add(line)
+                new_events.append(line)
 
-    with BytesIO() as bio:
-        ftp.retrbinary(f"RETR {latest_log}", bio.write)
-        log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
-    ftp.quit()
+        if not new_events:
+            print("[INFO] Brak nowych zdarzeń w logu.")
+            return
 
-    new_events = []
-    for line in log_text.splitlines():
-        if line not in processed_lines:
-            processed_lines.add(line)
-            new_events.append(line)
+        data = {}
+        user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
 
-    if not new_events:
-        print("[INFO] Brak nowych zdarzeń w logu.")
-        return
+        # --- Parsowanie nowych zdarzeń ---
+        for entry in new_events:
+            match = pattern.search(entry)
+            if match:
+                nick = match.group("nick")
+                lock_type = match.group("lock_type")
+                success = match.group("success")
+                elapsed = float(match.group("elapsed"))
 
-    data = {}
-    user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
+                # Sumowanie dla podium
+                user_summary[nick]["total"] += 1
+                user_summary[nick]["times"].append(elapsed)
+                if success == "Yes":
+                    user_summary[nick]["success"] += 1
 
-    # --- Parsowanie nowych zdarzeń ---
-    for entry in new_events:
-        match = pattern.search(entry)
-        if match:
-            nick = match.group("nick")
-            lock_type = match.group("lock_type")
-            success = match.group("success")
-            elapsed = float(match.group("elapsed"))
+                key = (nick, lock_type)
+                if key not in data:
+                    data[key] = {
+                        "all_attempts": 0,
+                        "successful_attempts": 0,
+                        "failed_attempts": 0,
+                        "times": [],
+                    }
 
-            # Sumowanie dla podium
-            user_summary[nick]["total"] += 1
-            user_summary[nick]["times"].append(elapsed)
-            if success == "Yes":
-                user_summary[nick]["success"] += 1
+                data[key]["all_attempts"] += 1
+                if success == "Yes":
+                    data[key]["successful_attempts"] += 1
+                else:
+                    data[key]["failed_attempts"] += 1
 
-            key = (nick, lock_type)
-            if key not in data:
-                data[key] = {
-                    "all_attempts": 0,
-                    "successful_attempts": 0,
-                    "failed_attempts": 0,
-                    "times": [],
-                }
+                data[key]["times"].append(elapsed)
 
-            data[key]["all_attempts"] += 1
-            if success == "Yes":
-                data[key]["successful_attempts"] += 1
-            else:
-                data[key]["failed_attempts"] += 1
+        print(f"[DEBUG] Przetworzono {len(new_events)} nowych wpisów.")
 
-            data[key]["times"].append(elapsed)
+        # --- ZAPIS DOPISUJĄCY DO CSV ---
+        file_exists = os.path.isfile("logi.csv")
+        with open("logi.csv", "a", newline='', encoding="utf-8") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow([
+                    "Nick", "Rodzaj zamka", "Ilość wszystkich prób", "Ilość udanych prób",
+                    "Ilość nieudanych prób", "Skuteczność", "Śr. czas"
+                ])
+            for (nick, lock_type), stats in data.items():
+                all_attempts = stats["all_attempts"]
+                succ = stats["successful_attempts"]
+                fail = stats["failed_attempts"]
+                avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
+                eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
+                writer.writerow([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
 
-    print(f"[DEBUG] Przetworzono {len(new_events)} nowych wpisów.")
+        # --- TABELA PODIUM (sumy per gracz) ---
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        ranking = []
+        for nick, summary in user_summary.items():
+            total_attempts = summary["total"]
+            total_success = summary["success"]
+            times_all = summary["times"]
 
-    # --- ZAPIS DOPISUJĄCY DO CSV ---
-    with open("logi.csv", "a", newline='', encoding="utf-8") as f:
-        writer = csv.writer(f)
-        for (nick, lock_type), stats in data.items():
-            all_attempts = stats["all_attempts"]
-            succ = stats["successful_attempts"]
-            fail = stats["failed_attempts"]
-            avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
-            eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
-            writer.writerow([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
+            eff = round(100 * total_success / total_attempts, 2) if total_attempts else 0
+            avg = round(statistics.mean(times_all), 2) if times_all else 0
 
-    # --- TABELA PODIUM (sumy per gracz) ---
-    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-    ranking = []
-    for nick, summary in user_summary.items():
-        total_attempts = summary["total"]
-        total_success = summary["success"]
-        times_all = summary["times"]
+            ranking.append((nick, eff, avg))
 
-        eff = round(100 * total_success / total_attempts, 2) if total_attempts else 0
-        avg = round(statistics.mean(times_all), 2) if times_all else 0
+        ranking = sorted(ranking, key=lambda x: (-x[1], x[2]))[:5]
 
-        ranking.append((nick, eff, avg))
+        col_widths = [2, 10, 14, 14]
+        podium_block = "```\n"
+        podium_block += f"{'':<{col_widths[0]}}{'Nick':^{col_widths[1]}}{'Skuteczność':^{col_widths[2]}}{'Śr. czas':^{col_widths[3]}}\n"
+        podium_block += "-" * sum(col_widths) + "\n"
 
-    ranking = sorted(ranking, key=lambda x: (-x[1], x[2]))[:5]
+        for i, (nick, eff, avg) in enumerate(ranking):
+            medal = medals[i]
+            podium_block += f"{medal:<{col_widths[0]}}{nick:^{col_widths[1]}}{(str(eff)+'%'):^{col_widths[2]}}{(str(avg)+'s'):^{col_widths[3]}}\n"
+        podium_block += "```"
+        send_discord(podium_block, WEBHOOK_TABLE3)
+        print("[INFO] Wysłano tabelę podium.")
 
-    col_widths = [2, 10, 14, 14]
-    podium_block = "```\n"
-    podium_block += f"{'':<{col_widths[0]}}{'Nick':^{col_widths[1]}}{'Skuteczność':^{col_widths[2]}}{'Śr. czas':^{col_widths[3]}}\n"
-    podium_block += "-" * sum(col_widths) + "\n"
-
-    for i, (nick, eff, avg) in enumerate(ranking):
-        medal = medals[i]
-        podium_block += f"{medal:<{col_widths[0]}}{nick:^{col_widths[1]}}{(str(eff)+'%'):^{col_widths[2]}}{(str(avg)+'s'):^{col_widths[3]}}\n"
-    podium_block += "```"
-    send_discord(podium_block, WEBHOOK_TABLE3)
-    print("[INFO] Wysłano tabelę podium.")
-
-    # --- ZAPIS PRZETWORZONYCH LINII DO PLIKU ---
-    with open(processed_lines_file, "w", encoding="utf-8") as f:
-        json.dump(list(processed_lines), f, ensure_ascii=False)
+        # --- ZAPIS PRZETWORZONYCH LINII DO PLIKU ---
+        with open(processed_lines_file, "w", encoding="utf-8") as f:
+            json.dump(list(processed_lines), f, ensure_ascii=False)
 
 # --- FUNKCJA GŁÓWNEJ PĘTLI ---
 def main_loop():
