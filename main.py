@@ -10,7 +10,7 @@ def silent_install(package):
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 silent_install("requests")
-silent_install("flask")  # dodano flask
+silent_install("flask")
 
 # --- IMPORTY ---
 import re
@@ -20,16 +20,15 @@ import requests
 import base64
 import os
 import time
-import threading
 from collections import defaultdict
 from ftplib import FTP
 from io import BytesIO
 from flask import Flask
 
-# --- FLASK APP ---
+# --- FLASK ---
 app = Flask(__name__)
 
-@app.route("/")
+@app.route('/')
 def index():
     return "Alive"
 
@@ -89,9 +88,9 @@ FTP_PASS = "LXNdGShY"
 FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
 
 # --- WEBHOOKI ---
-WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE2 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE3 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/..."
+WEBHOOK_TABLE2 = "https://discord.com/api/webhooks/..."
+WEBHOOK_TABLE3 = "https://discord.com/api/webhooks/..."
 
 # --- WZORZEC ---
 pattern = re.compile(
@@ -159,7 +158,7 @@ def process_new_entries(seen_lines):
             all_attempts = 1
             succ = 1 if success == "Yes" else 0
             fail = 1 - succ
-            avg = round(elapsed,2)
+            avg = round(elapsed, 2)
             eff = round(100 * succ / all_attempts, 2)
 
             data_rows.append([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
@@ -171,29 +170,50 @@ def process_new_entries(seen_lines):
 
     # --- Append do GitHub ---
     append_github_file(
-        repo="Spamownia/LockPick",  # <<<< ZMIEŃ NA SWOJE
+        repo="Spamownia/LockPick",
         path="stats/logi.csv",
         message="Append nowych logów",
         append_content=csv_append
     )
 
-    # --- Wysyłka Discord (opcjonalna) ---
-    # send_discord(table_block, WEBHOOK_TABLE1)
+    # --- Generowanie tabel i wysyłka ---
+    # Tabela pełna
+    table_full = "```\nNick,Zamek,Wszystkie,Udane,Nieudane,Skut.,Śr. czas\n"
+    for row in data_rows:
+        table_full += ",".join(map(str, row)) + "\n"
+    table_full += "```"
+    send_discord(table_full, WEBHOOK_TABLE1)
+
+    # Tabela admin
+    table_admin = "```\nNick,Skut.,Śr. czas\n"
+    for nick, summary in user_summary.items():
+        eff = round(100 * summary["success"] / summary["total"], 2) if summary["total"] else 0
+        avg = round(statistics.mean(summary["times"]), 2) if summary["times"] else 0
+        table_admin += f"{nick},{eff}%,{avg}s\n"
+    table_admin += "```"
+    send_discord(table_admin, WEBHOOK_TABLE2)
+
+    # Tabela podium
+    medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+    ranking = []
+    for nick, summary in user_summary.items():
+        eff = round(100 * summary["success"] / summary["total"], 2) if summary["total"] else 0
+        avg = round(statistics.mean(summary["times"]), 2) if summary["times"] else 0
+        ranking.append((nick, eff, avg))
+    ranking = sorted(ranking, key=lambda x: (-x[1], x[2]))[:5]
+
+    table_podium = "```\nMedal,Nick,Skut.,Śr. czas\n"
+    for i, (nick, eff, avg) in enumerate(ranking):
+        table_podium += f"{medals[i]},{nick},{eff}%,{avg}s\n"
+    table_podium += "```"
+    send_discord(table_podium, WEBHOOK_TABLE3)
 
     return seen_lines + new_lines
 
-# --- FUNKCJA PĘTLI ---
-def main_loop():
+# --- PĘTLA ---
+if __name__ == "__main__":
     seen_lines = []
     while True:
         seen_lines = process_new_entries(seen_lines)
         time.sleep(60)
-
-# --- START ---
-if __name__ == "__main__":
-    # uruchom pętlę w wątku
-    threading.Thread(target=main_loop, daemon=True).start()
-
-    # uruchom Flask
-    port = int(os.environ.get("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
