@@ -1,134 +1,103 @@
-# --- AUTOMATYCZNA INSTALACJA WYMAGANYCH BIBLIOTEK ---
-import subprocess
-import sys
-try:
-    import requests
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests"])
-    import requests
-
-import threading
-import time
 import csv
+import time
+import threading
+import requests
 from flask import Flask
+from collections import defaultdict
+
+CSV_FILE = 'lockpick.csv'
+WEBHOOK_URL = 'https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3'  # Twój webhook
 
 app = Flask(__name__)
 
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-CSV_FILE = 'logi.csv'
+def read_csv():
+    with open(CSV_FILE, newline='', encoding='utf-8') as f:
+        reader = csv.DictReader(f)
+        data = list(reader)
+    return data
 
-# --- FUNKCJA FORMATUJĄCA TABELĘ ---
-def format_table(headers, rows):
-    if not rows:
-        return "Brak danych."
-    col_widths = [max(len(h), *(len(str(r[i])) for r in rows)) + 2 for i, h in enumerate(headers)]
-    lines = []
-
-    header_line = "".join(str(h).center(col_widths[i]) for i, h in enumerate(headers))
-    separator = "".join('-'*w for w in col_widths)
-    lines.append(header_line)
-    lines.append(separator)
-
-    for row in rows:
-        lines.append("".join(str(row[i]).center(col_widths[i]) for i in range(len(headers))))
-
-    return "\n".join(lines)
-
-# --- GENEROWANIE TRZECH TABEL ---
 def generate_tables(data):
-    # --- ADMIN ---
-    admin_headers = ["Nick", "Rodzaj zamka", "Wszystkie próby", "Udane", "Nieudane", "Skuteczność", "Śr. czas"]
-    admin_rows = sorted(data, key=lambda x: (x[0], x[1]))
-
-    admin_table = format_table(admin_headers, admin_rows)
-
-    # --- STATYSTYKI ---
-    stats_headers = ["Nick", "Zamek", "Skuteczność", "Śr. czas"]
-    stats_rows = sorted([[row[0], row[1], row[5], row[6]] for row in data], key=lambda x: (x[0], x[1]))
-
-    stats_table = format_table(stats_headers, stats_rows)
-
-    # --- PODIUM ---
-    podium_headers = ["", "Nick", "Skuteczność", "Śr. czas"]
-    podium_dict = {}
+    # --- Tabela Admin ---
+    admin_stats = defaultdict(lambda: {'total':0, 'success':0, 'fail':0, 'times':[]})
     for row in data:
-        nick = row[0]
-        succ = float(row[5].replace("%", ""))
-        time_s = float(row[6].replace("s", ""))
-        if nick not in podium_dict:
-            podium_dict[nick] = [0, 0, 0]  # succ_sum, time_sum, count
-        podium_dict[nick][0] += succ
-        podium_dict[nick][1] += time_s
-        podium_dict[nick][2] += 1
+        key = (row['Nick'], row['Rodzaj zamka'])
+        admin_stats[key]['total'] += 1
+        if row['Wynik'] == 'udane':
+            admin_stats[key]['success'] += 1
+        else:
+            admin_stats[key]['fail'] += 1
+        admin_stats[key]['times'].append(float(row['Czas']))
 
-    podium_rows = []
-    for nick, (succ_sum, time_sum, count) in podium_dict.items():
-        avg_succ = round(succ_sum / count, 2)
-        avg_time = round(time_sum / count, 2)
-        podium_rows.append([nick, f"{avg_succ}%", f"{avg_time}s"])
+    admin_table = "**Tabela Admin**\nNick | Rodzaj zamka | Wszystkie próby | Udane | Nieudane | Skuteczność | Śr. czas\n"
+    admin_table += "--- | --- | --- | --- | --- | --- | ---\n"
+    for nick, lock in sorted(admin_stats.keys()):
+        stats = admin_stats[(nick, lock)]
+        skut = (stats['success']/stats['total'])*100 if stats['total'] else 0
+        sr_czas = sum(stats['times'])/len(stats['times']) if stats['times'] else 0
+        admin_table += f"{nick} | {lock} | {stats['total']} | {stats['success']} | {stats['fail']} | {skut:.1f}% | {sr_czas:.2f}s\n"
 
-    podium_rows.sort(key=lambda x: float(x[1].replace("%", "")), reverse=True)
-    medals = ["🥇", "🥈", "🥉"] + [""] * (len(podium_rows) - 3)
-    podium_rows = [[medals[i]] + podium_rows[i] for i in range(len(podium_rows))]
+    # --- Tabela Statystyki ---
+    stats_table = "**Tabela Statystyki**\nNick | Zamek | Skuteczność | Śr. czas\n"
+    stats_table += "--- | --- | --- | ---\n"
+    for nick, lock in sorted(admin_stats.keys()):
+        stats = admin_stats[(nick, lock)]
+        skut = (stats['success']/stats['total'])*100 if stats['total'] else 0
+        sr_czas = sum(stats['times'])/len(stats['times']) if stats['times'] else 0
+        stats_table += f"{nick} | {lock} | {skut:.1f}% | {sr_czas:.2f}s\n"
 
-    podium_table = format_table(podium_headers, podium_rows)
+    # --- Tabela Podium ---
+    podium_stats = defaultdict(lambda: {'success':0, 'total':0, 'times':[]})
+    for row in data:
+        nick = row['Nick']
+        podium_stats[nick]['total'] += 1
+        if row['Wynik'] == 'udane':
+            podium_stats[nick]['success'] += 1
+        podium_stats[nick]['times'].append(float(row['Czas']))
+
+    podium_list = []
+    for nick, stats in podium_stats.items():
+        skut = (stats['success']/stats['total'])*100 if stats['total'] else 0
+        sr_czas = sum(stats['times'])/len(stats['times']) if stats['times'] else 0
+        podium_list.append((nick, skut, sr_czas))
+
+    podium_list.sort(key=lambda x: (-x[1], x[2]))  # sortowanie: skuteczność malejąco, czas rosnąco
+
+    podium_table = "**Tabela Podium**\n🏅 | Nick | Skuteczność | Śr. czas\n--- | --- | --- | ---\n"
+    medals = ["🥇", "🥈", "🥉"]
+    for i, (nick, skut, sr_czas) in enumerate(podium_list):
+        medal = medals[i] if i < 3 else ""
+        podium_table += f"{medal} | {nick} | {skut:.1f}% | {sr_czas:.2f}s\n"
 
     return admin_table, stats_table, podium_table
 
-# --- WYSYŁKA DO WEBHOOKA ---
-def send_webhook(admin_table, stats_table, podium_table):
-    message = f"**ADMIN**\n```{admin_table}```\n**STATYSTYKI**\n```{stats_table}```\n**PODIUM**\n```{podium_table}```"
-    response = requests.post(WEBHOOK_URL, json={"content": message})
-    print(f"[WEBHOOK] Status: {response.status_code}")
-
-# --- WCZYTYWANIE CSV ---
-def read_csv():
-    try:
-        with open(CSV_FILE, newline='', encoding='utf-8') as csvfile:
-            reader = csv.reader(csvfile)
-            next(reader)  # pomiń nagłówek
-            data = [row for row in reader if row]
-        return data
-    except Exception as e:
-        print(f"[ERROR] Błąd wczytywania CSV: {e}")
-        return []
-
-# --- MONITOROWANIE PLIKU CSV ---
 def process_loop():
-    prev_lines = read_csv()
-    print(f"[START] Wczytano {len(prev_lines)} linii z pliku CSV.")
-    admin, stats, podium = generate_tables(prev_lines)
-    send_webhook(admin, stats, podium)
-    print("[INFO] Wysłano tabele startowe.")
+    last_line_count = 0
 
     while True:
-        time.sleep(60)
         print("[LOOP] Sprawdzanie nowych wpisów...")
-        current_lines = read_csv()
-        print(f"[LOOP] Liczba linii w CSV: {len(current_lines)}")
+        data = read_csv()
+        line_count = len(data)
+        print(f"[LOOP] Liczba linii w CSV: {line_count}")
 
-        if len(current_lines) == len(prev_lines):
-            print("[INFO] Brak nowych wpisów.")
-        elif len(current_lines) > len(prev_lines):
-            new_entries = current_lines[len(prev_lines):]
-            print(f"[INFO] Znaleziono {len(new_entries)} nowych wpisów.")
-            prev_lines += new_entries
-            admin, stats, podium = generate_tables(prev_lines)
-            send_webhook(admin, stats, podium)
-            print("[INFO] Wysłano zaktualizowane tabele.")
+        if line_count > last_line_count:
+            print("[INFO] Wykryto nowe wpisy. Generuję tabele i wysyłam webhooki.")
+            admin_table, stats_table, podium_table = generate_tables(data)
+
+            # Wysyłka (na razie jeden webhook)
+            requests.post(WEBHOOK_URL, json={"content": admin_table})
+            requests.post(WEBHOOK_URL, json={"content": stats_table})
+            requests.post(WEBHOOK_URL, json={"content": podium_table})
+
+            last_line_count = line_count
         else:
-            print("[WARNING] Liczba linii w CSV zmniejszyła się. Aktualizuję cały plik.")
-            prev_lines = current_lines
-            admin, stats, podium = generate_tables(prev_lines)
-            send_webhook(admin, stats, podium)
-            print("[INFO] Wysłano tabele po przeładowaniu pliku.")
+            print("[INFO] Brak nowych wpisów.")
 
-# --- FLASK KEEPALIVE ---
+        time.sleep(60)  # odczekanie 60 sekund przed kolejną iteracją
+
 @app.route('/')
 def index():
-    return "Lockpick monitor running."
+    return "Alive"
 
-# --- START ---
 if __name__ == "__main__":
     threading.Thread(target=process_loop, daemon=True).start()
     app.run(host='0.0.0.0', port=10000)
