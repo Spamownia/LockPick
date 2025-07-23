@@ -17,7 +17,6 @@ import re
 import csv
 import statistics
 import requests
-import base64
 import os
 import time
 import threading
@@ -45,7 +44,7 @@ FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
 
-# --- WEBHOOK (wszystkie trzy na razie do jednego) ---
+# --- WEBHOOK ---
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 # --- WZORZEC ---
@@ -101,29 +100,25 @@ def process_loop():
         print(f"[INFO] Znaleziono {len(new_lines)} nowych linii.")
 
         # --- Wczytanie dotychczasowych danych z pliku ---
+        data_dict = {}
         if os.path.exists("logi.csv"):
             with open("logi.csv", "r", encoding="utf-8") as f:
                 reader = csv.reader(f)
-                existing_rows = list(reader)
-        else:
-            existing_rows = [["Nick", "Rodzaj zamka", "Ilość wszystkich prób", "Ilość udanych prób",
-                              "Ilość nieudanych prób", "Skuteczność", "Śr. czas"]]
-
-        # --- Przetwarzanie nowych danych ---
-        data_dict = {}
-        for row in existing_rows[1:]:
-            if len(row) < 7: continue
-            nick, lock_type, all_attempts, succ, fail, eff, avg = row
-            key = (nick, lock_type)
-            data_dict[key] = {
-                "all_attempts": int(all_attempts),
-                "successful_attempts": int(succ),
-                "failed_attempts": int(fail),
-                "times": [float(avg.rstrip('s'))] * int(all_attempts)
-            }
+                next(reader, None)  # nagłówek
+                for row in reader:
+                    if len(row) < 7: continue
+                    nick, lock_type, all_attempts, succ, fail, eff, avg = row
+                    key = (nick, lock_type)
+                    data_dict[key] = {
+                        "all_attempts": int(all_attempts),
+                        "successful_attempts": int(succ),
+                        "failed_attempts": int(fail),
+                        "times": [float(avg.rstrip('s'))] * int(all_attempts)
+                    }
 
         user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
 
+        # --- Przetwarzanie nowych linii ---
         for line in new_lines:
             match = pattern.search(line)
             if match:
@@ -153,7 +148,7 @@ def process_loop():
                 if success == "Yes":
                     user_summary[nick]["success"] += 1
 
-        # --- Zapis do pliku CSV (nadpisanie pełnym zaktualizowanym zestawem) ---
+        # --- Zapis do pliku CSV (nadpisanie pełnym zestawem) ---
         with open("logi.csv", "w", newline='', encoding="utf-8") as f:
             writer = csv.writer(f)
             writer.writerow(["Nick", "Rodzaj zamka", "Ilość wszystkich prób", "Ilość udanych prób",
@@ -166,29 +161,32 @@ def process_loop():
                 eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
                 writer.writerow([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
 
-        # --- Generowanie trzech tabel ---
-        # Tabela główna
-        table_block = "Tabela Główna:\n```csv\nNick,Zamek,Wszystkie,Udane,Nieudane,Skut.,Śr. czas\n"
+        # --- Generowanie tabeli głównej ---
+        table_block = "```\n"
+        table_block += f"{'Nick':<12} {'Zamek':<10} {'Wszystkie':<10} {'Udane':<6} {'Nieudane':<9} {'Skut.':<6} {'Śr. czas':<8}\n"
+        table_block += "-" * 70 + "\n"
         for (nick, lock_type), stats in data_dict.items():
             all_attempts = stats["all_attempts"]
             succ = stats["successful_attempts"]
             fail = stats["failed_attempts"]
-            avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
+            avg = round(statistics.mean(stats["times"]), 2)
             eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
-            table_block += f"{nick},{lock_type},{all_attempts},{succ},{fail},{eff}%,{avg}s\n"
+            table_block += f"{nick:<12} {lock_type:<10} {all_attempts:<10} {succ:<6} {fail:<9} {eff}%   {avg}s\n"
         table_block += "```"
 
-        # Tabela admin
-        admin_block = "Tabela Admin:\n```csv\nNick,Zamek,Skut.,Śr. czas\n"
+        # --- Generowanie tabeli admin ---
+        admin_block = "```\n"
+        admin_block += f"{'Nick':<12} {'Zamek':<10} {'Skut.':<6} {'Śr. czas':<8}\n"
+        admin_block += "-" * 40 + "\n"
         for (nick, lock_type), stats in data_dict.items():
             all_attempts = stats["all_attempts"]
             succ = stats["successful_attempts"]
             eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
-            avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
-            admin_block += f"{nick},{lock_type},{eff}%,{avg}s\n"
+            avg = round(statistics.mean(stats["times"]), 2)
+            admin_block += f"{nick:<12} {lock_type:<10} {eff}%   {avg}s\n"
         admin_block += "```"
 
-        # Tabela podium
+        # --- Generowanie tabeli podium ---
         medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
         ranking = []
         for nick, summary in user_summary.items():
@@ -200,10 +198,12 @@ def process_loop():
             ranking.append((nick, eff, avg))
         ranking = sorted(ranking, key=lambda x: (-x[1], x[2]))[:5]
 
-        podium_block = "Tabela Podium:\n```csv\nMedal,Nick,Skuteczność,Śr. czas\n"
+        podium_block = "```\n"
+        podium_block += f"{' ':<2}{'Nick':<12}{'Skut.':<8}{'Śr. czas':<8}\n"
+        podium_block += "-" * 30 + "\n"
         for i, (nick, eff, avg) in enumerate(ranking):
             medal = medals[i]
-            podium_block += f"{medal},{nick},{eff}%,{avg}s\n"
+            podium_block += f"{medal:<2}{nick:<12}{eff}%   {avg}s\n"
         podium_block += "```"
 
         # --- Wysyłka wszystkich tabel ---
