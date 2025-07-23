@@ -26,6 +26,7 @@ from ftplib import FTP
 from io import BytesIO
 from flask import Flask
 
+# --- KONFIGURACJA FLASK ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -37,49 +38,6 @@ def send_discord(content, webhook_url):
     print("[DEBUG] Wysyłanie na webhook...")
     requests.post(webhook_url, json={"content": content})
 
-# --- FUNKCJA AKTUALIZACJI PLIKU W GITHUB ---
-def append_github_file(repo, path, message, append_content, branch="main"):
-    token = os.environ.get("GITHUB_TOKEN")
-    if not token:
-        print("[ERROR] Brak GITHUB_TOKEN w zmiennych środowiskowych")
-        return
-
-    headers = {
-        "Authorization": f"token {token}",
-        "Accept": "application/vnd.github.v3+json",
-    }
-
-    url = f"https://api.github.com/repos/{repo}/contents/{path}"
-
-    # Pobierz SHA i aktualną zawartość
-    r = requests.get(url, headers=headers, params={"ref": branch})
-    if r.status_code == 200:
-        sha = r.json()["sha"]
-        existing_content = base64.b64decode(r.json()["content"]).decode("utf-8")
-        new_content = existing_content + "\n" + append_content
-    elif r.status_code == 404:
-        sha = None
-        new_content = append_content
-    else:
-        print(f"[ERROR] Nie można pobrać pliku: {r.status_code} {r.text}")
-        return
-
-    encoded_content = base64.b64encode(new_content.encode("utf-8")).decode("utf-8")
-
-    data = {
-        "message": message,
-        "content": encoded_content,
-        "branch": branch,
-    }
-    if sha:
-        data["sha"] = sha
-
-    r = requests.put(url, headers=headers, json=data)
-    if r.status_code in [200, 201]:
-        print(f"[INFO] Zaktualizowano plik {path} w repozytorium {repo}.")
-    else:
-        print(f"[ERROR] Nie można zaktualizować pliku: {r.status_code} {r.text}")
-
 # --- KONFIGURACJA FTP ---
 FTP_IP = "176.57.174.10"
 FTP_PORT = 50021
@@ -87,10 +45,8 @@ FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
 
-# --- WEBHOOKI ---
-WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-WEBHOOK_TABLE2 = WEBHOOK_TABLE1
-WEBHOOK_TABLE3 = WEBHOOK_TABLE1
+# --- WEBHOOK (wszystkie trzy na razie do jednego) ---
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 # --- WZORZEC ---
 pattern = re.compile(
@@ -102,34 +58,12 @@ pattern = re.compile(
     r"Lock type: (?P<lock_type>\w+)\."
 )
 
-# --- FUNKCJA PĘTLI ---
-def process_loop():
-    seen_lines = []
-    user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
+# --- KOLEJNOŚĆ ZAMKÓW ---
+lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
 
-    # Pobierz istniejące dane z GitHub
-    token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json",
-        }
-        url = "https://api.github.com/repos/Spamownia/LockPick/contents/stats/logi.csv"
-        r = requests.get(url, headers=headers)
-        if r.status_code == 200:
-            csv_existing = base64.b64decode(r.json()["content"]).decode("utf-8")
-            reader = csv.reader(csv_existing.splitlines())
-            for row in reader:
-                if row and row[0] != "Nick" and len(row) == 7:
-                    nick, lock_type, all_attempts, succ, fail, eff, avg = row
-                    all_attempts = int(all_attempts)
-                    succ = int(succ)
-                    avg_sec = float(avg.replace('s','')) if avg.endswith('s') else float(avg)
-                    user_summary[nick]["total"] += all_attempts
-                    user_summary[nick]["success"] += succ
-                    user_summary[nick]["times"].append(avg_sec)
-        else:
-            print("[INFO] Brak istniejących danych w repozytorium.")
+# --- FUNKCJA GŁÓWNA ---
+def process_loop():
+    seen_lines = set()
 
     while True:
         print("[DEBUG] Sprawdzam nowe linie logu...")
@@ -165,56 +99,123 @@ def process_loop():
             continue
 
         print(f"[INFO] Znaleziono {len(new_lines)} nowych linii.")
-        seen_lines += new_lines
 
-        # --- Aktualizacja user_summary na podstawie nowych linii ---
+        # --- Wczytanie dotychczasowych danych z pliku ---
+        if os.path.exists("logi.csv"):
+            with open("logi.csv", "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                existing_rows = list(reader)
+        else:
+            existing_rows = [["Nick", "Rodzaj zamka", "Ilość wszystkich prób", "Ilość udanych prób",
+                              "Ilość nieudanych prób", "Skuteczność", "Śr. czas"]]
+
+        # --- Przetwarzanie nowych danych ---
+        data_dict = {}
+        for row in existing_rows[1:]:
+            if len(row) < 7: continue
+            nick, lock_type, all_attempts, succ, fail, eff, avg = row
+            key = (nick, lock_type)
+            data_dict[key] = {
+                "all_attempts": int(all_attempts),
+                "successful_attempts": int(succ),
+                "failed_attempts": int(fail),
+                "times": [float(avg.rstrip('s'))] * int(all_attempts)
+            }
+
+        user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
+
         for line in new_lines:
             match = pattern.search(line)
             if match:
                 nick = match.group("nick")
+                lock_type = match.group("lock_type")
                 success = match.group("success")
                 elapsed = float(match.group("elapsed"))
+
+                key = (nick, lock_type)
+                if key not in data_dict:
+                    data_dict[key] = {
+                        "all_attempts": 0,
+                        "successful_attempts": 0,
+                        "failed_attempts": 0,
+                        "times": []
+                    }
+
+                data_dict[key]["all_attempts"] += 1
+                if success == "Yes":
+                    data_dict[key]["successful_attempts"] += 1
+                else:
+                    data_dict[key]["failed_attempts"] += 1
+                data_dict[key]["times"].append(elapsed)
 
                 user_summary[nick]["total"] += 1
                 user_summary[nick]["times"].append(elapsed)
                 if success == "Yes":
                     user_summary[nick]["success"] += 1
 
-        # --- Generowanie pełnej tabeli na podstawie całego user_summary ---
-        data_rows = []
-        for nick, stats in user_summary.items():
-            all_attempts = stats["total"]
-            succ = stats["success"]
-            fail = all_attempts - succ
-            avg = round(statistics.mean(stats["times"]),2)
-            eff = round(100 * succ / all_attempts, 2)
-            data_rows.append([nick, "", all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
+        # --- Zapis do pliku CSV (nadpisanie pełnym zaktualizowanym zestawem) ---
+        with open("logi.csv", "w", newline='', encoding="utf-8") as f:
+            writer = csv.writer(f)
+            writer.writerow(["Nick", "Rodzaj zamka", "Ilość wszystkich prób", "Ilość udanych prób",
+                             "Ilość nieudanych prób", "Skuteczność", "Śr. czas"])
+            for (nick, lock_type), stats in data_dict.items():
+                all_attempts = stats["all_attempts"]
+                succ = stats["successful_attempts"]
+                fail = stats["failed_attempts"]
+                avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
+                eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
+                writer.writerow([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
 
-        # --- Generowanie CSV append ---
-        csv_append = ""
-        for row in data_rows:
-            csv_append += ",".join(map(str, row)) + "\n"
+        # --- Generowanie trzech tabel ---
+        # Tabela główna
+        table_block = "Tabela Główna:\n```csv\nNick,Zamek,Wszystkie,Udane,Nieudane,Skut.,Śr. czas\n"
+        for (nick, lock_type), stats in data_dict.items():
+            all_attempts = stats["all_attempts"]
+            succ = stats["successful_attempts"]
+            fail = stats["failed_attempts"]
+            avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
+            eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
+            table_block += f"{nick},{lock_type},{all_attempts},{succ},{fail},{eff}%,{avg}s\n"
+        table_block += "```"
 
-        append_github_file(
-            repo="Spamownia/LockPick",
-            path="stats/logi.csv",
-            message="Append nowych logów",
-            append_content=csv_append
-        )
+        # Tabela admin
+        admin_block = "Tabela Admin:\n```csv\nNick,Zamek,Skut.,Śr. czas\n"
+        for (nick, lock_type), stats in data_dict.items():
+            all_attempts = stats["all_attempts"]
+            succ = stats["successful_attempts"]
+            eff = round(100 * succ / all_attempts, 2) if all_attempts else 0
+            avg = round(statistics.mean(stats["times"]), 2) if stats["times"] else 0
+            admin_block += f"{nick},{lock_type},{eff}%,{avg}s\n"
+        admin_block += "```"
 
-        # --- Wysyłka trzech tabel ---
-        table_block = "Tabela Główna\n" + csv_append
-        send_discord(table_block, WEBHOOK_TABLE1)
+        # Tabela podium
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        ranking = []
+        for nick, summary in user_summary.items():
+            total_attempts = summary["total"]
+            total_success = summary["success"]
+            times_all = summary["times"]
+            eff = round(100 * total_success / total_attempts, 2) if total_attempts else 0
+            avg = round(statistics.mean(times_all), 2) if times_all else 0
+            ranking.append((nick, eff, avg))
+        ranking = sorted(ranking, key=lambda x: (-x[1], x[2]))[:5]
 
-        admin_block = "Tabela Admin\n" + csv_append
-        send_discord(admin_block, WEBHOOK_TABLE2)
+        podium_block = "Tabela Podium:\n```csv\nMedal,Nick,Skuteczność,Śr. czas\n"
+        for i, (nick, eff, avg) in enumerate(ranking):
+            medal = medals[i]
+            podium_block += f"{medal},{nick},{eff}%,{avg}s\n"
+        podium_block += "```"
 
-        podium_block = "Tabela Podium\n" + csv_append
-        send_discord(podium_block, WEBHOOK_TABLE3)
+        # --- Wysyłka wszystkich tabel ---
+        send_discord(table_block, WEBHOOK_URL)
+        send_discord(admin_block, WEBHOOK_URL)
+        send_discord(podium_block, WEBHOOK_URL)
 
+        seen_lines.update(new_lines)
         time.sleep(60)
 
-# --- URUCHOMIENIE ---
+# --- START ---
 if __name__ == "__main__":
     threading.Thread(target=process_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=10000)
+    port = int(os.environ.get("PORT", 10000))
+    app.run(host="0.0.0.0", port=port)
