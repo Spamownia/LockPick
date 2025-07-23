@@ -33,17 +33,13 @@ app = Flask(__name__)
 def index():
     return "Alive"
 
-# --- FUNKCJA WYSYŁANIA NA DISCORD ---
-def send_discord(content, webhook_url):
-    print("[DEBUG] Wysyłanie na webhook...")
-    requests.post(webhook_url, json={"content": content})
-
-# --- FUNKCJA POBIERANIA PLIKU Z GITHUB ---
+# --- FUNKCJE GITHUB ---
 def get_github_file(repo, path, branch="main"):
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         print("[ERROR] Brak GITHUB_TOKEN w zmiennych środowiskowych")
         return ""
+
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -52,21 +48,19 @@ def get_github_file(repo, path, branch="main"):
     r = requests.get(url, headers=headers, params={"ref": branch})
     if r.status_code == 200:
         content = base64.b64decode(r.json()["content"]).decode("utf-8")
-        print(f"[INFO] Pobrano plik {path} z GitHub.")
         return content
     elif r.status_code == 404:
-        print(f"[INFO] Plik {path} nie istnieje w repozytorium.")
         return ""
     else:
         print(f"[ERROR] Nie można pobrać pliku: {r.status_code} {r.text}")
         return ""
 
-# --- FUNKCJA APPEND DO GITHUB ---
-def append_github_file(repo, path, message, append_content, branch="main"):
+def upload_github_file(repo, path, message, new_content, branch="main"):
     token = os.environ.get("GITHUB_TOKEN")
     if not token:
         print("[ERROR] Brak GITHUB_TOKEN w zmiennych środowiskowych")
         return
+
     headers = {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github.v3+json",
@@ -74,19 +68,9 @@ def append_github_file(repo, path, message, append_content, branch="main"):
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
 
     r = requests.get(url, headers=headers, params={"ref": branch})
-    if r.status_code == 200:
-        sha = r.json()["sha"]
-        existing_content = base64.b64decode(r.json()["content"]).decode("utf-8")
-        new_content = existing_content + "\n" + append_content
-    elif r.status_code == 404:
-        sha = None
-        new_content = append_content
-    else:
-        print(f"[ERROR] Nie można pobrać pliku: {r.status_code} {r.text}")
-        return
+    sha = r.json()["sha"] if r.status_code == 200 else None
 
     encoded_content = base64.b64encode(new_content.encode("utf-8")).decode("utf-8")
-
     data = {
         "message": message,
         "content": encoded_content,
@@ -101,6 +85,11 @@ def append_github_file(repo, path, message, append_content, branch="main"):
     else:
         print(f"[ERROR] Nie można zaktualizować pliku: {r.status_code} {r.text}")
 
+# --- FUNKCJA WYSYŁANIA NA DISCORD ---
+def send_discord(content, webhook_url):
+    print("[DEBUG] Wysyłanie na webhook...")
+    requests.post(webhook_url, json={"content": content})
+
 # --- KONFIGURACJA FTP ---
 FTP_IP = "176.57.174.10"
 FTP_PORT = 50021
@@ -108,7 +97,7 @@ FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
 
-# --- WEBHOOK (WSZYSTKIE TABELKI) ---
+# --- WEBHOOKI ---
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 # --- WZORZEC ---
@@ -121,14 +110,24 @@ pattern = re.compile(
     r"Lock type: (?P<lock_type>\w+)\."
 )
 
+# --- KOLEJNOŚĆ ZAMKÓW ---
 lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
 
 # --- FUNKCJA GŁÓWNA ---
 def process_loop():
     seen_lines = set()
-    repo = "Spamownia/LockPick"  # <<<< ZMIEŃ NA SWOJE
+    repo = "Spamownia/LockPick"
 
     while True:
+        # Pobierz archiwalne dane z GitHub
+        csv_existing = get_github_file(repo, "stats/logi.csv")
+        existing_rows = []
+        if csv_existing:
+            reader = csv.reader(csv_existing.splitlines())
+            next(reader, None)  # pomiń nagłówek
+            existing_rows = [row for row in reader if len(row) == 7 and any(row)]
+
+        # Pobierz nowe dane z FTP
         ftp = FTP()
         ftp.connect(FTP_IP, FTP_PORT)
         ftp.login(FTP_USER, FTP_PASS)
@@ -137,106 +136,122 @@ def process_loop():
         log_files = []
         ftp.retrlines("MLSD", lambda line: log_files.append(line.split(";")[-1].strip()))
         log_files = sorted([f for f in log_files if f.startswith("gameplay_") and f.endswith(".log")])
+        if not log_files:
+            print("[ERROR] Brak plików gameplay_*.log na FTP.")
+            ftp.quit()
+            time.sleep(60)
+            continue
 
-        if log_files:
-            latest_log = log_files[-1]
-            with BytesIO() as bio:
-                ftp.retrbinary(f"RETR {latest_log}", bio.write)
-                log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
+        latest_log = log_files[-1]
+        print(f"[INFO] Najnowszy log: {latest_log}")
 
-            new_lines = [line for line in log_text.splitlines() if line not in seen_lines]
+        with BytesIO() as bio:
+            ftp.retrbinary(f"RETR {latest_log}", bio.write)
+            log_text = bio.getvalue().decode("utf-16-le", errors="ignore")
+        ftp.quit()
 
-            if new_lines:
-                print(f"[INFO] Znaleziono {len(new_lines)} nowych linii.")
+        new_lines = [line for line in log_text.splitlines() if line not in seen_lines]
+        if not new_lines:
+            print("[INFO] Brak nowych linii.")
+            time.sleep(60)
+            continue
 
-                # Pobierz plik CSV z GitHub
-                csv_existing = get_github_file(repo, "stats/logi.csv")
-                existing_rows = []
-                if csv_existing:
-                    reader = csv.reader(csv_existing.splitlines())
-                    next(reader, None)  # pomiń nagłówek
-                    existing_rows = list(reader)
+        print(f"[INFO] Znaleziono {len(new_lines)} nowych linii.")
+        seen_lines.update(new_lines)
 
-                data_rows = []
-                user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
+        # Parsowanie nowych danych
+        data_rows = []
+        user_summary = defaultdict(lambda: {"success": 0, "total": 0, "times": []})
+        for row in existing_rows:
+            nick, lock_type, all_attempts, succ, fail, eff, avg = row
+            all_attempts = int(all_attempts)
+            succ = int(succ)
+            fail = int(fail)
+            avg_sec = float(avg.replace('s','')) if avg.endswith('s') else float(avg)
+            data_rows.append([nick, lock_type, all_attempts, succ, fail, eff, avg])
+            user_summary[nick]["total"] += all_attempts
+            user_summary[nick]["success"] += succ
+            user_summary[nick]["times"].append(avg_sec)
 
-                for row in existing_rows:
-                    nick, lock_type, all_attempts, succ, fail, eff, avg = row
-                    user_summary[nick]["total"] += int(all_attempts)
-                    user_summary[nick]["success"] += int(succ)
-                    user_summary[nick]["times"].append(float(avg[:-1]))
+        for line in new_lines:
+            match = pattern.search(line)
+            if match:
+                nick = match.group("nick")
+                lock_type = match.group("lock_type")
+                success = match.group("success")
+                elapsed = float(match.group("elapsed"))
 
-                for line in new_lines:
-                    match = pattern.search(line)
-                    if match:
-                        nick = match.group("nick")
-                        lock_type = match.group("lock_type")
-                        success = match.group("success")
-                        elapsed = float(match.group("elapsed"))
+                user_summary[nick]["total"] += 1
+                user_summary[nick]["times"].append(elapsed)
+                if success == "Yes":
+                    user_summary[nick]["success"] += 1
 
-                        user_summary[nick]["total"] += 1
-                        user_summary[nick]["times"].append(elapsed)
-                        if success == "Yes":
-                            user_summary[nick]["success"] += 1
+                all_attempts = 1
+                succ = 1 if success == "Yes" else 0
+                fail = 1 - succ
+                avg = round(elapsed, 2)
+                eff = round(100 * succ / all_attempts, 2)
 
-                        all_attempts = 1
-                        succ = 1 if success == "Yes" else 0
-                        fail = 1 - succ
-                        avg = round(elapsed,2)
-                        eff = round(100 * succ / all_attempts, 2)
+                data_rows.append([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
 
-                        data_rows.append([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
+        # --- Generowanie CSV ---
+        csv_content = "Nick,Rodzaj zamka,Ilość wszystkich prób,Ilość udanych prób,Ilość nieudanych prób,Skuteczność,Śr. czas\n"
+        for row in data_rows:
+            csv_content += ",".join(map(str, row)) + "\n"
 
-                # --- Append do GitHub ---
-                csv_append = ""
-                for row in data_rows:
-                    csv_append += ",".join(map(str, row)) + "\n"
-                append_github_file(repo, "stats/logi.csv", "Append nowych logów", csv_append)
+        # --- Upload CSV ---
+        upload_github_file(
+            repo=repo,
+            path="stats/logi.csv",
+            message="Aktualizacja statystyk",
+            new_content=csv_content
+        )
 
-                # --- Generowanie tabelek ---
-                # Tabela główna
-                table_block = "```\nNick Zamek Wszystkie Udane Nieudane Skut. Śr. czas\n"
-                table_block += "-" * 70 + "\n"
-                for row in data_rows:
-                    table_block += " ".join(map(str, row)) + "\n"
-                table_block += "```"
+        # --- Tabela 1 (główna) ---
+        table_block = "Tabela główna\n```\n"
+        table_block += f"{'Nick':<10} {'Zamek':<10} {'Wszystkie':<12} {'Udane':<6} {'Nieudane':<9} {'Skut.':<8} {'Śr. czas':<8}\n"
+        table_block += "-" * 70 + "\n"
+        for row in data_rows:
+            table_block += f"{row[0]:<10} {row[1]:<10} {str(row[2]):<12} {str(row[3]):<6} {str(row[4]):<9} {row[5]:<8} {row[6]:<8}\n"
+        table_block += "```"
 
-                # Tabela admin
-                admin_block = "```\nNick Skut. Śr. czas\n"
-                admin_block += "-" * 45 + "\n"
-                for nick in user_summary:
-                    total = user_summary[nick]["total"]
-                    succ = user_summary[nick]["success"]
-                    eff = round(100 * succ / total,2) if total else 0
-                    avg = round(statistics.mean(user_summary[nick]["times"]),2) if user_summary[nick]["times"] else 0
-                    admin_block += f"{nick} {eff}% {avg}s\n"
-                admin_block += "```"
+        # --- Tabela 2 (admin) ---
+        admin_block = "Tabela admin\n```\n"
+        admin_block += f"{'Nick':<10} {'Skut.':<10} {'Śr. czas':<10}\n"
+        admin_block += "-" * 32 + "\n"
+        for nick, summary in user_summary.items():
+            total_attempts = summary["total"]
+            total_success = summary["success"]
+            eff = round(100 * total_success / total_attempts, 2) if total_attempts else 0
+            avg = round(statistics.mean(summary["times"]), 2) if summary["times"] else 0
+            admin_block += f"{nick:<10} {str(eff)+'%':<10} {str(avg)+'s':<10}\n"
+        admin_block += "```"
 
-                # Tabela podium
-                medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
-                ranking = sorted(user_summary.items(), key=lambda x: (-round(100 * x[1]["success"] / x[1]["total"],2), statistics.mean(x[1]["times"]) if x[1]["times"] else 9999))[:5]
-                podium_block = "```\n"
-                for i, (nick, summary) in enumerate(ranking):
-                    eff = round(100 * summary["success"] / summary["total"],2) if summary["total"] else 0
-                    avg = round(statistics.mean(summary["times"]),2) if summary["times"] else 0
-                    podium_block += f"{medals[i]} {nick} {eff}% {avg}s\n"
-                podium_block += "```"
+        # --- Tabela 3 (podium) ---
+        medals = ["🥇", "🥈", "🥉", "4️⃣", "5️⃣"]
+        ranking = []
+        for nick, summary in user_summary.items():
+            total_attempts = summary["total"]
+            total_success = summary["success"]
+            eff = round(100 * total_success / total_attempts, 2) if total_attempts else 0
+            avg = round(statistics.mean(summary["times"]), 2) if summary["times"] else 0
+            ranking.append((nick, eff, avg))
+        ranking = sorted(ranking, key=lambda x: (-x[1], x[2]))[:5]
 
-                # --- Wysyłka wszystkich tabelek ---
-                full_message = f"**Tabela główna**\n{table_block}\n\n**Tabela admin**\n{admin_block}\n\n**Podium**\n{podium_block}"
-                send_discord(full_message, WEBHOOK_URL)
+        podium_block = "Tabela podium\n```\n"
+        podium_block += f"{'':<2}{'Nick':<10}{'Skut.':<10}{'Śr. czas':<10}\n"
+        podium_block += "-" * 32 + "\n"
+        for i, (nick, eff, avg) in enumerate(ranking):
+            medal = medals[i]
+            podium_block += f"{medal:<2}{nick:<10}{str(eff)+'%':<10}{str(avg)+'s':<10}\n"
+        podium_block += "```"
 
-                seen_lines.update(new_lines)
-
-            else:
-                print("[INFO] Brak nowych linii.")
-
-        else:
-            print("[ERROR] Brak plików logów na FTP.")
+        # --- Wysyłka wszystkich tabel na jeden webhook ---
+        send_discord(table_block + "\n" + admin_block + "\n" + podium_block, WEBHOOK_URL)
 
         time.sleep(60)
 
-# --- START ---
+# --- URUCHOMIENIE ---
 if __name__ == "__main__":
     threading.Thread(target=process_loop, daemon=True).start()
     port = int(os.environ.get("PORT", 10000))
