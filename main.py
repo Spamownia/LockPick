@@ -5,7 +5,7 @@ import requests
 from flask import Flask
 from collections import defaultdict
 
-CSV_FILE = 'lockpick.csv'
+CSV_FILE = 'logi.csv'
 WEBHOOK_URL = 'https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3'  # Twój webhook
 
 app = Flask(__name__)
