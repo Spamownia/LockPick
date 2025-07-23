@@ -1,37 +1,30 @@
-import os
+import ftplib
 import re
 import csv
 import json
 import time
 import threading
 import requests
-from ftplib import FTP
 from collections import defaultdict
 
-# Konfiguracja FTP
-FTP_HOST = "ftp.example.com"
-FTP_PORT = 21
-FTP_USER = "username"
-FTP_PASS = "password"
-
-# Ścieżki i pliki tymczasowe
+# --- KONFIGURACJA ---
+FTP_HOST = "176.57.174.10"
+FTP_PORT = 50021
+FTP_USER = "gpftp37275281717442833"
+FTP_PASS = "LXNdGShY"
+LOG_PATTERN = re.compile(
+    r"\[(?P<timestamp>[0-9:\-T\.Z]+)\]\s+LockpickEvent: Nick=(?P<Nick>[^ ]+) Zamek=(?P<Rodzaj_zamka>[^ ]+) "
+    r"Attempt=(?P<Attempt>\d+) Result=(?P<Result>Success|Failure) Duration=(?P<Duration>\d+\.?\d*)"
+)
 PROCESSED_LINES_FILE = "/tmp/processed_lines.json"
 CSV_FILE = "/tmp/logi.csv"
 
-# Webhook Discord (3 osobne linie)
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3mVy3"
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# Regex do wyciągania danych z logów
-LOG_LINE_REGEX = re.compile(
-    r"(?P<timestamp>\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}): "
-    r"(?P<nick>\w+) - (?P<lock_type>[\w\s]+) - "
-    r"Attempt: (?P<attempt>[SU]) - Duration: (?P<duration>\d+\.?\d*)"
-)
-
+# --- FUNKCJE FTP ---
 def connect_ftp():
-    print("[DEBUG] Łączenie z FTP...")
-    ftp = FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
+    ftp = ftplib.FTP()
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
     ftp.login(FTP_USER, FTP_PASS)
     return ftp
 
@@ -42,169 +35,187 @@ def list_logs(ftp):
     return logs
 
 def download_log(ftp, filename):
-    print(f"[INFO] Pobieram log: {filename}")
     lines = []
-    ftp.retrlines(f"RETR {filename}", lines.append)
+    def callback(line):
+        lines.append(line)
+    ftp.retrlines(f"RETR {filename}", callback)
     return lines
 
-def parse_logs(log_lines):
+# --- PRZETWARZANIE LOGÓW ---
+def parse_logs(lines):
     entries = []
-    for line in log_lines:
-        match = LOG_LINE_REGEX.search(line)
-        if not match:
-            continue
-        data = match.groupdict()
-        entries.append({
-            "timestamp": data["timestamp"],
-            "Nick": data["nick"],
-            "Rodzaj zamka": data["lock_type"],
-            "Attempt": data["attempt"],  # 'S' = success, 'U' = unsuccess
-            "Duration": float(data["duration"])
-        })
+    for line in lines:
+        m = LOG_PATTERN.search(line)
+        if m:
+            entries.append({
+                "timestamp": m.group("timestamp"),
+                "Nick": m.group("Nick"),
+                "Rodzaj zamka": m.group("Rodzaj_zamka"),
+                "Attempt": int(m.group("Attempt")),
+                "Result": m.group("Result"),
+                "Duration": float(m.group("Duration")),
+            })
     return entries
 
-def load_processed_lines():
-    if not os.path.isfile(PROCESSED_LINES_FILE):
-        return set()
-    with open(PROCESSED_LINES_FILE, "r", encoding="utf-8") as f:
-        data = json.load(f)
-    return set(data)
-
-def save_processed_lines(processed_set):
-    with open(PROCESSED_LINES_FILE, "w", encoding="utf-8") as f:
-        json.dump(list(processed_set), f)
-
+# --- PRZETWARZANIE I AGREGACJA DANYCH ---
 def aggregate_data(entries):
-    # Struktura: data[nick][lock_type] = list of attempts (success/fail, duration)
-    data = defaultdict(lambda: defaultdict(list))
+    data = defaultdict(lambda: defaultdict(lambda: {
+        "Wszystkie podjęte próby": 0,
+        "Udane": 0,
+        "Nieudane": 0,
+        "Suma czasów": 0.0,
+    }))
     for e in entries:
-        key = (e["timestamp"], e["Nick"], e["Rodzaj zamka"], e["Attempt"], e["Duration"])
-        data[e["Nick"]][e["Rodzaj zamka"]].append(e)
+        nick = e["Nick"]
+        zamek = e["Rodzaj zamka"]
+        data[nick][zamek]["Wszystkie podjęte próby"] += 1
+        if e["Result"] == "Success":
+            data[nick][zamek]["Udane"] += 1
+        else:
+            data[nick][zamek]["Nieudane"] += 1
+        data[nick][zamek]["Suma czasów"] += e["Duration"]
     return data
 
 def calculate_stats(data):
-    # Dla każdej pary nick/lock_type liczymy statystyki
     stats = {}
-    for nick, locks in data.items():
+    for nick, zamki in data.items():
         stats[nick] = {}
-        for lock_type, attempts in locks.items():
-            total = len(attempts)
-            success = sum(1 for a in attempts if a["Attempt"] == "S")
-            fail = total - success
-            success_rate = round((success / total) * 100, 2) if total > 0 else 0.0
-            avg_time = round(sum(a["Duration"] for a in attempts) / total, 2) if total > 0 else 0.0
-            stats[nick][lock_type] = {
-                "Wszystkie podjęte próby": total,
-                "Udane": success,
-                "Nieudane": fail,
-                "Skuteczność": success_rate,
-                "Średni czas": avg_time
+        for zamek, vals in zamki.items():
+            prob = vals["Wszystkie podjęte próby"]
+            udane = vals["Udane"]
+            nieudane = vals["Nieudane"]
+            suma_czasow = vals["Suma czasów"]
+            skutecznosc = round((udane / prob) * 100, 2) if prob > 0 else 0.0
+            sredni_czas = round(suma_czasow / prob, 2) if prob > 0 else 0.0
+            stats[nick][zamek] = {
+                "Wszystkie podjęte próby": prob,
+                "Udane": udane,
+                "Nieudane": nieudane,
+                "Skuteczność": skutecznosc,
+                "Średni czas": sredni_czas,
             }
     return stats
 
+# --- ZAPIS CSV ---
+def save_csv(stats):
+    rows = []
+    for nick in sorted(stats.keys()):
+        for zamek in sorted(stats[nick].keys()):
+            vals = stats[nick][zamek]
+            rows.append([
+                nick,
+                zamek,
+                vals["Wszystkie podjęte próby"],
+                vals["Udane"],
+                vals["Nieudane"],
+                vals["Skuteczność"],
+                vals["Średni czas"],
+            ])
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f, delimiter=";")
+        writer.writerow([
+            "Nick", "Rodzaj zamka", "Wszystkie podjęte próby",
+            "Udane", "Nieudane", "Skuteczność", "Średni czas"
+        ])
+        writer.writerows(rows)
+
+# --- GENEROWANIE TABEL ---
 def generate_tables(stats):
     # Tabela Admin
     admin_lines = []
-    admin_lines.append("Nick | Rodzaj zamka | Wszystkie podjęte próby | Udane | Nieudane | Skuteczność (%) | Średni czas")
     for nick in sorted(stats.keys()):
-        for lock_type in sorted(stats[nick].keys()):
-            row = stats[nick][lock_type]
-            line = f"{nick} | {lock_type} | {row['Wszystkie podjęte próby']} | {row['Udane']} | {row['Nieudane']} | {row['Skuteczność']} | {row['Średni czas']}"
+        for zamek in sorted(stats[nick].keys()):
+            v = stats[nick][zamek]
+            line = f"{nick} | {zamek} | {v['Wszystkie podjęte próby']} | {v['Udane']} | {v['Nieudane']} | {v['Skuteczność']}% | {v['Średni czas']}"
             admin_lines.append(line)
+    admin_table = "Tabela Admin\n" + "\n".join(admin_lines)
 
     # Tabela Statystyki
     stats_lines = []
-    stats_lines.append("Nick | Zamek | Skuteczność (%) | Średni czas")
     for nick in sorted(stats.keys()):
-        for lock_type in sorted(stats[nick].keys()):
-            row = stats[nick][lock_type]
-            line = f"{nick} | {lock_type} | {row['Skuteczność']} | {row['Średni czas']}"
+        for zamek in sorted(stats[nick].keys()):
+            v = stats[nick][zamek]
+            line = f"{nick} | {zamek} | {v['Skuteczność']}% | {v['Średni czas']}"
             stats_lines.append(line)
+    stats_table = "Tabela Statystyki\n" + "\n".join(stats_lines)
 
     # Tabela Podium
-    podium_lines = []
-    podium_lines.append(" | Nick | Skuteczność (%) | Średni czas")
-    podium_list = []
+    podium_data = []
     for nick in stats.keys():
-        total_success = 0.0
-        total_time = 0.0
-        total_attempts = 0
-        for lock_type, row in stats[nick].items():
-            attempts = row["Wszystkie podjęte próby"]
-            total_attempts += attempts
-            total_success += (row["Skuteczność"] / 100.0) * attempts
-            total_time += row["Średni czas"] * attempts
-        if total_attempts > 0:
-            overall_success_rate = round((total_success / total_attempts) * 100, 2)
-            overall_avg_time = round(total_time / total_attempts, 2)
-        else:
-            overall_success_rate = 0.0
-            overall_avg_time = 0.0
-        podium_list.append((nick, overall_success_rate, overall_avg_time))
+        suma_skutecznosci = 0
+        suma_czasu = 0
+        liczba_zamkow = len(stats[nick])
+        for zamek in stats[nick]:
+            suma_skutecznosci += stats[nick][zamek]["Skuteczność"]
+            suma_czasu += stats[nick][zamek]["Średni czas"]
+        # uśredniamy średni czas i skuteczność
+        if liczba_zamkow > 0:
+            avg_skutecznosc = round(suma_skutecznosci, 2)  # sumujemy, nie uśredniamy - zgodnie z Twoim opisem
+            avg_czas = round(suma_czasu, 2)
+            podium_data.append((nick, avg_skutecznosc, avg_czas))
 
-    podium_list.sort(key=lambda x: (-x[1], x[2]))  # sortuj po skuteczności malejąco, potem czas rosnąco
+    podium_data.sort(key=lambda x: x[1], reverse=True)  # sort po skuteczności malejąco
+
+    podium_lines = []
     medals = ["🥇", "🥈", "🥉"]
-    for i, (nick, success, avg_time) in enumerate(podium_list):
-        medal = medals[i] if i < 3 else ""
-        line = f"{medal} | {nick} | {success} | {avg_time}"
+    for idx, (nick, skut, czas) in enumerate(podium_data):
+        medal = medals[idx] if idx < 3 else ""
+        line = f"{medal} | {nick} | {skut}% | {czas}"
         podium_lines.append(line)
+    podium_table = "Tabela Podium\n" + "\n".join(podium_lines)
 
-    return "\n".join(admin_lines), "\n".join(stats_lines), "\n".join(podium_lines)
+    return admin_table, stats_table, podium_table
 
-def save_csv(stats):
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as csvfile:
-        fieldnames = ["Nick", "Rodzaj zamka", "Wszystkie podjęte próby", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames, delimiter=";")
-        writer.writeheader()
-        for nick in sorted(stats.keys()):
-            for lock_type in sorted(stats[nick].keys()):
-                row = stats[nick][lock_type]
-                writer.writerow({
-                    "Nick": nick,
-                    "Rodzaj zamka": lock_type,
-                    "Wszystkie podjęte próby": row["Wszystkie podjęte próby"],
-                    "Udane": row["Udane"],
-                    "Nieudane": row["Nieudane"],
-                    "Skuteczność": row["Skuteczność"],
-                    "Średni czas": row["Średni czas"]
-                })
+# --- ZARZĄDZANIE PROCESSED LINES ---
+def load_processed_lines():
+    try:
+        with open(PROCESSED_LINES_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return set(data)
+    except Exception:
+        return set()
 
+def save_processed_lines(processed_set):
+    with open(PROCESSED_LINES_FILE, "w", encoding="utf-8") as f:
+        json.dump(list(processed_set), f, ensure_ascii=False)
+
+# --- WYSYŁANIE WEBHOOK ---
 def send_webhook(admin_table, stats_table, podium_table):
+    # 3 osobne wiadomości w 3 liniach na webhook
     headers = {"Content-Type": "application/json"}
-    data_admin = {"content": f"**Tabela Admin:**\n```\n{admin_table}\n```"}
-    data_stats = {"content": f"**Tabela Statystyki:**\n```\n{stats_table}\n```"}
-    data_podium = {"content": f"**Tabela Podium:**\n```\n{podium_table}\n```"}
+    data_admin = {"content": admin_table}
+    data_stats = {"content": stats_table}
+    data_podium = {"content": podium_table}
 
-    # Wysyłanie trzech osobnych wiadomości do webhooka
-    for data in (data_admin, data_stats, data_podium):
-        try:
-            response = requests.post(WEBHOOK_URL, json=data, headers=headers)
-            if response.status_code != 204 and response.status_code != 200:
-                print(f"[WARNING] Webhook zwrócił status {response.status_code}")
-        except Exception as e:
-            print(f"[ERROR] Błąd przy wysyłaniu webhooka: {e}")
+    for data in [data_admin, data_stats, data_podium]:
+        r = requests.post(WEBHOOK_URL, json=data, headers=headers)
+        if r.status_code != 204 and r.status_code != 200:
+            print(f"[WARNING] Webhook zwrócił status {r.status_code}")
 
+# --- LOGIKA STARTOWA ---
 def initial_load_and_send():
+    print("[DEBUG] Start initial_load_and_send")
     try:
         ftp = connect_ftp()
         logs = list_logs(ftp)
+        print(f"[DEBUG] Lista logów do pobrania: {logs}")
         all_entries = []
-        processed_lines_set = set()
-
-        # Wczytaj już przetworzone linie z pliku JSON
         processed_lines_set = load_processed_lines()
+        print(f"[DEBUG] Wczytano {len(processed_lines_set)} przetworzonych wpisów")
 
         for log_file in logs:
             lines = download_log(ftp, log_file)
+            print(f"[DEBUG] Pobranie {len(lines)} linii z {log_file}")
             entries = parse_logs(lines)
+            print(f"[DEBUG] Parsowanie logu {log_file}, znaleziono {len(entries)} pasujących wpisów")
 
-            # Przechowuj tylko nowe linie, których nie było wcześniej
             new_entries = []
             for e in entries:
                 key = f"{e['timestamp']}|{e['Nick']}|{e['Rodzaj zamka']}|{e['Attempt']}|{e['Duration']}"
                 if key not in processed_lines_set:
                     processed_lines_set.add(key)
                     new_entries.append(e)
+            print(f"[DEBUG] Nowych wpisów w logu {log_file}: {len(new_entries)}")
             all_entries.extend(new_entries)
 
         ftp.quit()
@@ -223,77 +234,85 @@ def initial_load_and_send():
         print(f"[INFO] Zapisano plik CSV: {CSV_FILE}")
         print(f"[INFO] Zapisano plik JSON: {PROCESSED_LINES_FILE}")
 
-        return processed_lines_set, data
+        return processed_lines_set, stats
     except Exception as e:
         print(f"[ERROR] Błąd podczas początkowego ładowania i wysyłania: {e}")
         return None
 
 def check_new_logs_loop(processed_lines_set, data):
+    print("[DEBUG] Start check_new_logs_loop")
     while True:
         try:
             ftp = connect_ftp()
             logs = list_logs(ftp)
-            new_lines_count = 0
-            all_new_entries = []
-
+            all_entries = []
             for log_file in logs:
                 lines = download_log(ftp, log_file)
                 entries = parse_logs(lines)
-                new_entries = []
                 for e in entries:
                     key = f"{e['timestamp']}|{e['Nick']}|{e['Rodzaj zamka']}|{e['Attempt']}|{e['Duration']}"
                     if key not in processed_lines_set:
                         processed_lines_set.add(key)
-                        new_entries.append(e)
-                if new_entries:
-                    all_new_entries.extend(new_entries)
-                    new_lines_count += len(new_entries)
-
+                        all_entries.append(e)
             ftp.quit()
 
-            if new_lines_count == 0:
+            if not all_entries:
                 print("[INFO] Brak nowych wpisów w pętli.")
-            else:
-                print(f"[DEBUG] Przetworzono {new_lines_count} nowych wpisów.")
-                # Aktualizuj dane i pliki
-                # Scal nowe wpisy z istniejącymi
-                for e in all_new_entries:
-                    data[e["Nick"]][e["Rodzaj zamka"]].append(e)
-                stats = calculate_stats(data)
-                save_csv(stats)
-                admin_table, stats_table, podium_table = generate_tables(stats)
-                send_webhook(admin_table, stats_table, podium_table)
-                save_processed_lines(processed_lines_set)
-                print("[INFO] Wysłano tabele po aktualizacji.")
+                time.sleep(60)
+                continue
+
+            print(f"[DEBUG] Nowych wpisów w pętli: {len(all_entries)}")
+
+            # aktualizuj dane i statystyki
+            for e in all_entries:
+                nick = e["Nick"]
+                zamek = e["Rodzaj zamka"]
+                if nick not in data:
+                    data[nick] = {}
+                if zamek not in data[nick]:
+                    data[nick][zamek] = {
+                        "Wszystkie podjęte próby": 0,
+                        "Udane": 0,
+                        "Nieudane": 0,
+                        "Suma czasów": 0.0,
+                    }
+                data[nick][zamek]["Wszystkie podjęte próby"] += 1
+                if e["Result"] == "Success":
+                    data[nick][zamek]["Udane"] += 1
+                else:
+                    data[nick][zamek]["Nieudane"] += 1
+                data[nick][zamek]["Suma czasów"] += e["Duration"]
+
+            stats = calculate_stats(data)
+            save_csv(stats)
+            admin_table, stats_table, podium_table = generate_tables(stats)
+            send_webhook(admin_table, stats_table, podium_table)
+            save_processed_lines(processed_lines_set)
+            print("[INFO] Wysłano tabele po aktualizacji.")
 
             time.sleep(60)
-
         except Exception as e:
-            print(f"[ERROR] Błąd w pętli sprawdzania nowych logów: {e}")
+            print(f"[ERROR] Błąd w pętli sprawdzania logów: {e}")
             time.sleep(60)
+
+# --- GŁÓWNY START ---
+from flask import Flask
+
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "Alive"
 
 def main_loop():
-    while True:
-        result = initial_load_and_send()
-        if result is None:
-            print("[ERROR] Początkowe ładowanie nie powiodło się lub brak nowych danych, próbuję ponownie za 60s...")
-            time.sleep(60)
-            continue
-        processed_lines_set, data = result
-        check_new_logs_loop(processed_lines_set, data)
+    print("[DEBUG] Start main_loop")
+    res = initial_load_and_send()
+    if res is None:
+        print("[ERROR] Początkowe ładowanie nie powiodło się lub brak danych.")
+        return
+    processed_lines_set, data = res
+    check_new_logs_loop(processed_lines_set, data)
 
 if __name__ == "__main__":
-    import flask
-    from flask import Flask
-
-    app = Flask(__name__)
-
-    @app.route("/")
-    def index():
-        return "Alive"
-
-    # Start pętli w osobnym wątku
-    thread = threading.Thread(target=main_loop, daemon=True)
-    thread.start()
-
-    app.run(host="0.0.0.0", port=10000)
+    threading.Thread(target=main_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=10000, debug=False)
