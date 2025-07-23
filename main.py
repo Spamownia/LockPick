@@ -26,7 +26,6 @@ from ftplib import FTP
 from io import BytesIO
 from flask import Flask
 
-# --- FLASK APP ---
 app = Flask(__name__)
 
 @app.route('/')
@@ -89,7 +88,9 @@ FTP_PASS = "LXNdGShY"
 FTP_PATH = "/SCUM/Saved/SaveFiles/Logs"
 
 # --- WEBHOOKI ---
-WEBHOOK_TABLE1 = WEBHOOK_TABLE2 = WEBHOOK_TABLE3 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+WEBHOOK_TABLE1 = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+WEBHOOK_TABLE2 = WEBHOOK_TABLE1
+WEBHOOK_TABLE3 = WEBHOOK_TABLE1
 
 # --- WZORZEC ---
 pattern = re.compile(
@@ -100,9 +101,6 @@ pattern = re.compile(
     r"Target object: [^\)]+\)\. "
     r"Lock type: (?P<lock_type>\w+)\."
 )
-
-# --- KOLEJNOŚĆ ZAMKÓW ---
-lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
 
 # --- FUNKCJA PĘTLI ---
 def process_loop():
@@ -126,7 +124,6 @@ def process_loop():
                     nick, lock_type, all_attempts, succ, fail, eff, avg = row
                     all_attempts = int(all_attempts)
                     succ = int(succ)
-                    fail = int(fail)
                     avg_sec = float(avg.replace('s','')) if avg.endswith('s') else float(avg)
                     user_summary[nick]["total"] += all_attempts
                     user_summary[nick]["success"] += succ
@@ -170,12 +167,11 @@ def process_loop():
         print(f"[INFO] Znaleziono {len(new_lines)} nowych linii.")
         seen_lines += new_lines
 
-        data_rows = []
+        # --- Aktualizacja user_summary na podstawie nowych linii ---
         for line in new_lines:
             match = pattern.search(line)
             if match:
                 nick = match.group("nick")
-                lock_type = match.group("lock_type")
                 success = match.group("success")
                 elapsed = float(match.group("elapsed"))
 
@@ -184,13 +180,15 @@ def process_loop():
                 if success == "Yes":
                     user_summary[nick]["success"] += 1
 
-                all_attempts = user_summary[nick]["total"]
-                succ = user_summary[nick]["success"]
-                fail = all_attempts - succ
-                avg = round(statistics.mean(user_summary[nick]["times"]),2)
-                eff = round(100 * succ / all_attempts, 2)
-
-                data_rows.append([nick, lock_type, all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
+        # --- Generowanie pełnej tabeli na podstawie całego user_summary ---
+        data_rows = []
+        for nick, stats in user_summary.items():
+            all_attempts = stats["total"]
+            succ = stats["success"]
+            fail = all_attempts - succ
+            avg = round(statistics.mean(stats["times"]),2)
+            eff = round(100 * succ / all_attempts, 2)
+            data_rows.append([nick, "", all_attempts, succ, fail, f"{eff}%", f"{avg}s"])
 
         # --- Generowanie CSV append ---
         csv_append = ""
@@ -216,8 +214,7 @@ def process_loop():
 
         time.sleep(60)
 
-# --- URUCHOMIENIE WĄTKU I FLASK ---
+# --- URUCHOMIENIE ---
 if __name__ == "__main__":
-    t = threading.Thread(target=process_loop)
-    t.start()
-    app.run(host="0.0.0.0", port=10000)
+    threading.Thread(target=process_loop, daemon=True).start()
+    app.run(host='0.0.0.0', port=10000)
