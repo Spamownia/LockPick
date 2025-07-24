@@ -98,4 +98,4 @@ def index():
 # --- URUCHOMIENIE ---
 if __name__ == "__main__":
     threading.Thread(target=main_loop, daemon=True).start()
-    app.run(host="0.0.0.0", port=10000)
+    app.run(host="0.0.0.0", port=10000, use_reloader=False)
