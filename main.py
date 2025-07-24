@@ -20,6 +20,7 @@ DB_FILE = "lockpick.db"
 
 # --- INICJALIZACJA BAZY ---
 def init_db():
+    print("[DEBUG] Inicjalizacja bazy danych...")
     conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
     c.execute("""
@@ -35,6 +36,7 @@ def init_db():
 
 # --- POBIERANIE I PRZETWARZANIE LOGÓW ---
 def download_logs_from_ftp():
+    print("[DEBUG] Rozpoczynam pobieranie logów z FTP...")
     entries = []
     try:
         ftp = ftplib.FTP()
@@ -53,7 +55,6 @@ def download_logs_from_ftp():
                 r.seek(0)
                 lines = r.read().decode('utf-8', errors='ignore').splitlines()
 
-                # Zapis do bazy unikalnych linii
                 conn = sqlite3.connect(DB_FILE)
                 c = conn.cursor()
                 for line in lines:
@@ -65,13 +66,14 @@ def download_logs_from_ftp():
                 conn.commit()
                 conn.close()
         ftp.quit()
+        print(f"[DEBUG] Zakończono pobieranie logów, znaleziono {len(entries)} nowych wpisów.")
     except Exception as e:
         print(f"[ERROR] Błąd podczas pobierania logów: {e}")
     return entries
 
 # --- GŁÓWNA PĘTLA ---
 def main_loop():
-    print("[DEBUG] Rozpoczynam cykl pętli...")
+    print("[DEBUG] Start main_loop")
     init_db()
     while True:
         new_entries = download_logs_from_ftp()
