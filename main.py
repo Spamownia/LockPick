@@ -1,18 +1,11 @@
-# --- AUTOMATYCZNA INSTALACJA BIBLIOTEK ---
-import subprocess
-import sys
-
-for pkg in ["requests", "flask"]:
-    try:
-        __import__(pkg)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-
+# --- IMPORTY ---
+import ftplib
 import sqlite3
-import time
 import threading
-import requests
-from ftplib import FTP
+import time
+import re
+import io
+import os
 from flask import Flask
 
 # --- KONFIGURACJA FTP I WEBHOOK ---
@@ -22,97 +15,81 @@ FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-DB_PATH = "logs.db"
+# --- KONFIGURACJA BAZY DANYCH ---
+DB_FILE = "lockpick.db"
 
-# --- INICJALIZACJA BAZY SQLITE ---
+# --- INICJALIZACJA BAZY ---
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(DB_FILE)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS logs
-                 (filename TEXT, line TEXT)''')
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            filename TEXT,
+            line TEXT UNIQUE
+        )
+    """)
     conn.commit()
     conn.close()
-    print("[DEBUG] Baza danych SQLite zainicjowana:", DB_PATH)
+    print("[DEBUG] Baza danych zainicjowana.")
 
-# --- POBRANIE LISTY LOGÓW Z FTP ---
+# --- POBIERANIE I PRZETWARZANIE LOGÓW ---
 def download_logs_from_ftp():
-    ftp = FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    print("[DEBUG] Połączono z FTP")
-
-    ftp.cwd('/SCUM/Saved/SaveFiles/Logs')
-    print("[DEBUG] Obecny katalog FTP:", ftp.pwd())
-
-    files = ftp.nlst()
-    print("[DEBUG] Wszystkie pliki w folderze Logs:", files)
-
-    log_files = [f for f in files if f.startswith('gameplay_') and f.endswith('.log')]
-    print("[DEBUG] Filtrowane gameplay_*.log:", log_files)
-
     entries = []
+    try:
+        ftp = ftplib.FTP()
+        ftp.connect(FTP_HOST, FTP_PORT)
+        ftp.login(FTP_USER, FTP_PASS)
+        print("[DEBUG] Połączono z FTP")
 
-    for filename in log_files:
-        print(f"[INFO] Pobieram plik: {filename}")
-        lines = []
-        ftp.retrlines(f"RETR {filename}", lines.append)
-        for line in lines:
-            entries.append( (filename, line) )
+        ftp.cwd('/SCUM/Saved/SaveFiles/Logs')
+        files = ftp.nlst()
 
-    ftp.quit()
+        for filename in files:
+            if re.match(r'gameplay_.*\.log', filename):
+                print(f"[INFO] Pobieranie pliku: {filename}")
+                r = io.BytesIO()
+                ftp.retrbinary(f"RETR {filename}", r.write)
+                r.seek(0)
+                lines = r.read().decode('utf-8', errors='ignore').splitlines()
+
+                # Zapis do bazy unikalnych linii
+                conn = sqlite3.connect(DB_FILE)
+                c = conn.cursor()
+                for line in lines:
+                    try:
+                        c.execute("INSERT INTO logs (filename, line) VALUES (?, ?)", (filename, line))
+                        entries.append(line)
+                    except sqlite3.IntegrityError:
+                        pass  # Linia już istnieje
+                conn.commit()
+                conn.close()
+        ftp.quit()
+    except Exception as e:
+        print(f"[ERROR] Błąd podczas pobierania logów: {e}")
     return entries
 
-# --- ZAPIS DO BAZY SQLITE ---
-def save_to_sqlite(entries):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    new_count = 0
-
-    for filename, line in entries:
-        c.execute("SELECT 1 FROM logs WHERE filename=? AND line=?", (filename, line))
-        if not c.fetchone():
-            c.execute("INSERT INTO logs VALUES (?, ?)", (filename, line))
-            new_count += 1
-
-    conn.commit()
-    conn.close()
-    print(f"[INFO] Zapisano {new_count} nowych linii do bazy danych.")
-    return new_count
-
-# --- WYŚLIJ NA WEBHOOK ---
-def send_webhook(message):
-    try:
-        r = requests.post(WEBHOOK_URL, json={"content": message})
-        if r.status_code == 204:
-            print("[INFO] Webhook wysłany poprawnie.")
-        else:
-            print(f"[WARNING] Błąd wysyłania webhook: {r.status_code} {r.text}")
-    except Exception as e:
-        print("[ERROR] Wyjątek podczas wysyłki webhook:", e)
-
-# --- PĘTLA GŁÓWNA ---
+# --- GŁÓWNA PĘTLA ---
 def main_loop():
+    print("[DEBUG] Rozpoczynam cykl pętli...")
     init_db()
     while True:
-        print("[DEBUG] Rozpoczynam cykl pętli...")
-        try:
-            entries = download_logs_from_ftp()
-            new_lines = save_to_sqlite(entries)
-            if new_lines > 0:
-                send_webhook(f"✅ Dodano {new_lines} nowych linii do bazy.")
-            else:
-                print("[INFO] Brak nowych wpisów.")
-        except Exception as e:
-            print("[ERROR] Błąd w pętli głównej:", e)
+        new_entries = download_logs_from_ftp()
+        if new_entries:
+            print(f"[INFO] Znaleziono {len(new_entries)} nowych wpisów.")
+            # Tutaj dodaj wysyłanie do webhook lub dalsze przetwarzanie
+        else:
+            print("[INFO] Brak nowych wpisów.")
         time.sleep(60)
 
-# --- FLASK KEEPALIVE ---
+# --- FLASK ---
 app = Flask(__name__)
 
-@app.route("/")
+@app.route('/')
 def index():
     return "Alive"
 
+# --- URUCHOMIENIE ---
 if __name__ == "__main__":
-    threading.Thread(target=main_loop).start()
+    threading.Thread(target=main_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=10000)
