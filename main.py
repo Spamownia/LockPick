@@ -40,12 +40,15 @@ def download_logs_from_ftp():
     entries = []
     try:
         ftp = ftplib.FTP()
+        print("[DEBUG] Łączenie z FTP...")
         ftp.connect(FTP_HOST, FTP_PORT)
         ftp.login(FTP_USER, FTP_PASS)
         print("[DEBUG] Połączono z FTP")
 
         ftp.cwd('/SCUM/Saved/SaveFiles/Logs')
+        print("[DEBUG] Zmieniono katalog na /SCUM/Saved/SaveFiles/Logs")
         files = ftp.nlst()
+        print(f"[DEBUG] Pliki na serwerze: {files}")
 
         for filename in files:
             if re.match(r'gameplay_.*\.log', filename):
@@ -76,6 +79,7 @@ def main_loop():
     print("[DEBUG] Start main_loop")
     init_db()
     while True:
+        print("[DEBUG] Iteracja pętli głównej...")
         new_entries = download_logs_from_ftp()
         if new_entries:
             print(f"[INFO] Znaleziono {len(new_entries)} nowych wpisów.")
