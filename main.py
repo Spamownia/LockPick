@@ -22,6 +22,7 @@ FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+HISTORY_FILE = "lockpick_history.csv"
 
 # --- POŁĄCZENIE Z FTP I POBRANIE WSZYSTKICH gameplay_*.log ---
 ftp = FTP()
@@ -91,7 +92,7 @@ for line in all_lines:
         data[(nick, lock)]['times'].append(time)
         data[(nick, lock)]['success'].append(success == "Yes")
 
-# --- TWORZENIE TABELI ---
+# --- TWORZENIE TABELI Z BIEŻĄCYCH LOGÓW ---
 rows = []
 
 for (nick, lock), values in data.items():
@@ -107,41 +108,65 @@ for (nick, lock), values in data.items():
         total,
         successes,
         fails,
-        f"{effectiveness:.2f}%",
-        f"{avg_time:.2f}s"
+        avg_time
     ])
 
-if not rows:
-    print("[INFO] Brak danych do wysłania.")
+df_current = pd.DataFrame(rows, columns=[
+    "Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Suma czasów"
+])
+
+# --- WCZYTANIE HISTORII JEŚLI ISTNIEJE ---
+if os.path.exists(HISTORY_FILE):
+    df_history = pd.read_csv(HISTORY_FILE)
+    # Połączenie z aktualnymi danymi
+    df_combined = pd.concat([df_history, df_current])
 else:
-    df = pd.DataFrame(rows, columns=[
-        "Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"
-    ])
+    df_combined = df_current
 
-    # --- SORTOWANIE ---
-    lock_order = ["VeryEasy", "Basic", "Medium", "Advanced", "DialLock"]
-    df["Zamek"] = pd.Categorical(df["Zamek"], categories=lock_order, ordered=True)
-    df = df.sort_values(by=["Nick", "Zamek"])
+# --- AGREGACJA DANYCH (SUMOWANIE HISTORII Z NOWYMI) ---
+agg = df_combined.groupby(["Nick", "Zamek"], as_index=False).agg({
+    "Ilość wszystkich prób": "sum",
+    "Udane": "sum",
+    "Nieudane": "sum",
+    "Suma czasów": "sum"
+})
 
-    # --- WYŚRODKOWANIE TEKSTU WE WSZYSTKICH KOMÓRKACH ---
-    # Tworzenie tabeli z wyrównaniem do środka każdej komórki
-    def center_align(df):
-        return df.applymap(lambda x: f"{str(x):^15}")
+# Wyliczenie średniego czasu i skuteczności na nowo
+agg["Średni czas"] = (agg["Suma czasów"] / agg["Ilość wszystkich prób"]).round(2).astype(str) + "s"
+agg["Skuteczność"] = ((agg["Udane"] / agg["Ilość wszystkich prób"]) * 100).round(2).astype(str) + "%"
 
-    df_centered = center_align(df)
+# Usunięcie kolumny pomocniczej przed finalną tabelą
+agg = agg[[
+    "Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"
+]]
 
-    table = df_centered.to_string(index=False, header=True)
+# --- SORTOWANIE ---
+lock_order = ["VeryEasy", "Basic", "Medium", "Advanced", "DialLock"]
+agg["Zamek"] = pd.Categorical(agg["Zamek"], categories=lock_order, ordered=True)
+agg = agg.sort_values(by=["Nick", "Zamek"])
 
-    print("[INFO] Tabela gotowa:\n", table)
+# --- ZAPIS HISTORII ---
+agg.to_csv(HISTORY_FILE, index=False)
+print(f"[INFO] Zaktualizowano historię w pliku {HISTORY_FILE}")
 
-    # --- WYSYŁKA NA DISCORD (WEBHOOK) ---
-    payload = {
-        "content": f"```\n{table}\n```"
-    }
+# --- WYŚRODKOWANIE TEKSTU WE WSZYSTKICH KOMÓRKACH DO WYŚWIETLENIA ---
+def center_align(df):
+    return df.applymap(lambda x: f"{str(x):^15}")
 
-    response = requests.post(WEBHOOK_URL, json=payload)
+df_centered = center_align(agg)
 
-    if response.status_code == 204:
-        print("[OK] Wysłano tabelę na Discord.")
-    else:
-        print(f"[ERROR] Nie udało się wysłać na Discord. Status: {response.status_code}")
+table = df_centered.to_string(index=False, header=True)
+
+print("[INFO] Tabela gotowa:\n", table)
+
+# --- WYSYŁKA NA DISCORD (WEBHOOK) ---
+payload = {
+    "content": f"```\n{table}\n```"
+}
+
+response = requests.post(WEBHOOK_URL, json=payload)
+
+if response.status_code == 204:
+    print("[OK] Wysłano tabelę na Discord.")
+else:
+    print(f"[ERROR] Nie udało się wysłać na Discord. Status: {response.status_code}")
