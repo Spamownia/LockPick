@@ -1,7 +1,6 @@
 import ftplib
-from io import StringIO
-import time
-import threading
+import re
+import statistics
 import requests
 from flask import Flask, jsonify
 
@@ -14,81 +13,106 @@ WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4
 app = Flask(__name__)
 
 def get_ftp_logs():
- print("[DEBUG] Rozpoczynam pobieranie logów z FTP...")
- logs = []
- try:
-  ftp = ftplib.FTP()
-  print("[DEBUG] Utworzono instancję FTP, próbuję connect()...")
-  ftp.connect(FTP_HOST, FTP_PORT)
-  print("[DEBUG] connect() zakończone, próbuję login()...")
-  ftp.login(FTP_USER, FTP_PASS)
-  print("[DEBUG] login() zakończone, próbuję cwd()...")
-  ftp.cwd("/SCUM/Saved/SaveFiles/Logs")
-  print("[DEBUG] cwd() zakończone, próbuję nlst()...")
-  files = ftp.nlst()
-  print(f"[DEBUG] Pliki na FTP: {files}")
-  for filename in files:
-   if filename.endswith(".log"):
-    print(f"[INFO] Downloading: {filename}")
-    sio = StringIO()
-    ftp.retrlines(f"RETR {filename}", lambda line: sio.write(line + "\n"))
-    logs.append(sio.getvalue())
-  ftp.quit()
- except Exception as e:
-  print(f"[ERROR] Błąd podczas pobierania logów: {e}")
- print(f"[DEBUG] Liczba pobranych logów: {len(logs)}")
- return logs
+    print("[DEBUG] Rozpoczynam pobieranie logów z FTP...")
+    logs = []
+    try:
+        ftp = ftplib.FTP()
+        print("[DEBUG] Utworzono instancję FTP, próbuję connect()...")
+        ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+        print("[DEBUG] connect() zakończone, próbuję login()...")
+        ftp.login(FTP_USER, FTP_PASS)
+        print("[DEBUG] login() zakończone, próbuję cwd()...")
+        ftp.cwd("/SCUM/Saved/SaveFiles/Logs")
+        print("[DEBUG] cwd() zakończone, próbuję nlst()...")
+        files = ftp.nlst()
+        print(f"[DEBUG] Pliki na FTP: {files}")
+        for filename in files:
+            if filename.endswith(".log"):
+                print(f"[INFO] Downloading: {filename}")
+                from io import StringIO
+                sio = StringIO()
+                ftp.retrlines(f"RETR {filename}", lambda line: sio.write(line + "\n"))
+                logs.append(sio.getvalue())
+        ftp.quit()
+    except Exception as e:
+        print(f"[ERROR] Błąd podczas pobierania logów: {e}")
+    print(f"[DEBUG] Liczba pobranych logów: {len(logs)}")
+    return logs
 
 def parse_lockpicks(logs):
- import re
- stats = {}
- pattern = re.compile(r"Lockpick \[(\w+)\] took ([\d\.]+) seconds")
- for log in logs:
-  for line in log.splitlines():
-   m = pattern.search(line)
-   if m:
-    key = m.group(1)
-    elapsed = m.group(2).rstrip(".")
-    if key not in stats:
-     stats[key] = {"count": 0, "times": []}
-    try:
-     stats[key]["times"].append(float(elapsed))
-     stats[key]["count"] += 1
-    except ValueError:
-     print(f"[WARNING] Nieprawidłowa wartość czasu: '{elapsed}' w linii: {line}")
- return stats
+    stats = {}
+    pattern = re.compile(r"Lockpick succeeded in ([\d\.]+) seconds with (.+)")
+    for log in logs:
+        for line in log.splitlines():
+            m = pattern.search(line)
+            if m:
+                elapsed = m.group(1).rstrip('.')  # usunięcie kropki jeśli jest
+                weapon = m.group(2)
+                try:
+                    elapsed_float = float(elapsed)
+                except ValueError:
+                    print(f"[WARNING] Niepoprawna wartość czasu: '{elapsed}', pomijam linię.")
+                    continue
+                key = weapon
+                if key not in stats:
+                    stats[key] = {"times": []}
+                stats[key]["times"].append(elapsed_float)
+    for key in stats:
+        times = stats[key]["times"]
+        stats[key]["count"] = len(times)
+        stats[key]["min"] = min(times)
+        stats[key]["max"] = max(times)
+        stats[key]["avg"] = statistics.mean(times)
+        stats[key]["median"] = statistics.median(times)
+    return stats
 
 def send_webhook(stats):
- for key, data in stats.items():
-  avg_time = sum(data["times"]) / len(data["times"]) if data["times"] else 0
-  message = f"Lockpick {key}: {data['count']} attempts, average time: {avg_time:.2f}s"
-  payload = {"content": message}
-  try:
-   response = requests.post(WEBHOOK_URL, json=payload)
-   if response.status_code != 204:
-    print(f"[ERROR] Webhook send failed: {response.status_code} {response.text}")
-  except Exception as e:
-   print(f"[ERROR] Exception sending webhook: {e}")
+    if not stats:
+        print("[INFO] Brak statystyk do wysłania.")
+        return
+    for weapon, data in stats.items():
+        content = (
+            f"**Statystyki lockpicków dla:** {weapon}\n"
+            f"Liczba prób: {data['count']}\n"
+            f"Min czas: {data['min']:.2f} s\n"
+            f"Max czas: {data['max']:.2f} s\n"
+            f"Średni czas: {data['avg']:.2f} s\n"
+            f"Mediana: {data['median']:.2f} s\n"
+        )
+        payload = {"content": content}
+        try:
+            response = requests.post(WEBHOOK_URL, json=payload)
+            if response.status_code == 204:
+                print(f"[INFO] Wysłano statystyki dla {weapon}")
+            else:
+                print(f"[ERROR] Błąd wysyłki webhook dla {weapon}: {response.status_code} {response.text}")
+        except Exception as e:
+            print(f"[ERROR] Wyjątek podczas wysyłki webhook: {e}")
+
+@app.route('/')
+def index():
+    return "Alive"
 
 def main_loop():
- while True:
-  print("[DEBUG] Iteracja pętli głównej...")
-  logs = get_ftp_logs()
-  if logs:
-   stats = parse_lockpicks(logs)
-   if stats:
+    print("[DEBUG] Iteracja pętli głównej...")
+    logs = get_ftp_logs()
+    if not logs:
+        print("[INFO] Brak nowych wpisów.")
+        return
+    stats = parse_lockpicks(logs)
     send_webhook(stats)
-   else:
-    print("[INFO] Brak nowych wpisów do przetworzenia.")
-  else:
-   print("[INFO] Brak nowych wpisów.")
-  time.sleep(60)
-
-@app.route("/")
-def index():
- return "Alive"
 
 if __name__ == "__main__":
- # Uruchomienie pętli głównej w wątku, by Flask mógł działać równolegle
- threading.Thread(target=main_loop, daemon=True).start()
- app.run(host="0.0.0.0", port=3000)
+    from threading import Timer
+    import time
+
+    def run_periodically(interval, func):
+        def wrapper():
+            func()
+            Timer(interval, wrapper).start()
+        wrapper()
+
+    # Uruchamiamy pętlę główną co 60 sekund
+    run_periodically(60, main_loop)
+
+    app.run(host='0.0.0.0', port=3000)
