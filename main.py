@@ -12,6 +12,8 @@ import os
 from ftplib import FTP
 import pandas as pd
 import requests
+import re
+from collections import defaultdict
 
 # --- DANE FTP I WEBHOOK ---
 FTP_HOST = "176.57.174.10"
@@ -21,41 +23,56 @@ FTP_PASS = "LXNdGShY"
 LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# --- NAZWA PLIKU (TU WPISZ NAJNOWSZY PEŁNY plik z panelu FTP) ---
-# Jeśli nie znasz nazwy, musisz ją sprawdzić w panelu – NLST nie działa na tym FTP
-latest_log = "gameplay_17B59C21F4CB47D38768C9F54B1870E7.log"
-
-# --- POBRANIE LOGA ---
+# --- POŁĄCZENIE Z FTP I POBRANIE WSZYSTKICH gameplay_*.log ---
 ftp = FTP()
 ftp.connect(FTP_HOST, FTP_PORT)
 ftp.login(FTP_USER, FTP_PASS)
 ftp.cwd(LOG_DIR)
 
-with open("latest_log.log", "wb") as f:
-    ftp.retrbinary(f"RETR {latest_log}", f.write)
+# Pobranie listy plików przez LIST (ponieważ NLST nie działa)
+files = []
+ftp.retrlines('LIST', files.append)
+
+# Filtrowanie nazw plików zawierających "gameplay_"
+gameplay_logs = []
+for line in files:
+    parts = line.split()
+    filename = parts[-1]
+    if filename.startswith("gameplay_") and filename.endswith(".log"):
+        gameplay_logs.append(filename)
+
+print(f"[INFO] Znaleziono {len(gameplay_logs)} plików gameplay_*.log")
+
+# Pobranie i odczytanie wszystkich logów
+all_lines = []
+
+for log_file in gameplay_logs:
+    print(f"[INFO] Pobieranie pliku: {log_file}")
+    local_filename = f"tmp_{log_file}"
+
+    with open(local_filename, "wb") as f:
+        ftp.retrbinary(f"RETR {log_file}", f.write)
+
+    with open(local_filename, "r", encoding="utf-16le") as f:
+        lines = f.readlines()
+        all_lines.extend(lines)
+
+    os.remove(local_filename)
 
 ftp.quit()
 
-# --- DEKODOWANIE LOGA ---
-with open("latest_log.log", "r", encoding="utf-16le") as f:
-    lines = f.readlines()
-
 # --- PARSOWANIE DANYCH ---
-import re
-from collections import defaultdict
-
 pattern = re.compile(
     r"User:\s+(?P<nick>\w+).*?"
     r"Success:\s+(?P<success>\w+).*?"
     r"Elapsed time:\s+(?P<time>[\d.]+).*?"
-    r"Target object:.*?"
     r"Lock type:\s+(?P<lock>\w+)",
     re.DOTALL
 )
 
 data = defaultdict(lambda: defaultdict(list))
 
-for line in lines:
+for line in all_lines:
     match = pattern.search(line)
     if match:
         nick = match.group("nick")
@@ -90,7 +107,7 @@ df = pd.DataFrame(rows, columns=[
     "Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"
 ])
 
-# Wyśrodkowanie tekstu
+# Wyśrodkowanie tekstu w pandas.to_string()
 table = df.to_string(index=False, justify="center")
 
 print("[INFO] Tabela gotowa:\n", table)
