@@ -78,7 +78,12 @@ for line in all_lines:
         nick = match.group("nick")
         lock = match.group("lock")
         success = match.group("success")
-        time = float(match.group("time"))
+        time_str = match.group("time").rstrip(".")  # USUNIĘCIE KOŃCOWEJ KROPKI JEŚLI ISTNIEJE
+        try:
+            time = float(time_str)
+        except ValueError:
+            print(f"[WARNING] Niepoprawna wartość czasu: '{time_str}'. Pomijam wpis.")
+            continue
 
         data[(nick, lock)]['times'].append(time)
         data[(nick, lock)]['success'].append(success == "Yes")
@@ -103,23 +108,26 @@ for (nick, lock), values in data.items():
         f"{avg_time:.2f}s"
     ])
 
-df = pd.DataFrame(rows, columns=[
-    "Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"
-])
-
-# Wyśrodkowanie tekstu w pandas.to_string()
-table = df.to_string(index=False, justify="center")
-
-print("[INFO] Tabela gotowa:\n", table)
-
-# --- WYSYŁKA NA DISCORD (WEBHOOK) ---
-payload = {
-    "content": f"```\n{table}\n```"
-}
-
-response = requests.post(WEBHOOK_URL, json=payload)
-
-if response.status_code == 204:
-    print("[OK] Wysłano tabelę na Discord.")
+if not rows:
+    print("[INFO] Brak danych do wysłania.")
 else:
-    print(f"[ERROR] Nie udało się wysłać na Discord. Status: {response.status_code}")
+    df = pd.DataFrame(rows, columns=[
+        "Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"
+    ])
+
+    # Wyśrodkowanie tekstu w pandas.to_string()
+    table = df.to_string(index=False, justify="center")
+
+    print("[INFO] Tabela gotowa:\n", table)
+
+    # --- WYSYŁKA NA DISCORD (WEBHOOK) ---
+    payload = {
+        "content": f"```\n{table}\n```"
+    }
+
+    response = requests.post(WEBHOOK_URL, json=payload)
+
+    if response.status_code == 204:
+        print("[OK] Wysłano tabelę na Discord.")
+    else:
+        print(f"[ERROR] Nie udało się wysłać na Discord. Status: {response.status_code}")
