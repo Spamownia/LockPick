@@ -77,6 +77,9 @@ for line in all_lines:
     if match:
         nick = match.group("nick")
         lock = match.group("lock")
+        # Zmiana nazwy zamka z Easy na Basic
+        if lock == "Easy":
+            lock = "Basic"
         success = match.group("success")
         time_str = match.group("time").rstrip(".")  # USUNIĘCIE KOŃCOWEJ KROPKI JEŚLI ISTNIEJE
         try:
@@ -116,12 +119,18 @@ else:
     ])
 
     # --- SORTOWANIE ---
-    lock_order = ["VeryEasy", "Easy", "Medium", "Advanced", "DialLock"]
+    lock_order = ["VeryEasy", "Basic", "Medium", "Advanced", "DialLock"]
     df["Zamek"] = pd.Categorical(df["Zamek"], categories=lock_order, ordered=True)
     df = df.sort_values(by=["Nick", "Zamek"])
 
-    # Wyśrodkowanie tekstu w pandas.to_string()
-    table = df.to_string(index=False, justify="center")
+    # --- WYŚRODKOWANIE TEKSTU WE WSZYSTKICH KOMÓRKACH ---
+    # Tworzenie tabeli z wyrównaniem do środka każdej komórki
+    def center_align(df):
+        return df.applymap(lambda x: f"{str(x):^15}")
+
+    df_centered = center_align(df)
+
+    table = df_centered.to_string(index=False, header=True)
 
     print("[INFO] Tabela gotowa:\n", table)
 
