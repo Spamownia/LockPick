@@ -17,10 +17,8 @@ LOG_PATTERN = "gameplay_"
 # --- Webhook Discord ---
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# --- Plik śledzący pobrane logi ---
 STATE_FILE = "downloaded_logs.txt"
 
-# --- Regex do lockpickingu ---
 LOCKPICK_REGEX = re.compile(
     r"User:\s+([^\s]+).*?Success:\s+(Yes|No).*?Elapsed time:\s+([\d.]+).*?Lock type:\s+([^\s.]+)",
     re.IGNORECASE | re.DOTALL
@@ -42,9 +40,18 @@ def fetch_logs():
     ftp.login(FTP_USER, FTP_PASS)
     ftp.cwd(FTP_DIR)
 
-    files = ftp.nlst()
     downloaded = load_downloaded()
-    new_files = [f for f in files if f.startswith(LOG_PATTERN) and f not in downloaded]
+    lines = []
+    ftp.retrlines('LIST', lines.append)
+
+    files = []
+    for line in lines:
+        parts = line.split()
+        filename = parts[-1]
+        if filename.startswith(LOG_PATTERN):
+            files.append(filename)
+
+    new_files = [f for f in files if f not in downloaded]
 
     all_data = []
 
@@ -92,7 +99,6 @@ def format_table(stats):
         avg_time = f"{sum(data['times']) / len(data['times']):.2f}s"
         rows.append([nick, lock, str(total), str(success), str(fail), accuracy, avg_time])
 
-    # Wyrównanie szerokości kolumn
     cols = list(zip(*([headers] + rows)))
     col_widths = [max(len(cell) for cell in col) for col in cols]
 
