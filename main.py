@@ -21,26 +21,16 @@ FTP_PASS = "LXNdGShY"
 LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# --- POBIERANIE NAJNOWSZEGO LOGA ---
+# --- NAZWA PLIKU (TU WPISZ NAJNOWSZY PEŁNY plik z panelu FTP) ---
+# Jeśli nie znasz nazwy, musisz ją sprawdzić w panelu – NLST nie działa na tym FTP
+latest_log = "gameplay_17B59C21F4CB47D38768C9F54B1870E7.log"
+
+# --- POBRANIE LOGA ---
 ftp = FTP()
 ftp.connect(FTP_HOST, FTP_PORT)
 ftp.login(FTP_USER, FTP_PASS)
 ftp.cwd(LOG_DIR)
-files = ftp.nlst()
 
-# Filtruj pliki gameplay_*.log
-log_files = [f for f in files if f.startswith("gameplay_") and f.endswith(".log")]
-
-if not log_files:
-    print("[ERROR] Brak plików gameplay_*.log")
-    ftp.quit()
-    exit()
-
-# Pobierz najnowszy (wg listy, FTP nie zawsze sortuje czasem modyfikacji)
-latest_log = sorted(log_files)[-1]
-print(f"[INFO] Najnowszy log: {latest_log}")
-
-# Pobierz plik
 with open("latest_log.log", "wb") as f:
     ftp.retrbinary(f"RETR {latest_log}", f.write)
 
