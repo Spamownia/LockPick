@@ -6,6 +6,7 @@ import requests
 import pandas as pd
 from flask import Flask
 
+# --- KONFIGURACJA FTP I WEBHOOK ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
@@ -13,8 +14,9 @@ FTP_PASS = "LXNdGShY"
 LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
+# --- REGEX DO WYCIĄGANIA LOCKPICKÓW ---
 LOCKPICK_REGEX = re.compile(
-    r"User:\s+(.*?)\s+\(\d+,\s+\d+\).*?Success:\s+(Yes|No).*?Elapsed time:\s+([\d.]+).*?Lock type:\s+(\w+)",
+    r"User:\s+(.*?)\s+\(\d+,\s+\d+\).*?Success:\s+(Yes|No).*?Elapsed time:\s+([\d.,]+).*?Lock type:\s+(\w+)",
     re.DOTALL
 )
 
@@ -24,6 +26,7 @@ app = Flask(__name__)
 def index():
     return "Alive"
 
+# --- POBIERANIE LOGÓW Z FTP ---
 def fetch_logs():
     logs = []
     try:
@@ -44,6 +47,7 @@ def fetch_logs():
         print(f"[ERROR] FTP download: {e}")
     return logs
 
+# --- PARSOWANIE LOGÓW LOCKPICK ---
 def parse_lockpicks(log_texts):
     stats = {}
     for text in log_texts:
@@ -59,10 +63,13 @@ def parse_lockpicks(log_texts):
             else:
                 stats[key]["fail"] += 1
 
-            clean_elapsed = elapsed.strip().rstrip(".")
-            stats[key]["times"].append(float(clean_elapsed))
+            clean_elapsed = elapsed.strip().replace(",", ".")
+            clean_elapsed = re.sub(r"[^\d.]", "", clean_elapsed)
+            if clean_elapsed:
+                stats[key]["times"].append(float(clean_elapsed))
     return stats
 
+# --- TWORZENIE TABELI EXCEL ---
 def build_table(stats):
     rows = []
     for (nick, locktype), data in stats.items():
@@ -93,21 +100,23 @@ def build_table(stats):
     output.seek(0)
     return output
 
+# --- WYSYŁANIE NA DISCORD WEBHOOK ---
 def send_to_discord(file):
     files = {"file": ("lockpicks.xlsx", file, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
     response = requests.post(WEBHOOK_URL, files=files)
     print(f"[INFO] Webhook status: {response.status_code}")
 
+# --- PĘTLA GŁÓWNA ---
 if __name__ == "__main__":
     while True:
-        print("[INFO] Checking FTP logs...")
+        print("[INFO] Sprawdzanie logów FTP...")
         logs = fetch_logs()
         if logs:
             stats = parse_lockpicks(logs)
             excel_file = build_table(stats)
             send_to_discord(excel_file)
         else:
-            print("[INFO] No new logs found.")
+            print("[INFO] Brak nowych logów.")
         time.sleep(60)
 
     app.run(host='0.0.0.0', port=3000)
