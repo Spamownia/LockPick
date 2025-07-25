@@ -115,6 +115,11 @@ else:
         "Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"
     ])
 
+    # --- SORTOWANIE ---
+    lock_order = ["VeryEasy", "Easy", "Medium", "Advanced", "DialLock"]
+    df["Zamek"] = pd.Categorical(df["Zamek"], categories=lock_order, ordered=True)
+    df = df.sort_values(by=["Nick", "Zamek"])
+
     # Wyśrodkowanie tekstu w pandas.to_string()
     table = df.to_string(index=False, justify="center")
 
