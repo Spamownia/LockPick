@@ -2,7 +2,7 @@ import ftplib
 import re
 import statistics
 import requests
-from flask import Flask, jsonify
+from flask import Flask
 
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
@@ -23,16 +23,36 @@ def get_ftp_logs():
         ftp.login(FTP_USER, FTP_PASS)
         print("[DEBUG] login() zakończone, próbuję cwd()...")
         ftp.cwd("/SCUM/Saved/SaveFiles/Logs")
-        print("[DEBUG] cwd() zakończone, próbuję nlst()...")
-        files = ftp.nlst()
-        print(f"[DEBUG] Pliki na FTP: {files}")
+        print("[DEBUG] cwd() zakończone, próbuję pobrać listę plików...")
+
+        files = []
+        # Najpierw próbujemy mlsd() - bardziej nowoczesne i stabilne
+        try:
+            for entry in ftp.mlsd():
+                name, facts = entry
+                if facts.get("type") == "file" and name.endswith(".log"):
+                    files.append(name)
+            print(f"[DEBUG] Pliki pobrane przez MLSD: {files}")
+        except (ftplib.error_perm, AttributeError) as e:
+            print(f"[WARNING] MLSD nie działa ({e}), próbuję LIST...")
+            # Fallback: ręczne parsowanie LIST
+            lines = []
+            ftp.retrlines("LIST", lines.append)
+            for line in lines:
+                parts = line.split(maxsplit=8)
+                if len(parts) == 9:
+                    name = parts[-1]
+                    mode = parts[0]
+                    if mode.startswith("-") and name.endswith(".log"):
+                        files.append(name)
+            print(f"[DEBUG] Pliki pobrane przez LIST: {files}")
+
         for filename in files:
-            if filename.endswith(".log"):
-                print(f"[INFO] Downloading: {filename}")
-                from io import StringIO
-                sio = StringIO()
-                ftp.retrlines(f"RETR {filename}", lambda line: sio.write(line + "\n"))
-                logs.append(sio.getvalue())
+            print(f"[INFO] Downloading: {filename}")
+            from io import StringIO
+            sio = StringIO()
+            ftp.retrlines(f"RETR {filename}", lambda line: sio.write(line + "\n"))
+            logs.append(sio.getvalue())
         ftp.quit()
     except Exception as e:
         print(f"[ERROR] Błąd podczas pobierania logów: {e}")
@@ -46,7 +66,7 @@ def parse_lockpicks(logs):
         for line in log.splitlines():
             m = pattern.search(line)
             if m:
-                elapsed = m.group(1).rstrip('.')  # usunięcie kropki jeśli jest
+                elapsed = m.group(1).rstrip('.')  # usuń kropkę jeśli występuje
                 weapon = m.group(2)
                 try:
                     elapsed_float = float(elapsed)
@@ -104,7 +124,6 @@ def main_loop():
 
 if __name__ == "__main__":
     from threading import Timer
-    import time
 
     def run_periodically(interval, func):
         def wrapper():
@@ -112,7 +131,5 @@ if __name__ == "__main__":
             Timer(interval, wrapper).start()
         wrapper()
 
-    # Uruchamiamy pętlę główną co 60 sekund
     run_periodically(60, main_loop)
-
     app.run(host='0.0.0.0', port=3000)
