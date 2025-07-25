@@ -1,116 +1,114 @@
-# main.py
-
-import ftplib
 import os
+import ftplib
 import time
-import io
 import pandas as pd
-import threading
+import requests
+from io import StringIO
 from flask import Flask
 
-# --- Konfiguracja FTP ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-
-# --- Webhook Discord ---
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# --- Flask app ---
-app = Flask(__name__)
-
-@app.route("/")
-def index():
-    return "Alive", 200
-
-# --- Pobieranie logów FTP ---
-def fetch_logs():
+def get_ftp_logs():
+    print("[DEBUG] Rozpoczynam pobieranie logów z FTP...")
     logs = []
     try:
-        with ftplib.FTP() as ftp:
-            ftp.connect(FTP_HOST, FTP_PORT)
-            ftp.login(FTP_USER, FTP_PASS)
-            ftp.cwd("/SCUM/Saved/SaveFiles/Logs")
-            filenames = ftp.nlst()
-            for filename in filenames:
-                if filename.startswith("gameplay_") and filename.endswith(".log"):
-                    print(f"[INFO] Downloading: {filename}")
-                    with io.BytesIO() as bio:
-                        ftp.retrbinary(f"RETR {filename}", bio.write)
-                        content = bio.getvalue().decode("utf-8")
-                        logs.append(content)
+        ftp = ftplib.FTP()
+        ftp.connect(FTP_HOST, FTP_PORT)
+        ftp.login(FTP_USER, FTP_PASS)
+        print("[DEBUG] Połączono z FTP")
+        ftp.cwd("/SCUM/Saved/SaveFiles/Logs")
+        files = ftp.nlst()
+        print(f"[DEBUG] Pliki na FTP: {files}")
+
+        for filename in files:
+            if filename.endswith(".log"):
+                print(f"[INFO] Downloading: {filename}")
+                sio = StringIO()
+                ftp.retrlines(f"RETR {filename}", lambda line: sio.write(line + "\n"))
+                logs.append(sio.getvalue())
+        ftp.quit()
     except Exception as e:
-        print(f"[ERROR] FTP: {e}")
+        print(f"[ERROR] Błąd podczas pobierania logów: {e}")
+    print(f"[DEBUG] Liczba pobranych logów: {len(logs)}")
     return logs
 
-# --- Parsowanie lockpicków ---
 def parse_lockpicks(logs):
-    import re
+    print("[DEBUG] Parsowanie logów lockpick...")
     stats = {}
-    pattern = re.compile(r"LOCKPICK: (\S+) - (\S+) - (\S+) - (\S+)s")
     for log in logs:
-        for line in log.splitlines():
-            m = pattern.search(line)
-            if m:
-                player, target, item, elapsed = m.groups()
-                key = (player, target, item)
-                if key not in stats:
-                    stats[key] = {"count": 0, "times": []}
-                stats[key]["count"] += 1
-                try:
-                    elapsed_clean = elapsed.replace(".", "", elapsed.count(".") - 1)  # usuwa nadmiar kropki
-                    stats[key]["times"].append(float(elapsed_clean))
-                except ValueError:
-                    print(f"[WARN] Cannot convert elapsed: {elapsed}")
+        lines = log.splitlines()
+        for line in lines:
+            if "lockpick" in line:
+                parts = line.split()
+                if len(parts) >= 4:
+                    player = parts[2]
+                    elapsed = parts[-1].replace(".", "").replace(",", ".")
+                    key = player
+                    if key not in stats:
+                        stats[key] = {"times": []}
+                    try:
+                        stats[key]["times"].append(float(elapsed))
+                    except ValueError:
+                        print(f"[WARN] Nieprawidłowa wartość czasu: '{elapsed}' w linii: {line}")
+    print(f"[DEBUG] Liczba graczy w statystykach: {len(stats)}")
     return stats
 
-# --- Budowanie tabeli ---
-def build_table(stats):
-    data = []
-    for (player, target, item), v in stats.items():
-        avg_time = round(sum(v["times"]) / len(v["times"]), 2) if v["times"] else 0
-        data.append({
-            "Player": player,
-            "Target": target,
-            "Item": item,
-            "Count": v["count"],
-            "AvgTime": avg_time
-        })
-    df = pd.DataFrame(data)
-    file_name = "lockpicks.xlsx"
-    df.to_excel(file_name, index=False)
-    return file_name
+def generate_table(stats):
+    print("[DEBUG] Generowanie tabeli...")
+    if not stats:
+        print("[INFO] Brak danych do wygenerowania tabeli.")
+        return None
+    df = pd.DataFrame([
+        {"Player": player, "Attempts": len(data["times"]), "Avg Time": sum(data["times"]) / len(data["times"])}
+        for player, data in stats.items()
+    ])
+    df.sort_values(by=["Attempts"], ascending=False, inplace=True)
+    table = df.to_markdown(index=False)
+    print("[DEBUG] Wygenerowana tabela:\n" + table)
+    return table
 
-# --- Wysyłka na Discord ---
-def send_to_discord(file_path):
-    import requests
-    with open(file_path, "rb") as f:
-        files = {"file": (file_path, f)}
-        response = requests.post(WEBHOOK_URL, files=files)
+def send_to_webhook(content):
+    if not content:
+        print("[INFO] Brak treści do wysłania na webhook.")
+        return
+    data = {"content": f"```\n{content}\n```"}
+    try:
+        response = requests.post(WEBHOOK_URL, json=data)
         if response.status_code == 204:
-            print("[INFO] Sent to Discord successfully.")
+            print("[INFO] Tabela wysłana na webhook.")
         else:
-            print(f"[ERROR] Discord: {response.status_code} {response.text}")
+            print(f"[ERROR] Błąd wysyłki na webhook: {response.status_code} {response.text}")
+    except Exception as e:
+        print(f"[ERROR] Wyjątek podczas wysyłki na webhook: {e}")
 
-# --- Pętla główna ---
 def main_loop():
     while True:
-        print("[INFO] Sprawdzanie logów FTP...")
-        logs = fetch_logs()
-        if logs:
-            stats = parse_lockpicks(logs)
-            excel_file = build_table(stats)
-            send_to_discord(excel_file)
-        else:
+        print("[DEBUG] Iteracja pętli głównej...")
+        logs = get_ftp_logs()
+        if not logs:
             print("[INFO] Brak nowych logów.")
+        else:
+            stats = parse_lockpicks(logs)
+            table = generate_table(stats)
+            if table:
+                send_to_webhook(table)
+            else:
+                print("[INFO] Tabela nie została wygenerowana.")
         time.sleep(60)
 
-# --- Uruchomienie ---
-if __name__ == "__main__":
-    # Start pętli głównej w wątku
-    thread = threading.Thread(target=main_loop, daemon=True)
-    thread.start()
+# Flask dla uptimerobot
+app = Flask(__name__)
 
-    # Start Flask
-    app.run(host="0.0.0.0", port=3000)
+@app.route('/')
+def index():
+    return "Alive"
+
+if __name__ == "__main__":
+    from threading import Thread
+    t = Thread(target=main_loop)
+    t.start()
+    app.run(host='0.0.0.0', port=3000)
