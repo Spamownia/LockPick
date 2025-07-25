@@ -1,76 +1,51 @@
 import ftplib
 import time
-import os
-import io
 import re
-import codecs
+import io
 import requests
+import pandas as pd
+from flask import Flask
 
-# --- Konfiguracja FTP ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-FTP_DIR = "/SCUM/Saved/SaveFiles/Logs/"
-LOG_PATTERN = "gameplay_"
-
-# --- Webhook Discord ---
+LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-STATE_FILE = "downloaded_logs.txt"
-
 LOCKPICK_REGEX = re.compile(
-    r"User:\s+([^\s]+).*?Success:\s+(Yes|No).*?Elapsed time:\s+([\d.]+).*?Lock type:\s+([^\s.]+)",
-    re.IGNORECASE | re.DOTALL
+    r"User:\s+(.*?)\s+\(\d+,\s+\d+\).*?Success:\s+(Yes|No).*?Elapsed time:\s+([\d.]+).*?Lock type:\s+(\w+)",
+    re.DOTALL
 )
 
-def load_downloaded():
-    if not os.path.exists(STATE_FILE):
-        return set()
-    with open(STATE_FILE, "r") as f:
-        return set(f.read().splitlines())
+app = Flask(__name__)
 
-def save_downloaded(files):
-    with open(STATE_FILE, "w") as f:
-        f.write("\n".join(files))
+@app.route('/')
+def index():
+    return "Alive"
 
 def fetch_logs():
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(FTP_DIR)
+    logs = []
+    try:
+        with ftplib.FTP() as ftp:
+            ftp.connect(FTP_HOST, FTP_PORT)
+            ftp.login(FTP_USER, FTP_PASS)
+            ftp.encoding = 'utf-8'
+            ftp.cwd(LOG_DIR)
+            filenames = ftp.nlst()
 
-    downloaded = load_downloaded()
-    lines = []
-    ftp.retrlines('LIST', lines.append)
-
-    files = []
-    for line in lines:
-        parts = line.split()
-        filename = parts[-1]
-        if filename.startswith(LOG_PATTERN):
-            files.append(filename)
-
-    new_files = [f for f in files if f not in downloaded]
-
-    all_data = []
-
-    for filename in new_files:
-        print(f"[INFO] Downloading: {filename}")
-        bio = io.BytesIO()
-        ftp.retrbinary(f"RETR {filename}", bio.write)
-        bio.seek(0)
-        content = codecs.decode(bio.read(), "utf-16-le")
-        all_data.append(content)
-        downloaded.add(filename)
-
-    ftp.quit()
-    save_downloaded(downloaded)
-    return all_data
+            for filename in filenames:
+                if filename.startswith("gameplay_") and filename.endswith(".log"):
+                    r = io.BytesIO()
+                    ftp.retrbinary(f"RETR {filename}", r.write)
+                    data = r.getvalue().decode('utf-16le')
+                    logs.append(data)
+    except Exception as e:
+        print(f"[ERROR] FTP download: {e}")
+    return logs
 
 def parse_lockpicks(log_texts):
     stats = {}
-
     for text in log_texts:
         matches = LOCKPICK_REGEX.findall(text)
         for nick, success, elapsed, locktype in matches:
@@ -83,54 +58,56 @@ def parse_lockpicks(log_texts):
                 stats[key]["success"] += 1
             else:
                 stats[key]["fail"] += 1
-            stats[key]["times"].append(float(elapsed))
 
+            clean_elapsed = elapsed.strip().rstrip(".")
+            stats[key]["times"].append(float(clean_elapsed))
     return stats
 
-def format_table(stats):
-    headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
-
+def build_table(stats):
     rows = []
-    for (nick, lock), data in stats.items():
+    for (nick, locktype), data in stats.items():
         total = data["total"]
         success = data["success"]
         fail = data["fail"]
-        accuracy = f"{(success / total) * 100:.2f}%"
-        avg_time = f"{sum(data['times']) / len(data['times']):.2f}s"
-        rows.append([nick, lock, str(total), str(success), str(fail), accuracy, avg_time])
+        avg_time = sum(data["times"]) / len(data["times"]) if data["times"] else 0
+        effectiveness = f"{(success/total)*100:.1f}%" if total else "0%"
+        rows.append([nick, locktype, total, success, fail, effectiveness, f"{avg_time:.2f}s"])
 
-    cols = list(zip(*([headers] + rows)))
-    col_widths = [max(len(cell) for cell in col) for col in cols]
+    df = pd.DataFrame(rows, columns=["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"])
 
-    def fmt_row(row):
-        return " | ".join(cell.center(w) for cell, w in zip(row, col_widths))
+    from io import BytesIO
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        df.to_excel(writer, index=False, sheet_name='Lockpicks')
+        workbook = writer.book
+        worksheet = writer.sheets['Lockpicks']
 
-    lines = [fmt_row(headers)]
-    lines.append("-+-".join("-" * w for w in col_widths))
-    for row in rows:
-        lines.append(fmt_row(row))
+        for i, col in enumerate(df.columns):
+            max_length = max(df[col].astype(str).map(len).max(), len(col)) + 2
+            worksheet.set_column(i, i, max_length, workbook.add_format({'align': 'center'}))
 
-    return "```\n" + "\n".join(lines) + "\n```"
+        header_format = workbook.add_format({'bold': True, 'align': 'center'})
+        for col_num, value in enumerate(df.columns.values):
+            worksheet.write(0, col_num, value, header_format)
 
-def send_to_discord(table):
-    payload = {"content": table}
-    r = requests.post(WEBHOOK_URL, json=payload)
-    if r.status_code == 204:
-        print("[INFO] Tabela wysłana.")
-    else:
-        print(f"[ERROR] Błąd wysyłki: {r.status_code} {r.text}")
+    output.seek(0)
+    return output
+
+def send_to_discord(file):
+    files = {"file": ("lockpicks.xlsx", file, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")}
+    response = requests.post(WEBHOOK_URL, files=files)
+    print(f"[INFO] Webhook status: {response.status_code}")
 
 if __name__ == "__main__":
     while True:
-        print("[INFO] Sprawdzanie logów FTP...")
+        print("[INFO] Checking FTP logs...")
         logs = fetch_logs()
         if logs:
             stats = parse_lockpicks(logs)
-            if stats:
-                table = format_table(stats)
-                send_to_discord(table)
-            else:
-                print("[INFO] Brak danych lockpickingu w nowych logach.")
+            excel_file = build_table(stats)
+            send_to_discord(excel_file)
         else:
-            print("[INFO] Brak nowych plików logów.")
+            print("[INFO] No new logs found.")
         time.sleep(60)
+
+    app.run(host='0.0.0.0', port=3000)
