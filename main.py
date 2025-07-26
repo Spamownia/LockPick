@@ -1,19 +1,18 @@
 import ftplib
-import psycopg2
+import io
 import re
-import time
+import psycopg2
 import requests
 from collections import defaultdict
 
-# --- Konfiguracja ---
+# Konfiguracja FTP
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 FTP_PATH = "/SCUM/Saved/SaveFiles/Logs/"
 
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-
+# Konfiguracja DB PostgreSQL Neon
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -22,154 +21,64 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-# --- Pobranie listy plików z FTP bez użycia nlst() ---
-def fetch_log_files_ftp(ftp):
-    files = []
-    def parse_line(line):
-        parts = line.split(None, 8)
-        if len(parts) == 9:
-            filename = parts[-1]
-            # Filtrujemy tylko pliki gameplay_*.log, jeśli takie są, lub inne odpowiednie
-            if filename.startswith("gameplay_") and filename.endswith(".log"):
-                files.append(filename)
-    ftp.retrlines("LIST", parse_line)
-    return files
+# Webhook Discord
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# --- Pobranie i dekodowanie plików logów z FTP ---
+# Regex do parsowania wpisów lockpick
+LOG_PATTERN = re.compile(
+    r"""
+    ^\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}:\s
+    \[LogMinigame\]\s\[LockpickingMinigame_C\]\sUser:\s
+    (?P<nick>.+?)\s\(\d+,.*?\)\.\s
+    Success:\s(?P<result>Yes|No)\.\s
+    Elapsed\stime:\s(?P<time>[\d\.]+)\.\s
+    Failed\sattempts:\s\d+\.\s
+    Target\sobject:.*?\.\s
+    Lock\stype:\s(?P<castle>\w+)\.
+    """,
+    re.VERBOSE | re.MULTILINE
+)
+
+def connect_ftp():
+    ftp = ftplib.FTP()
+    ftp.connect(FTP_HOST, FTP_PORT)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.cwd(FTP_PATH)
+    return ftp
+
 def fetch_logs():
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(FTP_PATH)
-    print("[INFO] Połączono z FTP.")
-    files = fetch_log_files_ftp(ftp)
+    ftp = connect_ftp()
+    files = ftp.nlst()
+    log_files = [f for f in files if f.startswith("gameplay_")]
     logs = []
-    for file in files:
-        lines = []
-        ftp.retrlines(f"RETR {file}", lines.append)
-        # Pliki kodowane UTF-16 LE, dekodujemy
-        raw_bytes = "\n".join(lines).encode('latin1')  # ftp.retrlines zwraca już tekst, więc by odkodować, musimy pobrać raw? Niestety retrlines zwraca już dekodowany tekst.
-        # Dlatego zamiast retrlines użyjemy retrbinary
-        # Zmieniamy podejście do pobierania zawartości:
+    for filename in log_files:
+        bio = io.BytesIO()
+        ftp.retrbinary(f"RETR {filename}", bio.write)
+        bio.seek(0)
+        content = bio.read().decode("utf-16le")
+        logs.append(content)
     ftp.quit()
-
-    # Poprawione pobieranie zawartości plików UTF-16 LE:
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(FTP_PATH)
-    logs = []
-    for file in files:
-        raw_data = []
-        ftp.retrbinary(f"RETR {file}", raw_data.append)
-        raw_bytes = b"".join(raw_data)
-        text = raw_bytes.decode("utf-16le")
-        logs.append(text)
-    ftp.quit()
-    print(f"[DEBUG] Liczba logów: {len(logs)}")
     return logs
 
-# --- Parsowanie logów, wyciąganie wpisów Lockpicking ---
-def parse_logs(log_texts):
+def parse_logs(logs):
     entries = []
-    # Regex dopasowujący linie lockpick
-    pattern = re.compile(
-        r"\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}: \[LogMinigame\] \[LockpickingMinigame_C\] "
-        r"User: (?P<nick>.+?) \(\d+, \d+\)\. Success: (?P<success>Yes|No)\. "
-        r"Elapsed time: (?P<time>[\d\.]+)\. Failed attempts: \d+\. "
-        r"Target object: .*? Lock type: (?P<lock_type>\w+)\..*"
-    )
-
-    for text in log_texts:
-        for line in text.splitlines():
-            match = pattern.match(line)
-            if match:
-                entry = {
-                    "nick": match.group("nick"),
-                    "castle": match.group("lock_type"),
-                    "result": match.group("success"),
-                    "time": match.group("time").rstrip("."),  # usuwamy kropkę na końcu jeśli jest
-                }
-                entries.append(entry)
-    print(f"[DEBUG] Sparsowane wpisy lockpick: {len(entries)}")
+    for log_text in logs:
+        for match in LOG_PATTERN.finditer(log_text):
+            time_str = match.group("time").rstrip(".")
+            try:
+                time = float(time_str)
+            except ValueError:
+                # Jeśli nadal błąd, pomiń wpis
+                continue
+            entries.append({
+                "nick": match.group("nick"),
+                "castle": match.group("castle"),
+                "result": match.group("result"),
+                "time": time
+            })
     return entries
 
-# --- Sprawdzenie czy wpis już istnieje ---
-def entry_exists(cur, entry):
-    cur.execute("""
-        SELECT 1 FROM lockpick_entries 
-        WHERE nick=%s AND castle=%s AND result=%s AND time=%s
-        """, (entry["nick"], entry["castle"], entry["result"], float(entry["time"])))
-    return cur.fetchone() is not None
-
-# --- Zapis wpisów do bazy ---
-def save_entries(cur, conn, entries):
-    new_entries = 0
-    for entry in entries:
-        if not entry_exists(cur, entry):
-            cur.execute("""
-                INSERT INTO lockpick_entries (nick, castle, result, time) 
-                VALUES (%s, %s, %s, %s)
-            """, (entry["nick"], entry["castle"], entry["result"], float(entry["time"])))
-            new_entries += 1
-    conn.commit()
-    print(f"[DEBUG] Nowe wpisy: {new_entries}")
-    return new_entries
-
-# --- Pobranie statystyk z bazy ---
-def get_stats(cur):
-    cur.execute("""
-        SELECT nick, castle, 
-               COUNT(*) as total,
-               COUNT(*) FILTER (WHERE result='Yes') as success,
-               COUNT(*) FILTER (WHERE result='No') as fail,
-               AVG(time) as avg_time
-        FROM lockpick_entries
-        GROUP BY nick, castle
-        ORDER BY nick
-    """)
-    return cur.fetchall()
-
-# --- Formatowanie i wysłanie tabeli do webhook ---
-def send_webhook(stats):
-    # Przygotowanie danych do tabeli
-    header = ["Nick", "Zamek", "Wszystkie", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
-    rows = []
-    for row in stats:
-        nick, castle, total, success, fail, avg_time = row
-        success_ratio = (success / total * 100) if total > 0 else 0
-        rows.append([
-            nick, 
-            castle, 
-            str(total), 
-            str(success), 
-            str(fail), 
-            f"{success_ratio:.1f}%", 
-            f"{avg_time:.2f}"
-        ])
-
-    # Obliczamy szerokość kolumn (max długość)
-    columns = list(zip(*([header] + rows)))
-    col_widths = [max(len(str(cell)) for cell in col) for col in columns]
-
-    # Formatowanie wierszy z wyśrodkowaniem
-    def format_row(row):
-        return "| " + " | ".join(f"{str(cell):^{col_widths[i]}}" for i, cell in enumerate(row)) + " |"
-
-    table = "\n".join([
-        format_row(header),
-        "|-" + "-|-".join('-' * w for w in col_widths) + "-|"
-    ] + [format_row(row) for row in rows])
-
-    payload = {"content": f"```\n{table}\n```"}
-    response = requests.post(WEBHOOK_URL, json=payload)
-    if response.ok:
-        print("[INFO] Wysłano tabelę na webhook.")
-    else:
-        print(f"[ERROR] Błąd wysyłania webhook: {response.status_code} - {response.text}")
-
-# --- Inicjalizacja bazy danych ---
-def init_db():
+def connect_db():
     conn = psycopg2.connect(
         host=DB_CONFIG["host"],
         dbname=DB_CONFIG["dbname"],
@@ -177,46 +86,110 @@ def init_db():
         password=DB_CONFIG["password"],
         sslmode=DB_CONFIG["sslmode"]
     )
-    cur = conn.cursor()
-    # Tworzymy tabelę jeśli nie istnieje
+    return conn
+
+def create_table(cur):
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS lockpick_entries (
-            id SERIAL PRIMARY KEY,
-            nick TEXT NOT NULL,
-            castle TEXT NOT NULL,
-            result TEXT NOT NULL,
-            time REAL NOT NULL
-        );
+        CREATE TABLE IF NOT EXISTS lockpick_stats (
+            nick TEXT,
+            castle TEXT,
+            result TEXT,
+            time REAL
+        )
     """)
+
+def entry_exists(cur, entry):
+    cur.execute("""
+        SELECT 1 FROM lockpick_stats WHERE
+        nick = %s AND castle = %s AND result = %s AND time = %s
+    """, (entry["nick"], entry["castle"], entry["result"], entry["time"]))
+    return cur.fetchone() is not None
+
+def save_entries(cur, conn, entries):
+    new_count = 0
+    for entry in entries:
+        if not entry_exists(cur, entry):
+            cur.execute("""
+                INSERT INTO lockpick_stats (nick, castle, result, time)
+                VALUES (%s, %s, %s, %s)
+            """, (entry["nick"], entry["castle"], entry["result"], entry["time"]))
+            new_count += 1
     conn.commit()
-    return conn, cur
+    return new_count
 
-# --- Główna funkcja ---
+def aggregate_stats(cur):
+    cur.execute("""
+        SELECT nick, castle,
+               COUNT(*) AS total,
+               SUM(CASE WHEN result='Yes' THEN 1 ELSE 0 END) AS success,
+               SUM(CASE WHEN result='No' THEN 1 ELSE 0 END) AS fail,
+               AVG(time) AS avg_time
+        FROM lockpick_stats
+        GROUP BY nick, castle
+        ORDER BY nick, castle
+    """)
+    return cur.fetchall()
+
+def create_table_text(data):
+    headers = ["Nick", "Zamek", "Wszystkie", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
+    rows = []
+
+    for row in data:
+        nick, castle, total, success, fail, avg_time = row
+        efficiency = f"{(success / total * 100):.2f}%" if total > 0 else "0%"
+        avg_time_str = f"{avg_time:.2f}" if avg_time is not None else "-"
+        rows.append([nick, castle, str(total), str(success), str(fail), efficiency, avg_time_str])
+
+    # Oblicz szerokości kolumn (max długość w każdej kolumnie)
+    col_widths = [max(len(row[i]) for row in [headers] + rows) for i in range(len(headers))]
+
+    # Funkcja do formatowania pojedynczej komórki wyśrodkowanie tekstu
+    def center_text(text, width):
+        return text.center(width)
+
+    # Buduj nagłówek tabeli
+    header_line = "| " + " | ".join(center_text(headers[i], col_widths[i]) for i in range(len(headers))) + " |"
+    separator_line = "|" + "|".join("-" * (col_widths[i] + 2) for i in range(len(headers))) + "|"
+
+    # Buduj wiersze danych
+    data_lines = []
+    for row in rows:
+        line = "| " + " | ".join(center_text(row[i], col_widths[i]) for i in range(len(row))) + " |"
+        data_lines.append(line)
+
+    table_text = "\n".join([header_line, separator_line] + data_lines)
+    return table_text
+
+def send_webhook(table_text):
+    data = {"content": f"```{table_text}```"}
+    requests.post(WEBHOOK_URL, json=data)
+
 def main():
-    print("[INFO] Inicjalizacja bazy...")
-    conn, cur = init_db()
-
     print("[INFO] Pobieranie logów...")
     logs = fetch_logs()
 
     print("[INFO] Parsowanie danych...")
-    entries = parse_logs(logs)
+    parsed_entries = parse_logs(logs)
+    print(f"[DEBUG] Sparsowane wpisy lockpick: {len(parsed_entries)}")
 
-    if not entries:
-        print("[INFO] Brak nowych danych w logach.")
-        conn.close()
-        return
+    conn = connect_db()
+    cur = conn.cursor()
+    print("[INFO] Inicjalizacja bazy...")
+    create_table(cur)
 
     print("[INFO] Zapisywanie do bazy...")
-    new_count = save_entries(cur, conn, entries)
+    new_entries_count = save_entries(cur, conn, parsed_entries)
+    print(f"[DEBUG] Nowe wpisy: {new_entries_count}")
 
-    if new_count > 0:
-        print("[INFO] Pobieranie statystyk...")
-        stats = get_stats(cur)
-        send_webhook(stats)
+    if new_entries_count > 0:
+        stats = aggregate_stats(cur)
+        table_text = create_table_text(stats)
+        send_webhook(table_text)
+        print("[INFO] Wysłano tabelę na webhook.")
     else:
         print("[INFO] Brak nowych danych – webhook nie wysłany.")
 
+    cur.close()
     conn.close()
 
 if __name__ == "__main__":
