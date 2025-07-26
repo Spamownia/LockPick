@@ -1,9 +1,9 @@
 # --- AUTOMATYCZNA INSTALACJA WYMAGANYCH BIBLIOTEK ---
 import subprocess, sys
 
-for pkg, module in [("requests", "requests"), ("pandas", "pandas")]:
+for pkg in ["requests", "pandas"]:
     try:
-        __import__(module)
+        __import__(pkg)
     except ImportError:
         subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
 
@@ -32,12 +32,10 @@ ftp.cwd(LOG_DIR)
 files = []
 ftp.retrlines('LIST', files.append)
 
-gameplay_logs = []
-for line in files:
-    parts = line.split()
-    filename = parts[-1]
-    if filename.startswith("gameplay_") and filename.endswith(".log"):
-        gameplay_logs.append(filename)
+gameplay_logs = [
+    line.split()[-1] for line in files
+    if line.split()[-1].startswith("gameplay_") and line.split()[-1].endswith(".log")
+]
 
 print(f"[INFO] Znaleziono {len(gameplay_logs)} plików gameplay_*.log")
 
@@ -52,8 +50,7 @@ for log_file in gameplay_logs:
         ftp.retrbinary(f"RETR {log_file}", f.write)
 
     with open(local_filename, "r", encoding="utf-16le") as f:
-        lines = f.readlines()
-        all_lines.extend(lines)
+        all_lines.extend(f.readlines())
 
     os.remove(local_filename)
 
@@ -120,7 +117,7 @@ else:
     df["Zamek_kolejnosc"] = df["Zamek"].map(lock_order)
     df = df.sort_values(by=["Nick", "Zamek_kolejnosc"]).drop(columns=["Zamek_kolejnosc"])
 
-    # --- WYŚRODKOWANIE KOMÓREK + NAGŁÓWKI ---
+    # --- WYŚRODKOWANIE KOMÓREK I NAGŁÓWKÓW ---
     df_str = df.astype(str)
     max_lengths = df_str.applymap(len).combine(df_str.columns.to_series().apply(len), max)
 
