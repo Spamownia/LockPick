@@ -29,6 +29,7 @@ ftp.connect(FTP_HOST, FTP_PORT)
 ftp.login(FTP_USER, FTP_PASS)
 ftp.cwd(LOG_DIR)
 
+# Pobranie listy plików przez LIST (ponieważ NLST nie działa)
 files = []
 ftp.retrlines('LIST', files.append)
 
@@ -77,7 +78,7 @@ for line in all_lines:
         nick = match.group("nick")
         lock = match.group("lock")
         if lock == "Easy":
-            lock = "Basic"
+            lock = "Basic"  # ZAMIANA
         success = match.group("success")
         time_str = match.group("time").rstrip(".")
         try:
@@ -116,14 +117,18 @@ else:
         "Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"
     ])
 
-    # Sortowanie wg Nick i kolejności zamków
+    # Ustalona kolejność zamków
     lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
-    df["Zamek_order"] = df["Zamek"].map(lock_order)
-    df.sort_values(by=["Nick", "Zamek_order"], inplace=True)
-    df.drop(columns=["Zamek_order"], inplace=True)
+    df["Zamek_kolejnosc"] = df["Zamek"].map(lock_order)
+    df = df.sort_values(by=["Nick", "Zamek_kolejnosc"]).drop(columns=["Zamek_kolejnosc"])
 
-    # Wyśrodkowanie tekstu w każdej komórce
-    table = df.to_string(index=False, justify="center")
+    # Wyśrodkowanie każdej komórki jako tekst
+    df_str = df.astype(str)
+    max_lengths = df_str.applymap(len).max()
+    for col in df_str.columns:
+        df_str[col] = df_str[col].apply(lambda x: x.center(max_lengths[col]))
+
+    table = df_str.to_string(index=False)
 
     print("[INFO] Tabela gotowa:\n", table)
 
