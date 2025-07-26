@@ -3,3 +3,4 @@ pandas
 openpyxl
 xlsxwriter
 flask
+psycopg2-binary
