@@ -5,3 +5,4 @@ xlsxwriter
 flask
 psycopg2-binary
 tabulate
+python-dotenv
