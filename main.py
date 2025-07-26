@@ -1,48 +1,44 @@
-# --- AUTOMATYCZNA INSTALACJA WYMAGANYCH BIBLIOTEK ---
-import subprocess
-import sys
-import os
 import re
 import pandas as pd
+import requests
+import os
 from ftplib import FTP
 from io import BytesIO
-import requests
+from collections import defaultdict
+from flask import Flask
 
-# --- INSTALACJA ---
-try:
-    import pandas as pd
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas"])
-    import pandas as pd
-
-# --- KONFIGURACJA FTP ---
+# --- Konfiguracja ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-FTP_DIR = "/Scum/Saved/Logs/"
-
-# --- KONFIGURACJA WEBHOOKA ---
+FTP_DIR = "/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# --- POBIERZ NAJNOWSZE PLIKI LOGÓW Z FTP ---
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Alive"
+
 def download_latest_log_files():
     ftp = FTP()
     ftp.connect(FTP_HOST, FTP_PORT)
     ftp.login(FTP_USER, FTP_PASS)
     ftp.cwd(FTP_DIR)
 
-    files = []
-    ftp.retrlines("NLST", files.append)
+    listing = []
+    ftp.retrlines("LIST", listing.append)
 
+    files = [line.split()[-1] for line in listing]
     gameplay_logs = sorted([f for f in files if f.startswith("gameplay_") and f.endswith(".log")])
     print(f"[INFO] Znaleziono {len(gameplay_logs)} plików gameplay_*.log")
 
     log_contents = []
-    for filename in gameplay_logs[-30:]:  # ostatnie 30
+    for filename in gameplay_logs[-30:]:
         print(f"[INFO] Pobieranie pliku: {filename}")
         with BytesIO() as f:
-            ftp.retrbinary(f"RETR {filename}", f.write)
+            ftp.retrbinary(f"RETR " + filename, f.write)
             f.seek(0)
             content = f.read().decode("utf-8", errors="ignore")
             log_contents.append(content)
@@ -50,59 +46,73 @@ def download_latest_log_files():
     ftp.quit()
     return "\n".join(log_contents)
 
-# --- PRZETWARZANIE LOGÓW ---
-def parse_gameplay_logs(log_text):
-    pattern = re.compile(
-        r"(?P<timestamp>\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}): "
-        r"(?P<killer>.*?)\[(?P<weapon>[^\]]*)\] killed (?P<victim>.*?) at distance (?P<distance>[\d\.]+)m"
-    )
+def parse_lockpick_attempts(log_data):
+    pattern = r'(?P<time>\d+\.\d+).*?(?P<nickname>.+?) started lockpicking a lock \(Basic\)'
+    matches = re.finditer(pattern, log_data)
+    attempts = defaultdict(int)
 
-    data = []
-    for match in pattern.finditer(log_text):
-        data.append({
-            "Czas": match.group("timestamp").replace("-", " "),
-            "Zabójca": match.group("killer").strip(),
-            "Broń": match.group("weapon").strip(),
-            "Ofiara": match.group("victim").strip(),
-            "Dystans": float(match.group("distance"))
-        })
+    for match in matches:
+        nickname = match.group("nickname").strip()
+        attempts[nickname] += 1
 
-    return pd.DataFrame(data)
+    return attempts
 
-# --- GENEROWANIE TABELI HTML ---
-def dataframe_to_html_table(df):
-    df_str = df.astype(str)
-    col_widths = df_str.applymap(len)
-    col_name_widths = pd.DataFrame([df_str.columns.str.len().tolist()], columns=df_str.columns)
-    max_lengths = pd.concat([col_widths, col_name_widths], axis=0).max()
-
-    html = "<table border='1' style='border-collapse: collapse; font-family: monospace; text-align: center;'>\n"
-    html += "  <tr>" + "".join(
-        f"<th style='padding:4px'>{col}</th>" for col in df.columns
-    ) + "</tr>\n"
-
-    for _, row in df.iterrows():
-        html += "  <tr>" + "".join(
-            f"<td style='padding:4px'>{str(val).ljust(max_lengths[col])}</td>" for col, val in row.items()
-        ) + "</tr>\n"
-    html += "</table>"
-    return html
-
-# --- WYSYŁANIE NA WEBHOOK DISCORDA ---
-def send_to_discord(webhook_url, html_table):
-    response = requests.post(webhook_url, json={"content": html_table})
-    if response.status_code == 204:
-        print("[OK] Tabela wysłana na Discord.")
-    else:
-        print(f"[BŁĄD] Nie udało się wysłać na Discord: {response.status_code}, {response.text}")
-
-# --- GŁÓWNA FUNKCJA ---
-if __name__ == "__main__":
-    logs = download_latest_log_files()
-    df = parse_gameplay_logs(logs)
-
-    if df.empty:
+def send_lockpick_table_to_discord(lockpick_data):
+    if not lockpick_data:
         print("[INFO] Brak danych do wysłania.")
+        return
+
+    df = pd.DataFrame(lockpick_data.items(), columns=["Nickname", "Attempts"])
+    df = df.sort_values(by="Attempts", ascending=False).reset_index(drop=True)
+
+    # Wyśrodkowanie zawartości i nagłówków w HTML
+    df_html = df.to_html(index=False, escape=False, border=0, classes="centered", justify="center")
+
+    html_message = f"""
+    <html>
+    <head>
+        <style>
+            table.centered {{
+                border-collapse: collapse;
+                margin-left: auto;
+                margin-right: auto;
+            }}
+            table.centered th, table.centered td {{
+                border: 1px solid #ccc;
+                padding: 8px;
+                text-align: center;
+            }}
+            table.centered th {{
+                background-color: #f2f2f2;
+                font-weight: bold;
+            }}
+        </style>
+    </head>
+    <body>
+        <h3 style="text-align:center;">🔐 Lockpick Attempts (Basic)</h3>
+        {df_html}
+    </body>
+    </html>
+    """
+
+    payload = {
+        "content": None,
+        "embeds": [{
+            "title": "Lockpick Stats",
+            "description": "Tabela prób podważania zamków typu **Basic**",
+            "type": "rich"
+        }],
+        "attachments": []
+    }
+
+    response = requests.post(WEBHOOK_URL, json={"content": html_message})
+    if response.status_code == 204:
+        print("[INFO] Tabela wysłana do Discord Webhook.")
     else:
-        tabela_html = dataframe_to_html_table(df)
-        send_to_discord(WEBHOOK_URL, tabela_html)
+        print(f"[ERROR] Błąd wysyłania do Discord: {response.status_code} - {response.text}")
+
+if __name__ == "__main__":
+    log_data = download_latest_log_files()
+    lockpick_data = parse_lockpick_attempts(log_data)
+    send_lockpick_table_to_discord(lockpick_data)
+    app.run(host='0.0.0.0', port=3000)
