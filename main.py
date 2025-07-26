@@ -25,7 +25,7 @@ DB_CONFIG = {
 }
 
 LOG_PATTERN = re.compile(
-    r"\[\w+Minigame\].*?User: (?P<nick>.*?) \(\d+, \d+\)\. Success: (?P<result>\w+).*?Elapsed time: (?P<time>[\d.]+)\.*.*?Target object: .*?_(?P<castle>\w+)_.*?"
+    r"\[\w+Minigame\].*?User: (?P<nick>.*?) \(\d+, \d+\)\. Success: (?P<result>\w+).*?Elapsed time: (?P<time>[\d.]+)\.*.*?Lock Type: (?P<locktype>\w+)"
 )
 
 # --- FLASK KEEPALIVE ---
@@ -66,7 +66,7 @@ def parse_logs_from_ftp():
                 match = LOG_PATTERN.search(line)
                 if match:
                     nick = match.group("nick").strip()
-                    castle = match.group("castle").strip()
+                    castle = match.group("locktype").strip()
                     result = match.group("result").strip()
                     time_str = match.group("time").strip().rstrip(".")
                     try:
@@ -142,7 +142,7 @@ def calculate_stats(cur):
     return results
 
 def format_table(rows):
-    headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
+    headers = ["Nick", "Zamek", "Wszystkie", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
     col_widths = [max(len(str(cell)) for cell in col) for col in zip(*([headers] + rows))]
     table = "```"
     table += "\n" + " | ".join(str(h).center(w) for h, w in zip(headers, col_widths))
