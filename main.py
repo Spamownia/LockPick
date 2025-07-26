@@ -1,143 +1,108 @@
 # --- AUTOMATYCZNA INSTALACJA WYMAGANYCH BIBLIOTEK ---
-import subprocess, sys
-
-for pkg in ["requests", "pandas"]:
-    try:
-        __import__(pkg)
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", pkg])
-
-# --- IMPORTY ---
+import subprocess
+import sys
 import os
-from ftplib import FTP
-import pandas as pd
-import requests
 import re
-from collections import defaultdict
+import pandas as pd
+from ftplib import FTP
+from io import BytesIO
+import requests
 
-# --- DANE FTP I WEBHOOK ---
+# --- INSTALACJA ---
+try:
+    import pandas as pd
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "pandas"])
+    import pandas as pd
+
+# --- KONFIGURACJA FTP ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+FTP_DIR = "/Scum/Saved/Logs/"
+
+# --- KONFIGURACJA WEBHOOKA ---
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# --- POŁĄCZENIE Z FTP I POBRANIE gameplay_*.log ---
-ftp = FTP()
-ftp.connect(FTP_HOST, FTP_PORT)
-ftp.login(FTP_USER, FTP_PASS)
-ftp.cwd(LOG_DIR)
+# --- POBIERZ NAJNOWSZE PLIKI LOGÓW Z FTP ---
+def download_latest_log_files():
+    ftp = FTP()
+    ftp.connect(FTP_HOST, FTP_PORT)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.cwd(FTP_DIR)
 
-files = []
-ftp.retrlines('LIST', files.append)
+    files = []
+    ftp.retrlines("NLST", files.append)
 
-gameplay_logs = [
-    line.split()[-1] for line in files
-    if line.split()[-1].startswith("gameplay_") and line.split()[-1].endswith(".log")
-]
+    gameplay_logs = sorted([f for f in files if f.startswith("gameplay_") and f.endswith(".log")])
+    print(f"[INFO] Znaleziono {len(gameplay_logs)} plików gameplay_*.log")
 
-print(f"[INFO] Znaleziono {len(gameplay_logs)} plików gameplay_*.log")
+    log_contents = []
+    for filename in gameplay_logs[-30:]:  # ostatnie 30
+        print(f"[INFO] Pobieranie pliku: {filename}")
+        with BytesIO() as f:
+            ftp.retrbinary(f"RETR {filename}", f.write)
+            f.seek(0)
+            content = f.read().decode("utf-8", errors="ignore")
+            log_contents.append(content)
 
-# --- POBRANIE I ODCZYT LOGÓW ---
-all_lines = []
+    ftp.quit()
+    return "\n".join(log_contents)
 
-for log_file in gameplay_logs:
-    print(f"[INFO] Pobieranie pliku: {log_file}")
-    local_filename = f"tmp_{log_file}"
+# --- PRZETWARZANIE LOGÓW ---
+def parse_gameplay_logs(log_text):
+    pattern = re.compile(
+        r"(?P<timestamp>\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}): "
+        r"(?P<killer>.*?)\[(?P<weapon>[^\]]*)\] killed (?P<victim>.*?) at distance (?P<distance>[\d\.]+)m"
+    )
 
-    with open(local_filename, "wb") as f:
-        ftp.retrbinary(f"RETR {log_file}", f.write)
+    data = []
+    for match in pattern.finditer(log_text):
+        data.append({
+            "Czas": match.group("timestamp").replace("-", " "),
+            "Zabójca": match.group("killer").strip(),
+            "Broń": match.group("weapon").strip(),
+            "Ofiara": match.group("victim").strip(),
+            "Dystans": float(match.group("distance"))
+        })
 
-    with open(local_filename, "r", encoding="utf-16le") as f:
-        all_lines.extend(f.readlines())
+    return pd.DataFrame(data)
 
-    os.remove(local_filename)
-
-ftp.quit()
-
-# --- PARSOWANIE DANYCH ---
-pattern = re.compile(
-    r"User:\s+(?P<nick>\w+).*?"
-    r"Success:\s+(?P<success>\w+).*?"
-    r"Elapsed time:\s+(?P<time>[\d.]+).*?"
-    r"Lock type:\s+(?P<lock>\w+)",
-    re.DOTALL
-)
-
-data = defaultdict(lambda: defaultdict(list))
-
-for line in all_lines:
-    match = pattern.search(line)
-    if match:
-        nick = match.group("nick")
-        lock = match.group("lock")
-        if lock == "Easy":
-            lock = "Basic"
-        success = match.group("success")
-        time_str = match.group("time").rstrip(".")
-        try:
-            time = float(time_str)
-        except ValueError:
-            print(f"[WARNING] Niepoprawna wartość czasu: '{time_str}'. Pomijam wpis.")
-            continue
-
-        data[(nick, lock)]['times'].append(time)
-        data[(nick, lock)]['success'].append(success == "Yes")
-
-# --- TWORZENIE TABELI ---
-rows = []
-
-for (nick, lock), values in data.items():
-    total = len(values['success'])
-    successes = sum(values['success'])
-    fails = total - successes
-    avg_time = sum(values['times']) / total if total else 0
-    effectiveness = (successes / total * 100) if total else 0
-
-    rows.append([
-        nick,
-        lock,
-        total,
-        successes,
-        fails,
-        f"{effectiveness:.2f}%",
-        f"{avg_time:.2f}s"
-    ])
-
-if not rows:
-    print("[INFO] Brak danych do wysłania.")
-else:
-    df = pd.DataFrame(rows, columns=[
-        "Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"
-    ])
-
-    # Kolejność zamków
-    lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
-    df["Zamek_kolejnosc"] = df["Zamek"].map(lock_order)
-    df = df.sort_values(by=["Nick", "Zamek_kolejnosc"]).drop(columns=["Zamek_kolejnosc"])
-
-    # --- WYŚRODKOWANIE KOMÓREK I NAGŁÓWKÓW ---
+# --- GENEROWANIE TABELI HTML ---
+def dataframe_to_html_table(df):
     df_str = df.astype(str)
-    max_lengths = df_str.applymap(len).combine(df_str.columns.to_series().apply(len), max)
+    col_widths = df_str.applymap(len)
+    col_name_widths = pd.DataFrame([df_str.columns.str.len().tolist()], columns=df_str.columns)
+    max_lengths = pd.concat([col_widths, col_name_widths], axis=0).max()
 
-    for col in df_str.columns:
-        df_str[col] = df_str[col].apply(lambda val: val.center(max_lengths[col]))
+    html = "<table border='1' style='border-collapse: collapse; font-family: monospace; text-align: center;'>\n"
+    html += "  <tr>" + "".join(
+        f"<th style='padding:4px'>{col}</th>" for col in df.columns
+    ) + "</tr>\n"
 
-    headers = [col.center(max_lengths[col]) for col in df_str.columns]
-    table = pd.DataFrame([headers] + df_str.values.tolist())
-    table_text = table.to_string(index=False, header=False)
+    for _, row in df.iterrows():
+        html += "  <tr>" + "".join(
+            f"<td style='padding:4px'>{str(val).ljust(max_lengths[col])}</td>" for col, val in row.items()
+        ) + "</tr>\n"
+    html += "</table>"
+    return html
 
-    print("[INFO] Tabela gotowa:\n", table_text)
-
-    # --- WYSYŁKA NA DISCORD ---
-    payload = {
-        "content": f"```\n{table_text}\n```"
-    }
-
-    response = requests.post(WEBHOOK_URL, json=payload)
-
+# --- WYSYŁANIE NA WEBHOOK DISCORDA ---
+def send_to_discord(webhook_url, html_table):
+    response = requests.post(webhook_url, json={"content": html_table})
     if response.status_code == 204:
-        print("[OK] Wysłano tabelę na Discord.")
+        print("[OK] Tabela wysłana na Discord.")
     else:
-        print(f"[ERROR] Nie udało się wysłać na Discord. Status: {response.status_code}")
+        print(f"[BŁĄD] Nie udało się wysłać na Discord: {response.status_code}, {response.text}")
+
+# --- GŁÓWNA FUNKCJA ---
+if __name__ == "__main__":
+    logs = download_latest_log_files()
+    df = parse_gameplay_logs(logs)
+
+    if df.empty:
+        print("[INFO] Brak danych do wysłania.")
+    else:
+        tabela_html = dataframe_to_html_table(df)
+        send_to_discord(WEBHOOK_URL, tabela_html)
