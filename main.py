@@ -1,23 +1,21 @@
-import os
-import re
-import psycopg2
 import ftplib
+import psycopg2
+import re
 import io
 import requests
 from collections import defaultdict
-from flask import Flask
+from datetime import datetime
 
-# ---------------------------------------
-# KONFIGURACJA
-# ---------------------------------------
-
+# --- Konfiguracja FTP i Webhook ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
+# --- Konfiguracja bazy danych PostgreSQL (Neon) ---
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -26,158 +24,139 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-# ---------------------------------------
-# INICJALIZACJA BAZY
-# ---------------------------------------
-
+# --- Połączenie z bazą danych ---
 def init_db():
     conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS lockpick_stats (
+        CREATE TABLE IF NOT EXISTS lockpicking (
             nick TEXT,
             castle TEXT,
-            success BOOLEAN,
-            duration FLOAT
+            result TEXT,
+            time FLOAT,
+            UNIQUE(nick, castle, result, time)
         );
     """)
     conn.commit()
-    cur.close()
-    conn.close()
+    return conn, cur
 
-# ---------------------------------------
-# POBIERANIE LOGÓW Z FTP
-# ---------------------------------------
-
+# --- Pobranie plików z FTP ---
 def download_logs():
+    print("[INFO] Pobieranie logów...")
+    ftp = ftplib.FTP()
+    ftp.connect(FTP_HOST, FTP_PORT)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.cwd(FTP_LOG_DIR)
+    all_files = ftp.nlst()
+    filenames = [f for f in all_files if f.startswith("gameplay_") and f.endswith(".log")]
+
     logs = []
-    with ftplib.FTP() as ftp:
-        ftp.connect(FTP_HOST, FTP_PORT)
-        ftp.login(FTP_USER, FTP_PASS)
-        ftp.cwd(LOG_DIR)
-        filenames = ftp.nlst("gameplay_*.log")
-        for filename in filenames:
-            with io.BytesIO() as f:
-                ftp.retrbinary(f"RETR {filename}", f.write)
-                content = f.getvalue().decode("utf-16-le", errors="ignore")
-                logs.append(content)
+    for filename in filenames:
+        with io.BytesIO() as f:
+            ftp.retrbinary(f"RETR {filename}", f.write)
+            content = f.getvalue().decode("utf-16-le", errors="ignore")
+            logs.append(content)
+    ftp.quit()
     return logs
 
-# ---------------------------------------
-# PARSOWANIE LOGÓW
-# ---------------------------------------
-
-LOG_PATTERN = re.compile(
-    r'(?P<time>\d+\.\d+).*?LockpickingComponent.*?CharacterName: (?P<nick>.*?) .*?on castle (?P<castle>.*?)\. Result: (?P<result>SUCCESS|FAILED).*?in (?P<duration>\d+\.\d+)s',
-    re.DOTALL
-)
-
+# --- Parsowanie danych z logów ---
 def parse_logs(logs):
-    parsed = []
-    for log in logs:
-        for match in LOG_PATTERN.finditer(log):
-            parsed.append({
-                "nick": match.group("nick"),
-                "castle": match.group("castle"),
-                "success": match.group("result") == "SUCCESS",
-                "duration": float(match.group("duration"))
-            })
-    return parsed
+    print("[INFO] Parsowanie danych...")
+    data = []
+    pattern = re.compile(
+        r"(?P<nick>\w+)\s+tried to pick the (?P<castle>\w+) lock and (?P<result>succeeded|failed)(?: in (?P<time>\d+(?:[.,]\d+)?)s)?"
+    )
+    for content in logs:
+        for match in pattern.finditer(content):
+            nick = match.group("nick")
+            castle = match.group("castle")
+            result = match.group("result")
+            time = match.group("time")
+            time_val = float(time.replace(",", ".")) if time else None
+            data.append((nick, castle, result, time_val))
+    return data
 
-# ---------------------------------------
-# ZAPIS DO BAZY
-# ---------------------------------------
-
-def insert_to_db(entries):
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
-    for e in entries:
-        cur.execute("""
-            INSERT INTO lockpick_stats (nick, castle, success, duration)
-            VALUES (%s, %s, %s, %s);
-        """, (e["nick"], e["castle"], e["success"], e["duration"]))
+# --- Zapis do bazy danych ---
+def store_data(cur, conn, data):
+    print(f"[INFO] Zapis do bazy: {len(data)} rekordów")
+    for nick, castle, result, time_val in data:
+        try:
+            cur.execute("""
+                INSERT INTO lockpicking (nick, castle, result, time)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT DO NOTHING;
+            """, (nick, castle, result, time_val))
+        except Exception as e:
+            print(f"[BŁĄD] {e}")
     conn.commit()
-    cur.close()
-    conn.close()
 
-# ---------------------------------------
-# GENEROWANIE TABELI
-# ---------------------------------------
-
-def build_stats_table():
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT nick, castle,
-            COUNT(*) as total,
-            COUNT(*) FILTER (WHERE success) as success_count,
-            COUNT(*) FILTER (WHERE NOT success) as fail_count,
-            ROUND(100.0 * COUNT(*) FILTER (WHERE success)::NUMERIC / COUNT(*), 1) as effectiveness,
-            ROUND(AVG(duration), 2) as avg_time
-        FROM lockpick_stats
-        GROUP BY nick, castle
-        ORDER BY effectiveness DESC, total DESC;
-    """)
+# --- Agregacja danych i przygotowanie tabeli ---
+def build_table(cur):
+    print("[INFO] Generowanie tabeli...")
+    cur.execute("SELECT nick, castle, result, time FROM lockpicking;")
     rows = cur.fetchall()
-    cur.close()
-    conn.close()
 
+    summary = defaultdict(lambda: {"total": 0, "success": 0, "fail": 0, "times": []})
+
+    for nick, castle, result, time in rows:
+        key = (nick, castle)
+        summary[key]["total"] += 1
+        if result == "succeeded":
+            summary[key]["success"] += 1
+            if time is not None:
+                summary[key]["times"].append(time)
+        else:
+            summary[key]["fail"] += 1
+
+    table = []
     headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
-    col_widths = [max(len(str(r[i])) for r in rows + [headers]) for i in range(len(headers))]
+    rows_text = []
 
-    def center(text, width):
-        return str(text).center(width)
+    for (nick, castle), stats in summary.items():
+        total = stats["total"]
+        success = stats["success"]
+        fail = stats["fail"]
+        effectiveness = f"{(success / total * 100):.1f}%" if total else "0%"
+        avg_time = f"{(sum(stats['times']) / len(stats['times'])):.2f}s" if stats["times"] else "-"
+        row = [nick, castle, str(total), str(success), str(fail), effectiveness, avg_time]
+        rows_text.append(row)
 
-    lines = [" | ".join([center(h, col_widths[i]) for i, h in enumerate(headers)])]
-    lines.append("-+-".join(["-" * w for w in col_widths]))
-    for row in rows:
-        lines.append(" | ".join([center(str(cell), col_widths[i]) for i, cell in enumerate(row)]))
+    # Wyznacz szerokości kolumn
+    col_widths = [max(len(str(cell)) for cell in col) for col in zip(*([headers] + rows_text))]
 
-    return "```\n" + "\n".join(lines) + "\n```"
+    def format_row(row):
+        return "| " + " | ".join(f"{cell:^{col_widths[i]}}" for i, cell in enumerate(row)) + " |"
 
-# ---------------------------------------
-# WYSYŁKA NA WEBHOOK
-# ---------------------------------------
+    separator = "|-" + "-|-".join("-" * w for w in col_widths) + "-|"
+    formatted_table = [format_row(headers), separator] + [format_row(row) for row in rows_text]
 
-def send_to_webhook(message):
-    requests.post(WEBHOOK_URL, json={"content": message})
+    return "```\n" + "\n".join(formatted_table) + "\n```"
 
-# ---------------------------------------
-# MAIN
-# ---------------------------------------
+# --- Wysyłanie tabeli na webhook Discord ---
+def send_to_webhook(table):
+    print("[INFO] Wysyłanie na webhook...")
+    response = requests.post(WEBHOOK_URL, json={"content": table})
+    if response.status_code != 204:
+        print(f"[BŁĄD] Webhook zwrócił {response.status_code}: {response.text}")
 
+# --- Główna funkcja ---
 def main():
     print("[INFO] Inicjalizacja bazy...")
-    init_db()
+    conn, cur = init_db()
 
-    print("[INFO] Pobieranie logów...")
     logs = download_logs()
-    print(f"[INFO] Liczba logów: {len(logs)}")
+    if not logs:
+        print("[INFO] Brak logów do przetworzenia.")
+        return
 
-    print("[INFO] Parsowanie danych...")
     parsed = parse_logs(logs)
-    print(f"[INFO] Wpisów do bazy: {len(parsed)}")
+    store_data(cur, conn, parsed)
 
-    print("[INFO] Wstawianie do bazy...")
-    insert_to_db(parsed)
+    table = build_table(cur)
+    send_to_webhook(table)
 
-    print("[INFO] Generowanie tabeli...")
-    tabela = build_stats_table()
-
-    print("[INFO] Wysyłanie na webhook...")
-    send_to_webhook(tabela)
-    print("[OK] Gotowe")
-
-# ---------------------------------------
-# Flask (ping render)
-# ---------------------------------------
-
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Alive"
+    cur.close()
+    conn.close()
 
 if __name__ == "__main__":
     main()
-    app.run(host="0.0.0.0", port=3000)
