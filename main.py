@@ -23,17 +23,15 @@ FTP_PASS = "LXNdGShY"
 LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# --- POŁĄCZENIE Z FTP I POBRANIE WSZYSTKICH gameplay_*.log ---
+# --- POŁĄCZENIE Z FTP I POBRANIE gameplay_*.log ---
 ftp = FTP()
 ftp.connect(FTP_HOST, FTP_PORT)
 ftp.login(FTP_USER, FTP_PASS)
 ftp.cwd(LOG_DIR)
 
-# Pobranie listy plików przez LIST (ponieważ NLST nie działa)
 files = []
 ftp.retrlines('LIST', files.append)
 
-# Filtrowanie nazw plików zawierających "gameplay_"
 gameplay_logs = []
 for line in files:
     parts = line.split()
@@ -43,7 +41,7 @@ for line in files:
 
 print(f"[INFO] Znaleziono {len(gameplay_logs)} plików gameplay_*.log")
 
-# Pobranie i odczytanie wszystkich logów
+# --- POBRANIE I ODCZYT LOGÓW ---
 all_lines = []
 
 for log_file in gameplay_logs:
@@ -78,7 +76,7 @@ for line in all_lines:
         nick = match.group("nick")
         lock = match.group("lock")
         if lock == "Easy":
-            lock = "Basic"  # ZAMIANA
+            lock = "Basic"
         success = match.group("success")
         time_str = match.group("time").rstrip(".")
         try:
@@ -117,24 +115,27 @@ else:
         "Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"
     ])
 
-    # Ustalona kolejność zamków
+    # Kolejność zamków
     lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
     df["Zamek_kolejnosc"] = df["Zamek"].map(lock_order)
     df = df.sort_values(by=["Nick", "Zamek_kolejnosc"]).drop(columns=["Zamek_kolejnosc"])
 
-    # Wyśrodkowanie każdej komórki jako tekst
+    # --- WYŚRODKOWANIE KOMÓREK + NAGŁÓWKI ---
     df_str = df.astype(str)
-    max_lengths = df_str.applymap(len).max()
+    max_lengths = df_str.applymap(len).combine(df_str.columns.to_series().apply(len), max)
+
     for col in df_str.columns:
-        df_str[col] = df_str[col].apply(lambda x: x.center(max_lengths[col]))
+        df_str[col] = df_str[col].apply(lambda val: val.center(max_lengths[col]))
 
-    table = df_str.to_string(index=False)
+    headers = [col.center(max_lengths[col]) for col in df_str.columns]
+    table = pd.DataFrame([headers] + df_str.values.tolist())
+    table_text = table.to_string(index=False, header=False)
 
-    print("[INFO] Tabela gotowa:\n", table)
+    print("[INFO] Tabela gotowa:\n", table_text)
 
-    # --- WYSYŁKA NA DISCORD (WEBHOOK) ---
+    # --- WYSYŁKA NA DISCORD ---
     payload = {
-        "content": f"```\n{table}\n```"
+        "content": f"```\n{table_text}\n```"
     }
 
     response = requests.post(WEBHOOK_URL, json=payload)
