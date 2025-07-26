@@ -1,26 +1,22 @@
-# main.py
-
+import ftplib
+import io
 import os
 import re
-import ftplib
 import psycopg2
+import time
 import requests
-from io import BytesIO
-from datetime import datetime
 from tabulate import tabulate
-from flask import Flask
+from datetime import datetime
 
-# FTP dane
+# --- KONFIGURACJA ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 FTP_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 
-# Webhook
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# DB config
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -29,80 +25,88 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
+LOG_FILENAME_PATTERN = re.compile(r"gameplay_.*\.log$", re.IGNORECASE)
+
+LOCKPICK_PATTERN = re.compile(
+    r"User: (?P<nick>.*?) \(\d+, \d+\).*?Success: (?P<result>Yes|No).*?Elapsed time: (?P<time>[\d.]+).*?Target object: (?P<castle>.*?)\(",
+    re.DOTALL
+)
+
+# --- FUNKCJE ---
+
+def connect_ftp():
+    ftp = ftplib.FTP()
+    ftp.connect(FTP_HOST, FTP_PORT)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.cwd(FTP_DIR)
+    return ftp
+
 def get_ftp_log_files():
-    with ftplib.FTP() as ftp:
-        ftp.connect(FTP_HOST, FTP_PORT)
-        ftp.login(FTP_USER, FTP_PASS)
-        ftp.cwd(FTP_DIR)
-        files = ftp.nlst()
-        return [f for f in files if f.startswith("gameplay_") and f.endswith(".log")]
+    ftp = connect_ftp()
+    files = []
+
+    def parse_line(line):
+        parts = line.split()
+        filename = parts[-1]
+        if LOG_FILENAME_PATTERN.match(filename):
+            files.append(filename)
+
+    ftp.retrlines("LIST", parse_line)
+    ftp.quit()
+    return files
 
 def download_log_file(filename):
-    with ftplib.FTP() as ftp:
-        ftp.connect(FTP_HOST, FTP_PORT)
-        ftp.login(FTP_USER, FTP_PASS)
-        ftp.cwd(FTP_DIR)
-        buffer = BytesIO()
-        ftp.retrbinary(f"RETR {filename}", buffer.write)
-        buffer.seek(0)
-        return buffer.read().decode("utf-16-le", errors="ignore")
+    ftp = connect_ftp()
+    bio = io.BytesIO()
+    ftp.retrbinary(f"RETR {filename}", bio.write)
+    ftp.quit()
+    bio.seek(0)
+    return bio.read().decode("utf-16-le", errors="ignore")
 
-def parse_log_line(line):
-    pattern = re.compile(
-        r"User: (?P<nick>\w+) \(\d+, (?P<steam_id>\d+)\)\. "
-        r"Success: (?P<result>Yes|No)\. "
-        r"Elapsed time: (?P<time>[\d.]+)\. "
-        r"Failed attempts: (?P<fail>\d+)\. "
-        r"Target object: (?P<castle>[^\(]+)\(ID: [^)]+\)\. "
-        r"Lock type: (?P<lock_type>\w+)\. "
-    )
-    match = pattern.search(line)
-    if match:
-        d = match.groupdict()
-        return {
-            "nick": d["nick"],
-            "castle": d["castle"].strip(),
-            "result": d["result"],
-            "time": float(d["time"])
-        }
-    return None
+def parse_lockpick_entries(log_data):
+    return [
+        match.groupdict()
+        for match in LOCKPICK_PATTERN.finditer(log_data)
+    ]
 
-def init_db(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS lockpick_stats (
-                id SERIAL PRIMARY KEY,
-                nick TEXT,
-                castle TEXT,
-                result TEXT,
-                time FLOAT
-            )
-        """)
-        conn.commit()
+def init_db():
+    conn = psycopg2.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS lockpick_stats (
+            id SERIAL PRIMARY KEY,
+            nick TEXT,
+            castle TEXT,
+            result TEXT,
+            time FLOAT
+        );
+    """)
+    try:
+        cur.execute("ALTER TABLE lockpick_stats ADD COLUMN result TEXT;")
+        print("[INFO] Dodano brakującą kolumnę 'result'...")
+    except psycopg2.errors.DuplicateColumn:
+        pass
+    conn.commit()
+    return conn, cur
 
-        # Upewnij się, że kolumna result istnieje
-        cur.execute("SELECT column_name FROM information_schema.columns WHERE table_name='lockpick_stats'")
-        columns = [row[0] for row in cur.fetchall()]
-        if "result" not in columns:
-            print("[INFO] Dodawanie brakującej kolumny 'result'...")
-            cur.execute("ALTER TABLE lockpick_stats ADD COLUMN result TEXT")
-            conn.commit()
+def entry_exists(cur, entry):
+    cur.execute("""
+        SELECT 1 FROM lockpick_stats
+        WHERE nick = %s AND castle = %s AND result = %s AND time = %s
+        LIMIT 1
+    """, (entry["nick"], entry["castle"], entry["result"], float(entry["time"])))
+    return cur.fetchone() is not None
 
-def insert_new_entries(conn, entries):
+def save_entries(cur, conn, entries):
     new_count = 0
-    with conn.cursor() as cur:
-        for entry in entries:
+    for entry in entries:
+        if not entry_exists(cur, entry):
             cur.execute("""
-                SELECT 1 FROM lockpick_stats
-                WHERE nick = %s AND castle = %s AND result = %s AND time = %s
-            """, (entry["nick"], entry["castle"], entry["result"], entry["time"]))
-            if cur.fetchone() is None:
-                cur.execute("""
-                    INSERT INTO lockpick_stats (nick, castle, result, time)
-                    VALUES (%s, %s, %s, %s)
-                """, (entry["nick"], entry["castle"], entry["result"], entry["time"]))
-                new_count += 1
-        conn.commit()
+                INSERT INTO lockpick_stats (nick, castle, result, time)
+                VALUES (%s, %s, %s, %s)
+            """, (entry["nick"], entry["castle"], entry["result"], float(entry["time"])))
+            new_count += 1
+    conn.commit()
     return new_count
 
 def get_statistics(cur):
@@ -110,45 +114,48 @@ def get_statistics(cur):
     rows = cur.fetchall()
 
     stats = {}
-    for nick, castle, result, time in rows:
+    for nick, castle, result, time_val in rows:
         key = (nick, castle)
         if key not in stats:
             stats[key] = {"total": 0, "success": 0, "fail": 0, "times": []}
         stats[key]["total"] += 1
-        if result.lower() == "yes":
+        if result == "Yes":
             stats[key]["success"] += 1
-            stats[key]["times"].append(time)
         else:
             stats[key]["fail"] += 1
+        stats[key]["times"].append(time_val)
 
-    summary = []
+    result_rows = []
     for (nick, castle), data in stats.items():
-        success_rate = data["success"] / data["total"] * 100 if data["total"] > 0 else 0
-        avg_time = round(sum(data["times"]) / len(data["times"]), 2) if data["times"] else "-"
-        summary.append([
+        success_rate = data["success"] / data["total"] * 100
+        avg_time = sum(data["times"]) / len(data["times"])
+        result_rows.append([
             nick,
             castle,
             data["total"],
             data["success"],
             data["fail"],
-            f"{success_rate:.1f}%",
-            avg_time
+            f"{success_rate:.2f}%",
+            f"{avg_time:.2f}s"
         ])
 
-    return summary
+    result_rows.sort(key=lambda row: (-row[3], row[0]))
+    return result_rows
 
-def send_webhook(stats_table):
-    headers = {"Content-Type": "application/json"}
-    table = tabulate(stats_table, headers=["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"], tablefmt="github", stralign="center", numalign="center")
-    payload = {
-        "content": f"```\n{table}\n```"
-    }
-    requests.post(WEBHOOK_URL, json=payload, headers=headers)
+def send_to_webhook(stats):
+    if not stats:
+        return
+
+    headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
+    table = tabulate(stats, headers=headers, tablefmt="github", stralign="center", numalign="center")
+    data = {"content": f"```\n{table}\n```"}
+    requests.post(WEBHOOK_URL, json=data)
+
+# --- GŁÓWNA PĘTLA ---
 
 def main():
     print("[INFO] Inicjalizacja bazy...")
-    conn = psycopg2.connect(**DB_CONFIG)
-    init_db(conn)
+    conn, cur = init_db()
 
     print("[INFO] Pobieranie logów...")
     files = get_ftp_log_files()
@@ -156,40 +163,30 @@ def main():
 
     all_entries = []
     for file in files:
-        content = download_log_file(file)
-        for line in content.splitlines():
-            if "LockpickingMinigame_C" in line:
-                parsed = parse_log_line(line)
-                if parsed:
-                    all_entries.append(parsed)
+        log_data = download_log_file(file)
+        entries = parse_lockpick_entries(log_data)
+        all_entries.extend(entries)
 
+    print("[INFO] Parsowanie danych...")
     print(f"[DEBUG] Sparsowane wpisy lockpick: {len(all_entries)}")
+
     if not all_entries:
         print("[INFO] Brak danych lockpick.")
         return
 
     print("[INFO] Zapisywanie do bazy...")
-    new = insert_new_entries(conn, all_entries)
-    print(f"[INFO] Nowe wpisy zapisane: {new}")
+    new_count = save_entries(cur, conn, all_entries)
+    print(f"[INFO] Nowe wpisy zapisane: {new_count}")
 
-    if new > 0:
+    if new_count > 0:
         print("[INFO] Generowanie statystyk...")
-        with conn.cursor() as cur:
-            stats = get_statistics(cur)
-        print("[INFO] Wysyłanie webhooka...")
-        send_webhook(stats)
+        stats = get_statistics(cur)
+        print("[INFO] Wysyłanie danych na webhook...")
+        send_to_webhook(stats)
     else:
-        print("[INFO] Brak nowych danych do wysłania.")
+        print("[INFO] Brak nowych wpisów - webhook pominięty.")
 
     conn.close()
 
-# Serwer Flask do pingowania
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Alive"
-
 if __name__ == "__main__":
     main()
-    app.run(host="0.0.0.0", port=3000)
