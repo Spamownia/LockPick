@@ -109,6 +109,8 @@ def save_results(parsed):
                         ON CONFLICT (unikalny_id) DO NOTHING
                     """, (nick, zamek, result, czas, uid))
                     new_entries += cur.rowcount
+                except Exception as e:
+                    print(f"[Błąd zapisu] {e}")
             conn.commit()
     return new_entries
 
