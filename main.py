@@ -1,63 +1,161 @@
-import os import re import psycopg2 import requests import threading from flask import Flask from datetime import datetime from ftplib import FTP_TLS from io import BytesIO
+import os
+import re
+import psycopg2
+import requests
+import threading
+from flask import Flask
+from datetime import datetime
+from ftplib import FTP_TLS
+from io import BytesIO
 
-=== KONFIGURACJA ===
+DB_CONFIG = {
+    "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
+    "dbname": "neondb",
+    "user": "neondb_owner",
+    "password": "npg_dRU1YCtxbh6v",
+    "sslmode": "require",
+}
 
-FTP_HOST = "176.57.174.10" FTP_PORT = 50021 FTP_USER = "gpftp37275281717442833" FTP_PASS = "LXNdGShY" FTP_DIR = "/SCUM/Saved/SaveFiles/Logs/"
-
+FTP_HOST = "176.57.174.10"
+FTP_PORT = 50021
+FTP_USER = "gpftp37275281717442833"
+FTP_PASS = "LXNdGShY"
+LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-DB_CONFIG = { "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech", "dbname": "neondb", "user": "neondb_owner", "password": "npg_dRU1YCtxbh6v", "sslmode": "require" }
+app = Flask(__name__)
 
-=== INICJALIZACJA FLASKA ===
+def init_db():
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS lockpick_stats (
+                    id SERIAL PRIMARY KEY,
+                    nick TEXT,
+                    zamek TEXT,
+                    wynik TEXT,
+                    czas INTEGER,
+                    unikalny_id TEXT UNIQUE
+                );
+            """)
+        conn.commit()
+    print("[DEBUG] Baza danych zainicjalizowana")
 
-app = Flask(name)
+def extract_data_from_log(content):
+    entries = []
+    lines = content.splitlines()
+    for line in lines:
+        match = re.search(r'LockPickingComponent.*?nick: (\S+), zamek: (\S+), wynik: (\S+), czas: (\d+)', line)
+        if match:
+            nick, zamek, wynik, czas = match.groups()
+            unikalny_id = f"{nick}_{zamek}_{wynik}_{czas}"
+            entries.append((nick, zamek, wynik, int(czas), unikalny_id))
+    return entries
 
-@app.route('/') def index(): return "Alive"
+def fetch_all_log_files():
+    print("[DEBUG] Nawiązywanie połączenia FTP...")
+    ftps = FTP_TLS()
+    ftps.connect(FTP_HOST, FTP_PORT)
+    ftps.login(FTP_USER, FTP_PASS)
+    ftps.prot_p()
+    ftps.cwd(LOG_DIR)
 
-=== FUNKCJE POMOCNICZE ===
+    filenames = []
+    ftps.retrlines("LIST", lambda line: filenames.append(line.split()[-1]))
+    log_files = [name for name in filenames if name.startswith("gameplay_") and name.endswith(".log")]
+    print(f"[DEBUG] Znaleziono {len(log_files)} plików logów.")
+    logs_data = []
 
-def parse_log(content): entries = [] lines = content.splitlines() for line in lines: if "Lockpicking event" in line: match = re.search(r"(\d{4}.\d{2}.\d{2}-\d{2}.\d{2}.\d{2}).*?Player (.+?) tried to lockpick the doors of (.+?). Success: (True|False) in ([\d.]+)s", line) if match: timestamp, nick, zamek, success, time = match.groups() entries.append({ "timestamp": timestamp, "nick": nick, "zamek": zamek, "success": success == "True", "time": float(time) }) return entries
+    for log_file in log_files:
+        buffer = BytesIO()
+        ftps.retrbinary(f"RETR {log_file}", buffer.write)
+        buffer.seek(0)
+        content = buffer.read().decode("utf-16-le", errors="ignore")
+        logs_data.append(content)
+        print(f"[DEBUG] Pobrano {log_file}, {len(content.splitlines())} linii")
 
-def fetch_all_gameplay_logs(): print("[DEBUG] Connecting to FTP...") ftp = FTP_TLS() ftp.connect(FTP_HOST, FTP_PORT) ftp.login(FTP_USER, FTP_PASS) ftp.prot_p() ftp.cwd(FTP_DIR)
+    ftps.quit()
+    return logs_data
 
-filenames = []
-ftp.retrlines('LIST', lambda line: filenames.append(line.split()[-1]))
-log_files = [f for f in filenames if f.startswith("gameplay_") and f.endswith(".log")]
+def insert_new_entries(entries):
+    new_count = 0
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            for entry in entries:
+                try:
+                    cur.execute("""
+                        INSERT INTO lockpick_stats (nick, zamek, wynik, czas, unikalny_id)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (unikalny_id) DO NOTHING;
+                    """, entry)
+                    if cur.rowcount > 0:
+                        new_count += 1
+            conn.commit()
+    print(f"[DEBUG] Wstawiono {new_count} nowych wpisów do bazy")
+    return new_count
 
-all_entries = []
-for filename in log_files:
-    print(f"[DEBUG] Fetching: {filename}")
-    bio = BytesIO()
-    ftp.retrbinary(f"RETR {filename}", bio.write)
-    content = bio.getvalue().decode("utf-16-le", errors="ignore")
-    entries = parse_log(content)
-    all_entries.extend(entries)
-    print(f"[DEBUG] Parsed {len(entries)} entries from {filename}")
+def fetch_stats():
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT nick, zamek,
+                       COUNT(*) AS proby,
+                       COUNT(*) FILTER (WHERE wynik = 'sukces') AS udane,
+                       COUNT(*) FILTER (WHERE wynik = 'pudlo') AS nieudane,
+                       ROUND(
+                           100.0 * COUNT(*) FILTER (WHERE wynik = 'sukces') / NULLIF(COUNT(*), 0),
+                           2
+                       ) AS skutecznosc,
+                       ROUND(AVG(czas), 2) AS sredni_czas
+                FROM lockpick_stats
+                GROUP BY nick, zamek
+                ORDER BY skutecznosc DESC NULLS LAST, sredni_czas ASC;
+            """)
+            return cur.fetchall()
 
-ftp.quit()
-print(f"[DEBUG] Łącznie wpisów: {len(all_entries)}")
-return all_entries
+def format_table(data):
+    headers = ["Nick", "Zamek", "Ilość prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
+    table = [headers] + [[str(cell) for cell in row] for row in data]
+    col_widths = [max(len(str(cell)) for cell in col) for col in zip(*table)]
+    lines = []
+    for row in table:
+        line = " | ".join(cell.center(width) for cell, width in zip(row, col_widths))
+        lines.append(line)
+    return "```\n" + "\n".join(lines) + "\n```"
 
-def init_db(): print("[DEBUG] Inicjalizacja bazy danych...") conn = psycopg2.connect(**DB_CONFIG) cur = conn.cursor() cur.execute(""" CREATE TABLE IF NOT EXISTS gameplay_logs ( id SERIAL PRIMARY KEY, timestamp TEXT, nick TEXT, zamek TEXT, success BOOLEAN, time FLOAT ); """) conn.commit() cur.close() conn.close()
+def send_to_webhook(message):
+    response = requests.post(WEBHOOK_URL, json={"content": message})
+    if response.status_code == 204:
+        print("[DEBUG] Wysłano dane na webhook")
+    else:
+        print(f"[ERROR] Webhook zwrócił kod {response.status_code}: {response.text}")
 
-def save_entries(entries): conn = psycopg2.connect(**DB_CONFIG) cur = conn.cursor() new_count = 0 for entry in entries: cur.execute(""" SELECT 1 FROM gameplay_logs WHERE timestamp = %s AND nick = %s AND zamek = %s """, (entry['timestamp'], entry['nick'], entry['zamek'])) if not cur.fetchone(): cur.execute(""" INSERT INTO gameplay_logs (timestamp, nick, zamek, success, time) VALUES (%s, %s, %s, %s, %s) """, (entry['timestamp'], entry['nick'], entry['zamek'], entry['success'], entry['time'])) new_count += 1 conn.commit() cur.close() conn.close() print(f"[DEBUG] Zapisano {new_count} nowych wpisów do bazy.")
+def process_logs():
+    logs = fetch_all_log_files()
+    all_entries = []
+    for content in logs:
+        entries = extract_data_from_log(content)
+        all_entries.extend(entries)
+    new_count = insert_new_entries(all_entries)
+    return new_count
 
-def fetch_stats(): conn = psycopg2.connect(**DB_CONFIG) cur = conn.cursor() cur.execute(""" SELECT nick, zamek, COUNT() as total, SUM(CASE WHEN success THEN 1 ELSE 0 END) as success_count, SUM(CASE WHEN NOT success THEN 1 ELSE 0 END) as fail_count, ROUND(100.0 * SUM(CASE WHEN success THEN 1 ELSE 0 END)/COUNT(), 1) as skutecznosc, ROUND(AVG(time), 2) as sredni_czas FROM gameplay_logs GROUP BY nick, zamek ORDER BY skutecznosc DESC NULLS LAST, sredni_czas ASC; """) rows = cur.fetchall() cur.close() conn.close() return rows
+def main_loop():
+    print("[DEBUG] Start main_loop")
+    while True:
+        new_entries = process_logs()
+        if new_entries > 0:
+            stats = fetch_stats()
+            table = format_table(stats)
+            send_to_webhook(table)
+        else:
+            print("[DEBUG] Brak nowych danych w logach")
+        threading.Event().wait(60)
 
-def format_table(rows): headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"] col_widths = [len(h) for h in headers] for row in rows: for i, item in enumerate(row): col_widths[i] = max(col_widths[i], len(str(item)))
+@app.route('/')
+def index():
+    return "Alive"
 
-line = " | ".join(h.center(col_widths[i]) for i, h in enumerate(headers))
-separator = "-+-".join("-" * w for w in col_widths)
-lines = [line, separator]
-for row in rows:
-    lines.append(" | ".join(str(item).center(col_widths[i]) for i, item in enumerate(row)))
-return "\n".join(lines)
-
-def send_to_webhook(message): requests.post(WEBHOOK_URL, json={"content": f"\n{message}\n"})
-
-=== GŁÓWNA PĘTLA ===
-
-def main_loop(): print("[DEBUG] Start main_loop") init_db() entries = fetch_all_gameplay_logs() if entries: save_entries(entries) stats = fetch_stats() table = format_table(stats) send_to_webhook(table) else: print("[DEBUG] Brak nowych danych do przetworzenia.")
-
-if name == 'main': threading.Thread(target=main_loop).start() app.run(host=
-                                                                      '0.0.0.0', port=3000)
+if __name__ == "__main__":
+    init_db()
+    threading.Thread(target=main_loop, daemon=True).start()
+    app.run(host='0.0.0.0', port=3000)
