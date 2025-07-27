@@ -90,6 +90,8 @@ def insert_new_entries(entries):
                     """, entry)
                     if cur.rowcount > 0:
                         new_count += 1
+                except Exception as e:
+                    print(f"[ERROR] Błąd przy wstawianiu wpisu {entry}: {e}")
             conn.commit()
     print(f"[DEBUG] Wstawiono {new_count} nowych wpisów do bazy")
     return new_count
