@@ -3,6 +3,7 @@ import re
 import psycopg2
 import requests
 import threading
+import time
 from flask import Flask
 from datetime import datetime
 from ftplib import FTP
@@ -54,16 +55,19 @@ def fetch_all_log_files():
     ftp.login(FTP_USER, FTP_PASS)
     ftp.cwd(FTP_LOG_DIR)
 
-    filenames = []
-    ftp.retrlines('LIST', lambda line: filenames.append(line.split()[-1]))
+    lines = []
+    ftp.dir(lines.append)
 
+    filenames = [line.split()[-1] for line in lines if line.lower().endswith(".log") and line.startswith("gameplay_")]
     logs = []
     for filename in filenames:
-        if filename.startswith("gameplay_") and filename.endswith(".log"):
+        try:
             print(f"[DEBUG] Pobieranie pliku: {filename}")
             file_data = BytesIO()
             ftp.retrbinary(f"RETR {filename}", file_data.write)
             logs.append(file_data.getvalue().decode("utf-16-le"))
+        except Exception as e:
+            print(f"[ERROR] Nie udało się pobrać pliku {filename}: {e}")
     ftp.quit()
     print(f"[DEBUG] Pobieranie zakończone. Liczba logów: {len(logs)}")
     return logs
@@ -79,13 +83,13 @@ def save_to_db(entries):
     conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
     new_count = 0
-    for nick, castle, result, time in entries:
+    for nick, castle, result, time_ in entries:
         try:
             cur.execute("""
                 INSERT INTO lockpicking (nick, castle, result, time)
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT DO NOTHING;
-            """, (nick, castle, result, time))
+            """, (nick, castle, result, time_))
             if cur.rowcount:
                 new_count += 1
         except Exception as e:
@@ -94,6 +98,7 @@ def save_to_db(entries):
     cur.close()
     conn.close()
     print(f"[DEBUG] Zapisano {new_count} nowych wpisów do bazy.")
+    return new_count
 
 def generate_stats():
     conn = psycopg2.connect(**DB_CONFIG)
@@ -141,19 +146,22 @@ def process_logs():
         entries = parse_log_entries(log_text)
         all_entries.extend(entries)
     print(f"[DEBUG] Łącznie wpisów: {len(all_entries)}")
-    save_to_db(all_entries)
-    return all_entries
+    new_count = save_to_db(all_entries)
+    return new_count
 
 def main_loop():
     print("[DEBUG] Start main_loop")
     init_db()
-    new_entries = process_logs()
-    if new_entries:
-        print("[DEBUG] Nowe dane – generuję i wysyłam statystyki")
-        table = generate_stats()
-        send_webhook(table)
-    else:
-        print("[DEBUG] Brak nowych wpisów – nic nie wysyłam")
+    while True:
+        print("[DEBUG] Sprawdzanie nowych wpisów...")
+        new_entries = process_logs()
+        if new_entries > 0:
+            print("[DEBUG] Nowe dane – generuję i wysyłam statystyki")
+            table = generate_stats()
+            send_webhook(table)
+        else:
+            print("[DEBUG] Brak nowych wpisów – nic nie wysyłam")
+        time.sleep(60)
 
 if __name__ == "__main__":
     threading.Thread(target=main_loop).start()
