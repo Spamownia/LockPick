@@ -4,14 +4,14 @@ import psycopg2
 import re
 from datetime import datetime
 
-# FTP KONFIGURACJA
+# --- KONFIGURACJA FTP ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 FTP_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 
-# BAZA KONFIGURACJA (Neon)
+# --- KONFIGURACJA BAZY NEON POSTGRESQL ---
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -20,7 +20,7 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-# Katalog lokalny do zapisu logów
+# --- KATALOG DO LOKALNEGO ZAPISU PLIKÓW ---
 LOCAL_DIR = "downloaded_logs"
 
 def debug(msg):
@@ -35,19 +35,19 @@ def connect_ftp():
 
 def list_log_files(ftp):
     ftp.cwd(FTP_DIR)
-    debug(f"Zmieniono katalog: {FTP_DIR}")
-    files = []
-    ftp.retrlines('LIST', lambda line: files.append(line))
-    gameplay_files = [line.split()[-1] for line in files if line.split()[-1].startswith("gameplay") and line.endswith(".log")]
-    debug(f"Znaleziono {len(gameplay_files)} plików gameplay_*.log")
-    return gameplay_files
+    debug(f"Zmieniono katalog na: {FTP_DIR}")
+    lines = []
+    ftp.retrlines('LIST', lambda line: lines.append(line))
+    files = [line.split()[-1] for line in lines if line.split()[-1].startswith("gameplay") and line.endswith(".log")]
+    debug(f"Znaleziono {len(files)} plików gameplay_*.log")
+    return files
 
 def download_files(ftp, filenames):
     os.makedirs(LOCAL_DIR, exist_ok=True)
     for filename in filenames:
         local_path = os.path.join(LOCAL_DIR, filename)
         with open(local_path, "wb") as f:
-            ftp.retrbinary(f"RETR " + filename, f.write)
+            ftp.retrbinary("RETR " + filename, f.write)
         debug(f"Pobrano: {filename}")
 
 def connect_db():
@@ -68,11 +68,11 @@ def init_db(conn):
             );
         """)
         conn.commit()
-        debug("Tabela 'lockpicks' gotowa.")
+        debug("Tabela 'lockpicks' przygotowana.")
 
 def parse_log_content(content):
-    entries = []
     pattern = re.compile(r'\[(.*?)\] \[LockPicking\] Player (.+?) tried to pick (.+?): (SUCCESS|FAIL) in (\d+)ms')
+    entries = []
     for match in pattern.finditer(content):
         _, nick, zamek, wynik, czas_ms = match.groups()
         entries.append((nick.strip(), zamek.strip(), wynik, int(czas_ms)))
@@ -94,7 +94,7 @@ def process_logs_and_save_to_db(conn):
 
         entries = parse_log_content(content)
         if not entries:
-            debug(f"Brak wpisów w {filename}")
+            debug(f"Brak danych lockpicking w {filename}")
             continue
 
         with conn.cursor() as cur:
@@ -103,13 +103,14 @@ def process_logs_and_save_to_db(conn):
                 VALUES (%s, %s, %s, %s);
             """, entries)
             conn.commit()
-            debug(f"Zapisano {len(entries)} wpisów z {filename} do bazy danych")
+            debug(f"Zapisano {len(entries)} rekordów z {filename}")
             total += len(entries)
 
     debug(f"Zapisano łącznie {total} wpisów do bazy danych.")
 
 def main():
     debug("Start programu")
+
     try:
         ftp = connect_ftp()
         files = list_log_files(ftp)
