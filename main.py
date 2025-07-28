@@ -1,21 +1,30 @@
 import os
-import re
+import ssl
 import pandas as pd
 import psycopg2
-from tabulate import tabulate
+import re
 import requests
+from io import StringIO
+from datetime import datetime
+from tabulate import tabulate
 from flask import Flask
+from ftplib import FTP_TLS
 
-# --- Flask dla UptimeRobot ---
+# --- Flask keepalive ---
 app = Flask(__name__)
 @app.route('/')
 def index():
     return "Alive"
-# ----------------------------
+# -----------------------
 
 # --- Konfiguracja ---
+FTP_HOST = "176.57.174.10"
+FTP_PORT = 50021
+FTP_USER = "gpftp37275281717442833"
+FTP_PASS = "LXNdGShY"
 FTP_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -23,130 +32,114 @@ DB_CONFIG = {
     "password": "npg_dRU1YCtxbh6v",
     "sslmode": "require"
 }
-LOCK_ORDER = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
-# ---------------------
 
-def connect_db():
-    return psycopg2.connect(**DB_CONFIG)
+LOCK_ORDER = {'VeryEasy': 0, 'Basic': 1, 'Medium': 2, 'Advanced': 3, 'DialLock': 4}
 
-def create_table():
-    conn = connect_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lockpicking (
-            nick TEXT,
-            lock TEXT,
-            success BOOLEAN,
-            time FLOAT
-        )
-    """)
-    conn.commit()
-    conn.close()
-
+# --- Parsowanie wpisów z logu ---
 def parse_log_content(content):
-    """
-    Parsuje treść logu i wyciąga dane lockpickingu.
-    """
-    pattern = re.compile(
-        r"\[LogMinigame\]\s+\[LockpickingMinigame_C\]\s+User:\s+(?P<nick>.*?)\s+\((?P<lock>.*?)\)\s+Success:\s+(?P<success>Yes|No)\.\s+Elapsed time:\s+(?P<time>\d+(\.\d+)?)"
-    )
-    matches = list(pattern.finditer(content))
-    print(f"[DEBUG] Dopasowano {len(matches)} wpisów lockpickingu")
+    print("[DEBUG] Parsowanie zawartości logu...")
+    decoded = content.decode('utf-16-le')
+    pattern = r'\[LogMinigame\] \[LockpickingMinigame_C\] User: (.+?) \| Lock: (.+?) \| Success: (Yes|No)\. Elapsed time: ([\d.]+)'
+    matches = re.findall(pattern, decoded)
+    print(f"[DEBUG] Dopasowano wpisów: {len(matches)}")
+    return [
+        {
+            "user": match[0].strip(),
+            "lock": match[1].strip(),
+            "success": match[2] == "Yes",
+            "time": float(match[3])
+        } for match in matches
+    ]
 
-    data = []
-    for match in matches:
-        nick = match.group("nick")
-        lock = match.group("lock")
-        success = match.group("success") == "Yes"
-        time = float(match.group("time"))
-        data.append((nick, lock, success, time))
+# --- Pobranie listy plików z FTP ---
+def list_log_files():
+    print("[DEBUG] Nawiązywanie połączenia FTP...")
+    ftps = FTP_TLS()
+    ftps.ssl_version = ssl.PROTOCOL_TLSv1_2
+    ftps.connect(FTP_HOST, FTP_PORT)
+    ftps.auth()
+    ftps.login(FTP_USER, FTP_PASS)
+    ftps.prot_p()
+    ftps.cwd(FTP_DIR)
+    files = []
+    ftps.retrlines("LIST", lambda x: files.append(x.split()[-1]) if "gameplay_" in x else None)
+    ftps.quit()
+    print(f"[DEBUG] Znaleziono plików: {len(files)}")
+    return files
 
-    return data
+# --- Pobieranie i parsowanie plików ---
+def download_and_parse_logs():
+    files = list_log_files()
+    all_entries = []
 
-def insert_data(data):
-    conn = connect_db()
-    cur = conn.cursor()
-    cur.executemany(
-        "INSERT INTO lockpicking (nick, lock, success, time) VALUES (%s, %s, %s, %s)", data
-    )
-    conn.commit()
-    conn.close()
+    ftps = FTP_TLS()
+    ftps.ssl_version = ssl.PROTOCOL_TLSv1_2
+    ftps.connect(FTP_HOST, FTP_PORT)
+    ftps.auth()
+    ftps.login(FTP_USER, FTP_PASS)
+    ftps.prot_p()
+    ftps.cwd(FTP_DIR)
 
-def create_dataframe():
-    conn = connect_db()
-    df = pd.read_sql("SELECT * FROM lockpicking", conn)
-    conn.close()
+    for file in files:
+        print(f"[DEBUG] Przetwarzanie pliku: {file}")
+        buffer = []
+        ftps.retrlines(f"RETR {file}", buffer.append)
+        content = "\n".join(buffer).encode("utf-16-le")
+        entries = parse_log_content(content)
+        all_entries.extend(entries)
 
+    ftps.quit()
+    return all_entries
+
+# --- Tworzenie tabeli ---
+def create_dataframe(entries):
+    print("[DEBUG] Tworzenie tabeli...")
+    df = pd.DataFrame(entries)
     if df.empty:
-        return None
+        print("[DEBUG] Brak danych do przetworzenia.")
+        return pd.DataFrame()
 
-    df['total'] = 1
-    df['success_count'] = df['success'].astype(int)
-    df['fail_count'] = (~df['success']).astype(int)
+    grouped = df.groupby(['user', 'lock']).agg(
+        total=('success', 'count'),
+        success=('success', 'sum'),
+        fail=('success', lambda x: (~x).sum()),
+        effectiveness=('success', 'mean'),
+        avg_time=('time', 'mean')
+    ).reset_index()
 
-    summary = df.groupby(['nick', 'lock']).agg({
-        'total': 'sum',
-        'success_count': 'sum',
-        'fail_count': 'sum',
-        'time': 'mean'
-    }).reset_index()
+    grouped['effectiveness'] = (grouped['effectiveness'] * 100).round(1)
+    grouped['avg_time'] = grouped['avg_time'].round(2)
 
-    summary['success_rate'] = (summary['success_count'] / summary['total'] * 100).round(1)
-    summary['time'] = summary['time'].round(1)
+    grouped = grouped.sort_values(by=['user', 'lock'], key=lambda col: col.map(LOCK_ORDER) if col.name == 'lock' else col)
+    return grouped
 
-    summary = summary.rename(columns={
-        'nick': 'Nick',
-        'lock': 'Zamek',
-        'total': 'Ilość wszystkich prób',
-        'success_count': 'Udane',
-        'fail_count': 'Nieudane',
-        'success_rate': 'Skuteczność',
-        'time': 'Średni czas'
-    })
-
-    # ✅ Sortowanie: najpierw Nick, potem kolejność zamków
-    summary['Zamek_sort'] = summary['Zamek'].map(LOCK_ORDER)
-    summary = summary.sort_values(by=['Nick', 'Zamek_sort'])
-    summary = summary.drop(columns=['Zamek_sort'])
-
-    print("[DEBUG] Tabela lockpickingu przed wysyłką:")
-    print(tabulate(summary, headers='keys', tablefmt='grid', stralign='center', numalign='center'))
-
-    return summary
-
+# --- Wysyłka na Discord ---
 def send_to_discord(df):
-    if df is None or df.empty:
-        print("[INFO] Brak danych do wysłania.")
+    if df.empty:
+        print("[DEBUG] Brak danych do wysyłki.")
         return
+    table = tabulate(
+        df,
+        headers=["Nick", "Zamek", "Ilość prób", "Udane", "Nieudane", "Skuteczność (%)", "Średni czas"],
+        tablefmt="github",
+        showindex=False,
+        numalign="center",
+        stralign="center"
+    )
+    print("[DEBUG] Tabela do wysyłki:")
+    print(table)
 
-    table = tabulate(df, headers='keys', tablefmt='grid', stralign='center', numalign='center')
-    payload = {
-        "content": f"```\n{table}\n```"
-    }
-    response = requests.post(WEBHOOK_URL, json=payload)
-    print(f"[DEBUG] Wysłano dane na webhook: {response.status_code}")
+    response = requests.post(WEBHOOK_URL, json={"content": f"```\n{table}\n```"})
+    print(f"[DEBUG] Wysłano na webhook, status: {response.status_code}")
 
+# --- Główna pętla ---
 def main_loop():
-    print("[DEBUG] Start main_loop")
-    create_table()
-
-    logs_dir = "./downloaded_logs"
-    if not os.path.exists(logs_dir):
-        os.makedirs(logs_dir)
-
-    for filename in os.listdir(logs_dir):
-        if filename.startswith("gameplay_") and filename.endswith(".log"):
-            path = os.path.join(logs_dir, filename)
-            with open(path, "r", encoding="utf-16-le") as f:
-                content = f.read()
-                data = parse_log_content(content)
-                if data:
-                    insert_data(data)
-
-    df = create_dataframe()
+    print("[DEBUG] Start programu")
+    entries = download_and_parse_logs()
+    df = create_dataframe(entries)
     send_to_discord(df)
 
+# --- Start programu ---
 if __name__ == "__main__":
-    import threading
-    threading.Thread(target=app.run, kwargs={"host": "0.0.0.0", "port": 3000}).start()
     main_loop()
+    app.run(host='0.0.0.0', port=3000)
