@@ -1,20 +1,21 @@
 import os
-import ftplib
+import re
 import pandas as pd
 import psycopg2
-import requests
-from io import BytesIO
-from datetime import datetime
 from tabulate import tabulate
+import requests
 from flask import Flask
 
-# --- Konfiguracje ---
-FTP_HOST = "176.57.174.10"
-FTP_PORT = 50021
-FTP_USER = "gpftp37275281717442833"
-FTP_PASS = "LXNdGShY"
-FTP_LOGS_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+# --- Flask dla UptimeRobot ---
+app = Flask(__name__)
+@app.route('/')
+def index():
+    return "Alive"
+# ----------------------------
 
+# --- Konfiguracja ---
+FTP_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -22,126 +23,130 @@ DB_CONFIG = {
     "password": "npg_dRU1YCtxbh6v",
     "sslmode": "require"
 }
+LOCK_ORDER = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
+# ---------------------
 
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+def connect_db():
+    return psycopg2.connect(**DB_CONFIG)
 
-LOCK_ORDER = {'VeryEasy': 0, 'Basic': 1, 'Medium': 2, 'Advanced': 3, 'DialLock': 4}
-
-# --- Flask ---
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Alive"
-
-# --- Funkcje ---
-
-def connect_to_ftp():
-    try:
-        ftp = ftplib.FTP()
-        ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
-        ftp.login(FTP_USER, FTP_PASS)
-        print("[DEBUG] Połączono z FTP")
-        return ftp
-    except Exception as e:
-        print(f"[ERROR] Połączenie FTP nieudane: {e}")
-        return None
-
-def list_log_files(ftp):
-    try:
-        ftp.cwd(FTP_LOGS_DIR)
-        files = []
-        ftp.retrlines("LIST", lambda line: files.append(line.split()[-1]))
-        log_files = [f for f in files if f.startswith("gameplay_") and f.endswith(".log")]
-        print(f"[DEBUG] Znaleziono plików: {len(log_files)}")
-        return log_files
-    except Exception as e:
-        print(f"[ERROR] Nie można pobrać listy plików: {e}")
-        return []
-
-def download_log_file(ftp, filename):
-    try:
-        bio = BytesIO()
-        ftp.retrbinary(f"RETR {filename}", bio.write)
-        content = bio.getvalue().decode("utf-16-le", errors="ignore")
-        print(f"[DEBUG] Pobrano plik: {filename}")
-        return content
-    except Exception as e:
-        print(f"[ERROR] Błąd pobierania {filename}: {e}")
-        return ""
+def create_table():
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS lockpicking (
+            nick TEXT,
+            lock TEXT,
+            success BOOLEAN,
+            time FLOAT
+        )
+    """)
+    conn.commit()
+    conn.close()
 
 def parse_log_content(content):
-    import re
+    """
+    Parsuje treść logu i wyciąga dane lockpickingu.
+    """
     pattern = re.compile(
-        r"User: (?P<nick>.*?) .*?Lock: (?P<lock>.*?)\..*?Success: (?P<success>Yes|No).*?Elapsed time: (?P<time>\d+\.\d+)",
-        re.DOTALL
+        r"\[LogMinigame\]\s+\[LockpickingMinigame_C\]\s+User:\s+(?P<nick>.*?)\s+\((?P<lock>.*?)\)\s+Success:\s+(?P<success>Yes|No)\.\s+Elapsed time:\s+(?P<time>\d+(\.\d+)?)"
     )
-    results = []
-    for match in pattern.finditer(content):
-        nick = match.group("nick").strip()
-        lock = match.group("lock").strip()
+    matches = list(pattern.finditer(content))
+    print(f"[DEBUG] Dopasowano {len(matches)} wpisów lockpickingu")
+
+    data = []
+    for match in matches:
+        nick = match.group("nick")
+        lock = match.group("lock")
         success = match.group("success") == "Yes"
         time = float(match.group("time"))
-        results.append((nick, lock, success, time))
-    return results
+        data.append((nick, lock, success, time))
 
-def create_dataframe(all_entries):
-    df = pd.DataFrame(all_entries, columns=["Nick", "Lock", "Success", "Time"])
-    grouped = df.groupby(["Nick", "Lock"])
-    summary = grouped.agg(
-        Attempts=("Success", "count"),
-        Successes=("Success", "sum"),
-        Failures=("Success", lambda x: (~x).sum()),
-        Accuracy=("Success", "mean"),
-        AvgTime=("Time", "mean")
-    ).reset_index()
+    return data
 
-    summary["Accuracy"] = (summary["Accuracy"] * 100).round(1).astype(str) + "%"
-    summary["AvgTime"] = summary["AvgTime"].round(2)
+def insert_data(data):
+    conn = connect_db()
+    cur = conn.cursor()
+    cur.executemany(
+        "INSERT INTO lockpicking (nick, lock, success, time) VALUES (%s, %s, %s, %s)", data
+    )
+    conn.commit()
+    conn.close()
 
-    # Dodane sortowanie: najpierw po Nicku, potem Lock według porządku LOCK_ORDER
-    summary["LockOrder"] = summary["Lock"].map(LOCK_ORDER).fillna(999)
-    summary.sort_values(by=["Nick", "LockOrder"], inplace=True)
-    summary.drop(columns=["LockOrder"], inplace=True)
+def create_dataframe():
+    conn = connect_db()
+    df = pd.read_sql("SELECT * FROM lockpicking", conn)
+    conn.close()
 
-    print("[DEBUG] Tabela podsumowania:")
-    print(tabulate(summary, headers="keys", tablefmt="grid", showindex=False))
+    if df.empty:
+        return None
+
+    df['total'] = 1
+    df['success_count'] = df['success'].astype(int)
+    df['fail_count'] = (~df['success']).astype(int)
+
+    summary = df.groupby(['nick', 'lock']).agg({
+        'total': 'sum',
+        'success_count': 'sum',
+        'fail_count': 'sum',
+        'time': 'mean'
+    }).reset_index()
+
+    summary['success_rate'] = (summary['success_count'] / summary['total'] * 100).round(1)
+    summary['time'] = summary['time'].round(1)
+
+    summary = summary.rename(columns={
+        'nick': 'Nick',
+        'lock': 'Zamek',
+        'total': 'Ilość wszystkich prób',
+        'success_count': 'Udane',
+        'fail_count': 'Nieudane',
+        'success_rate': 'Skuteczność',
+        'time': 'Średni czas'
+    })
+
+    # ✅ Sortowanie: najpierw Nick, potem kolejność zamków
+    summary['Zamek_sort'] = summary['Zamek'].map(LOCK_ORDER)
+    summary = summary.sort_values(by=['Nick', 'Zamek_sort'])
+    summary = summary.drop(columns=['Zamek_sort'])
+
+    print("[DEBUG] Tabela lockpickingu przed wysyłką:")
+    print(tabulate(summary, headers='keys', tablefmt='grid', stralign='center', numalign='center'))
 
     return summary
 
 def send_to_discord(df):
-    table = tabulate(df, headers="keys", tablefmt="grid", showindex=False, stralign="center")
-    payload = {"content": f"```\n{table}\n```"}
+    if df is None or df.empty:
+        print("[INFO] Brak danych do wysłania.")
+        return
+
+    table = tabulate(df, headers='keys', tablefmt='grid', stralign='center', numalign='center')
+    payload = {
+        "content": f"```\n{table}\n```"
+    }
     response = requests.post(WEBHOOK_URL, json=payload)
-    if response.status_code == 204:
-        print("[DEBUG] Wysłano dane do Discord webhook")
-    else:
-        print(f"[ERROR] Nie udało się wysłać na Discord: {response.status_code}")
+    print(f"[DEBUG] Wysłano dane na webhook: {response.status_code}")
 
-def main():
-    print("[DEBUG] Start programu")
-    ftp = connect_to_ftp()
-    if not ftp:
-        return
+def main_loop():
+    print("[DEBUG] Start main_loop")
+    create_table()
 
-    log_files = list_log_files(ftp)
-    all_entries = []
+    logs_dir = "./downloaded_logs"
+    if not os.path.exists(logs_dir):
+        os.makedirs(logs_dir)
 
-    for filename in log_files:
-        content = download_log_file(ftp, filename)
-        entries = parse_log_content(content)
-        print(f"[DEBUG] W pliku {filename} znaleziono wpisów: {len(entries)}")
-        all_entries.extend(entries)
+    for filename in os.listdir(logs_dir):
+        if filename.startswith("gameplay_") and filename.endswith(".log"):
+            path = os.path.join(logs_dir, filename)
+            with open(path, "r", encoding="utf-16-le") as f:
+                content = f.read()
+                data = parse_log_content(content)
+                if data:
+                    insert_data(data)
 
-    ftp.quit()
-
-    if not all_entries:
-        print("[INFO] Brak nowych danych do przetworzenia.")
-        return
-
-    df = create_dataframe(all_entries)
+    df = create_dataframe()
     send_to_discord(df)
 
 if __name__ == "__main__":
-    main()
-    app.run(host="0.0.0.0", port=3000)
+    import threading
+    threading.Thread(target=app.run, kwargs={"host": "0.0.0.0", "port": 3000}).start()
+    main_loop()
