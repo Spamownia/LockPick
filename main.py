@@ -5,14 +5,13 @@ import psycopg2
 import requests
 from collections import defaultdict
 
-# --- KONFIGURACJA ---
+# Dane dostępowe do FTP
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
+# Dane dostępowe do PostgreSQL (Neon)
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -21,133 +20,128 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-# --- PARSER ---
-log_entry_pattern = re.compile(
-    r"\[LogMinigame\] \[LockpickingMinigame_C\] User: (?P<nick>.*?) \(\d+, \d+\)\. "
-    r"Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>\d+(\.\d+)?)\. "
-    r"Failed attempts: (?P<fail>\d+)\. Target object: .*?\. Lock type: (?P<locktype>\w+)\."
-)
+# Webhook Discord
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
+# Parsowanie danych z logów
 def parse_log_content(content):
-    stats = defaultdict(lambda: {
-        "total": 0, "success": 0, "fail": 0, "sum_time": 0.0
-    })
+    pattern = re.compile(
+        r'User:\s+(.*?)\s+\(.*?\)\.\s+Success:\s+(Yes|No)\.\s+Elapsed time:\s+([\d.]+)\.\s+Failed attempts:\s+(\d+).*?Lock type:\s+(.*?)\.',
+        re.MULTILINE
+    )
+    results = []
 
-    for match in log_entry_pattern.finditer(content):
-        nick = match.group("nick").strip()
-        locktype = match.group("locktype").strip()
-        success = match.group("success") == "Yes"
-        time_str = match.group("time").strip().rstrip(".")
-        try:
-            elapsed = float(time_str)
-        except ValueError:
-            continue
+    for match in pattern.finditer(content):
+        nick = match.group(1)
+        success = match.group(2) == 'Yes'
+        elapsed = float(match.group(3).rstrip('.'))
+        fails = int(match.group(4))
+        locktype = match.group(5)
 
-        key = (nick, locktype)
-        stats[key]["total"] += 1
-        stats[key]["sum_time"] += elapsed
-        if success:
-            stats[key]["success"] += 1
-        else:
-            stats[key]["fail"] += 1
+        results.append({
+            "nick": nick,
+            "success": success,
+            "elapsed": elapsed,
+            "fails": fails,
+            "locktype": locktype
+        })
+    return results
 
-    return stats
+# Zapis danych do bazy PostgreSQL
+def save_to_db(entries):
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS lockpicking_logs (
+                    id SERIAL PRIMARY KEY,
+                    nick TEXT,
+                    locktype TEXT,
+                    success BOOLEAN,
+                    elapsed FLOAT,
+                    fails INTEGER
+                );
+            """)
+            for e in entries:
+                cur.execute("""
+                    INSERT INTO lockpicking_logs (nick, locktype, success, elapsed, fails)
+                    VALUES (%s, %s, %s, %s, %s);
+                """, (e["nick"], e["locktype"], e["success"], e["elapsed"], e["fails"]))
+        conn.commit()
 
-# --- TABELA ---
-def build_table(stats):
-    headers = ["Nick", "Zamek", "Ilość prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
-    rows = []
-
-    for (nick, locktype), data in stats.items():
-        total = data["total"]
-        success = data["success"]
-        fail = data["fail"]
-        avg_time = round(data["sum_time"] / total, 2) if total else 0
-        acc = f"{(success / total * 100):.1f}%" if total else "0%"
-        rows.append([nick, locktype, str(total), str(success), str(fail), acc, str(avg_time)])
-
-    col_widths = [max(len(row[i]) for row in [headers] + rows) for i in range(len(headers))]
-
-    def format_row(row):
-        return " | ".join(cell.center(col_widths[i]) for i, cell in enumerate(row))
-
-    table = "```\n" + format_row(headers) + "\n" + "-+-".join("-" * w for w in col_widths) + "\n"
-    for row in rows:
-        table += format_row(row) + "\n"
-    return table + "```"
-
-# --- DANE FTP ---
+# Pobieranie i przetwarzanie logów z FTP
 def fetch_and_parse_logs():
-    all_stats = defaultdict(lambda: {
-        "total": 0, "success": 0, "fail": 0, "sum_time": 0.0
-    })
-
     print("[DEBUG] Start programu")
+    all_entries = []
     with ftplib.FTP() as ftp:
         ftp.connect(FTP_HOST, FTP_PORT)
         ftp.login(FTP_USER, FTP_PASS)
         print(f"[OK] Połączono z FTP: {FTP_HOST}:{FTP_PORT}")
-
-        ftp.cwd(FTP_LOG_DIR)
+        ftp.cwd("/SCUM/Saved/SaveFiles/Logs/")
         filenames = []
-        ftp.retrlines("LIST", lambda line: filenames.append(line.split()[-1]))
+        ftp.retrlines('LIST', lambda line: filenames.append(line.split()[-1]))
         log_files = [f for f in filenames if f.startswith("gameplay_") and f.endswith(".log")]
-
         print(f"[INFO] Znaleziono {len(log_files)} plików gameplay_*.log")
+
         for filename in log_files:
             print(f"[INFO] Przetwarzanie: {filename}")
-            with io.BytesIO() as bio:
-                ftp.retrbinary(f"RETR {filename}", bio.write)
-                content = bio.getvalue().decode("utf-16-le", errors="ignore")
-                stats = parse_log_content(content)
-                for key, val in stats.items():
-                    for k in val:
-                        all_stats[key][k] += val[k]
+            bio = io.BytesIO()
+            ftp.retrbinary(f"RETR {filename}", bio.write)
+            content = bio.getvalue().decode("utf-16-le", errors="ignore")
+            parsed = parse_log_content(content)
+            print(f"[DEBUG] Rozpoznano {len(parsed)} wpisów")
+            all_entries.extend(parsed)
 
-    return all_stats
+    return all_entries
 
-# --- DB ---
-def init_db():
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lockpicking_stats (
-            nick TEXT,
-            locktype TEXT,
-            total INT,
-            success INT,
-            fail INT,
-            avg_time FLOAT
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+# Generowanie i wysyłka tabeli
+def generate_table(entries):
+    grouped = defaultdict(list)
+    for e in entries:
+        key = (e["nick"], e["locktype"])
+        grouped[key].append(e)
 
-def save_to_db(stats):
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
-    cur.execute("DELETE FROM lockpicking_stats")  # reset przed zapisem
+    headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
+    table = [headers]
 
-    for (nick, locktype), data in stats.items():
-        avg_time = round(data["sum_time"] / data["total"], 2) if data["total"] else 0.0
-        cur.execute("""
-            INSERT INTO lockpicking_stats (nick, locktype, total, success, fail, avg_time)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (nick, locktype, data["total"], data["success"], data["fail"], avg_time))
+    for (nick, locktype), records in grouped.items():
+        total = len(records)
+        success = sum(1 for r in records if r["success"])
+        fails = total - success
+        avg_time = sum(r["elapsed"] for r in records if r["success"]) / success if success else 0
+        acc = f"{(success / total * 100):.1f}%" if total else "0%"
+        table.append([
+            nick,
+            locktype,
+            str(total),
+            str(success),
+            str(fails),
+            acc,
+            f"{avg_time:.2f}s"
+        ])
 
-    conn.commit()
-    cur.close()
-    conn.close()
+    # Wyśrodkowanie i formatowanie kolumn
+    col_widths = [max(len(row[i]) for row in table) for i in range(len(headers))]
+    formatted = ""
+    for row in table:
+        formatted += " | ".join(f"{cell.center(col_widths[i])}" for i, cell in enumerate(row)) + "\n"
 
-# --- MAIN ---
-if __name__ == "__main__":
-    init_db()
-    stats = fetch_and_parse_logs()
-    if stats:
-        save_to_db(stats)
-        tabela = build_table(stats)
-        print("[OK] Wygenerowano tabelę:\n", tabela)
-        requests.post(WEBHOOK_URL, json={"content": tabela})
+    return f"```\n{formatted}```"
+
+# Wysyłanie danych do Discorda
+def send_to_discord(message):
+    data = {"content": message}
+    response = requests.post(WEBHOOK_URL, json=data)
+    if response.status_code != 204:
+        print(f"[ERROR] Wysyłka do Discord nie powiodła się: {response.status_code}")
     else:
-        print("[INFO] Brak danych do przetworzenia.")
+        print("[OK] Wysłano wiadomość na Discord")
+
+# Główna pętla
+if __name__ == "__main__":
+    entries = fetch_and_parse_logs()
+    if not entries:
+        print("[INFO] Brak rozpoznanych wpisów w logach.")
+    else:
+        save_to_db(entries)
+        message = generate_table(entries)
+        send_to_discord(message)
