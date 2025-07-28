@@ -1,19 +1,20 @@
 import os
-import re
 import time
-import psycopg2
+import re
 import pandas as pd
 from ftplib import FTP
 from io import BytesIO
 from tabulate import tabulate
+import psycopg2
 import requests
-from datetime import datetime
+from flask import Flask
 
+# --- KONFIGURACJE ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 DB_CONFIG = {
@@ -24,132 +25,113 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-last_known_lines = 0
+# --- APLIKACJA ---
+app = Flask(__name__)
 
-def connect_ftp():
-    ftp = FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    return ftp
+@app.route('/')
+def index():
+    return "Alive"
 
-def get_latest_log_filename(ftp):
-    ftp.cwd(LOG_DIR)
-    files = []
-    ftp.retrlines("LIST", lambda x: files.append(x))
-    log_files = [f.split()[-1] for f in files if f.split()[-1].startswith("gameplay_") and f.endswith(".log")]
-    return sorted(log_files)[-1] if log_files else None
-
-def download_log_file(ftp, filename):
-    bio = BytesIO()
-    ftp.retrbinary(f"RETR {filename}", bio.write)
-    bio.seek(0)
-    return bio.read().decode("utf-16-le", errors="ignore")
-
+# --- FUNKCJA PARSUJĄCA ---
 def parse_log_content(content):
+    lines = content.splitlines()
+    results = []
     pattern = re.compile(
-        r"\[LogMinigame\].*?User:\s*(?P<nick>\w+).*?"
-        r"LockType:\s*(?P<lock>[\w_]+).*?"
-        r"Success:\s*(?P<success>\w+).*?"
-        r"Elapsed time:\s*(?P<time>[0-9.]+)",
-        re.DOTALL
+        r"\[LogMinigame\].*?User: (?P<nick>\w+).*?Lock: (?P<lock_type>.+?)\..*?Success: (?P<success>Yes|No)\. Elapsed time: (?P<elapsed_time>\d+\.\d+)"
     )
-    return pattern.findall(content)
+    for line in lines:
+        match = pattern.search(line)
+        if match:
+            results.append(match.groupdict())
+    return results
 
-def create_dataframe(entries):
-    rows = []
-    for nick, lock, success, time_str in entries:
-        success = success.lower() == "yes"
-        elapsed = float(time_str)
-        rows.append({"Nick": nick, "LockType": lock, "Success": success, "Time": elapsed})
-    df = pd.DataFrame(rows)
-    return df
-
-def update_postgresql(df):
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lock_stats (
-            nick TEXT,
-            locktype TEXT,
-            success BOOLEAN,
-            time FLOAT,
-            timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    for _, row in df.iterrows():
-        cur.execute(
-            "INSERT INTO lock_stats (nick, locktype, success, time) VALUES (%s, %s, %s, %s)",
-            (row["Nick"], row["LockType"], row["Success"], row["Time"])
-        )
-    conn.commit()
-    cur.close()
-    conn.close()
-
-def generate_summary_table():
-    conn = psycopg2.connect(**DB_CONFIG)
-    df = pd.read_sql_query("SELECT nick, locktype, success, time FROM lock_stats", conn)
-    conn.close()
-
+# --- FUNKCJA PRZETWARZAJĄCA DANE ---
+def create_dataframe(data):
+    df = pd.DataFrame(data)
     if df.empty:
-        return "Brak danych do wyświetlenia."
+        return None
+    df["elapsed_time"] = df["elapsed_time"].astype(float)
+    df["success"] = df["success"].map({"Yes": 1, "No": 0})
+    df["failure"] = 1 - df["success"]
+    grouped = df.groupby(["nick", "lock_type"]).agg(
+        Attempts=("success", "count"),
+        Successes=("success", "sum"),
+        Failures=("failure", "sum"),
+        Accuracy=("success", lambda x: f"{(x.mean() * 100):.1f}%"),
+        AvgTime=("elapsed_time", lambda x: f"{x.mean():.2f}s")
+    ).reset_index()
+    return grouped
 
-    grouped = df.groupby(["Nick", "LockType"], observed=False)
-    summary = []
-    for (nick, lock), group in grouped:
-        total = len(group)
-        success = group["Success"].sum()
-        fail = total - success
-        avg_time = round(group["Time"].mean(), 2)
-        accuracy = f"{(success / total * 100):.1f}%"
-        summary.append([
-            nick.center(12),
-            lock.center(10),
-            str(total).center(6),
-            str(success).center(6),
-            str(fail).center(7),
-            accuracy.center(10),
-            str(avg_time).center(10)
-        ])
-
-    headers = ["Nick", "Zamek", "Próby", "Udane", "Nieudane", "Skuteczność", "Śr. czas"]
-    return "```\n" + tabulate(summary, headers=headers, tablefmt="grid") + "\n```"
-
-def send_to_discord(message):
-    requests.post(WEBHOOK_URL, json={"content": message})
-
-def main_loop():
-    global last_known_lines
-    print("[DEBUG] Start programu")
-    ftp = connect_ftp()
-    latest_file = get_latest_log_filename(ftp)
-    if not latest_file:
-        print("[DEBUG] Brak logów.")
+# --- WYŚWIETLENIE I WYSYŁKA ---
+def send_to_discord(df):
+    if df is None or df.empty:
+        print("[DEBUG] Brak danych do wysłania.")
         return
-    print(f"[DEBUG] Ostatni log: {latest_file}")
-    last_content = ""
+    df = df.rename(columns={
+        "nick": "Nick", "lock_type": "Zamek", "Attempts": "Próby",
+        "Successes": "Udane", "Failures": "Nieudane", "Accuracy": "Skuteczność", "AvgTime": "Średni czas"
+    })
+    table = tabulate(df, headers="keys", tablefmt="grid", showindex=False, stralign="center", numalign="center")
+    print("[DEBUG] Wygenerowana tabela:\n", table)
+    try:
+        requests.post(WEBHOOK_URL, json={"content": f"```\n{table}\n```"})
+        print("[DEBUG] Wysłano dane do Discorda.")
+    except Exception as e:
+        print("[ERROR] Błąd wysyłki do Discorda:", e)
 
+# --- FUNKCJA PRZETWARZAJĄCA NAJNOWSZY PLIK ---
+def process_last_log(ftp, last_filename, last_known_entries):
+    try:
+        with BytesIO() as f:
+            ftp.retrbinary(f"RETR {FTP_LOG_DIR}{last_filename}", f.write)
+            content = f.getvalue().decode("utf-16le", errors="ignore")
+        parsed = parse_log_content(content)
+        if not parsed:
+            print("[DEBUG] Brak rozpoznanych wpisów w ostatnim pliku.")
+            return last_known_entries
+        new_entries = [entry for entry in parsed if entry not in last_known_entries]
+        if new_entries:
+            print(f"[DEBUG] Nowe wpisy: {len(new_entries)}")
+            df = create_dataframe(new_entries)
+            send_to_discord(df)
+            return parsed
+        else:
+            print("[DEBUG] Brak nowych wpisów.")
+            return last_known_entries
+    except Exception as e:
+        print("[ERROR] Błąd przetwarzania logu:", e)
+        return last_known_entries
+
+# --- PĘTLA GŁÓWNA ---
+def main_loop():
+    print("[DEBUG] Start programu")
+    last_known_entries = []
+    last_filename = ""
     while True:
         try:
-            content = download_log_file(ftp, latest_file)
-            lines = content.splitlines()
-            if len(lines) > last_known_lines:
-                new_lines = "\n".join(lines[last_known_lines:])
-                entries = parse_log_content(new_lines)
-                print(f"[DEBUG] Wczytano {len(entries)} nowych wpisów.")
-                if entries:
-                    df = create_dataframe(entries)
-                    update_postgresql(df)
-                    summary = generate_summary_table()
-                    send_to_discord(summary)
-                else:
-                    print("[DEBUG] Brak nowych rozpoznanych wpisów.")
-                last_known_lines = len(lines)
-            else:
-                print("[DEBUG] Brak nowych danych.")
-            time.sleep(60)
+            with FTP() as ftp:
+                ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+                ftp.login(FTP_USER, FTP_PASS)
+                ftp.cwd(FTP_LOG_DIR)
+                filenames = []
+                ftp.retrlines("LIST", lambda line: filenames.append(line.split()[-1]))
+                log_files = [f for f in filenames if f.startswith("gameplay_") and f.endswith(".log")]
+                if not log_files:
+                    print("[DEBUG] Brak plików gameplay_*.log na FTP.")
+                    time.sleep(60)
+                    continue
+                latest_file = sorted(log_files)[-1]
+                if latest_file != last_filename:
+                    print(f"[DEBUG] Nowy plik: {latest_file}")
+                    last_filename = latest_file
+                    last_known_entries = []
+                last_known_entries = process_last_log(ftp, latest_file, last_known_entries)
         except Exception as e:
-            print(f"[ERROR] {e}")
-            time.sleep(60)
+            print("[ERROR] Błąd połączenia z FTP:", e)
+        time.sleep(60)
 
+# --- START ---
 if __name__ == "__main__":
-    main_loop()
+    import threading
+    threading.Thread(target=main_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=3000)
