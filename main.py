@@ -1,21 +1,29 @@
-import ftplib
+import os
 import io
 import re
+import time
 import pandas as pd
 import psycopg2
 import requests
+from ftplib import FTP
 from tabulate import tabulate
 from flask import Flask
-import threading
-import time
+from datetime import datetime
+from collections import defaultdict
 
-# --- KONFIGURACJA ---
+# --- Flask keep-alive ---
+app = Flask(__name__)
+@app.route('/')
+def index():
+    return "Alive"
+
+# --- Konfiguracja FTP i DB ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-LOGS_DIR = "/SCUM/Saved/SaveFiles/Logs/"
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -24,110 +32,105 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-# --- REGEXP DOPASOWUJĄCY WPISY ---
-LOG_ENTRY_REGEX = re.compile(
-    r"User: (?P<nick>.*?) \([0-9]+, (?P<steamid>\d+)\)\. "
-    r"Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>\d+\.\d+)\. Failed attempts: \d+\. "
-    r"Target object: .*?\. Lock type: (?P<lock_type>\w+)\. User owner:"
-)
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-app = Flask(__name__)
+# --- Funkcja pobierająca logi z FTP ---
+def fetch_logs_from_ftp():
+    try:
+        with FTP() as ftp:
+            ftp.connect(FTP_HOST, FTP_PORT)
+            ftp.login(FTP_USER, FTP_PASS)
+            ftp.cwd(FTP_LOG_DIR)
+            filenames = []
+            ftp.retrlines("LIST", lambda line: filenames.append(line.split()[-1]))
+            log_files = [f for f in filenames if f.startswith("gameplay_") and f.endswith(".log")]
+            logs = []
 
-def parse_log_content(content: str):
+            for filename in log_files:
+                r = io.BytesIO()
+                ftp.retrbinary(f"RETR {filename}", r.write)
+                content = r.getvalue().decode('utf-16-le')
+                logs.append((filename, content))
+                print(f"[DEBUG] Pobrano {filename}, długość: {len(content)} znaków")
+            return logs
+    except Exception as e:
+        print(f"[ERROR] Błąd podczas pobierania logów: {e}")
+        return []
+
+# --- Parsowanie logów ---
+def parse_log_content(log_content):
     entries = []
-    for match in LOG_ENTRY_REGEX.finditer(content):
-        nick = match.group("nick")
-        success = match.group("success") == "Yes"
-        time_elapsed = float(match.group("time"))
-        lock_type = match.group("lock_type")
+    pattern = re.compile(
+        r"\[LogMinigame\].+?User: (?P<nick>.+?) .+?Type: (?P<lock>.+?) .+?Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[0-9.]+)",
+        re.DOTALL
+    )
+    for match in pattern.finditer(log_content):
         entries.append({
-            "Nick": nick,
-            "Success": success,
-            "Elapsed": time_elapsed,
-            "LockType": lock_type
+            "Nick": match.group("nick"),
+            "Zamek": match.group("lock"),
+            "Sukces": match.group("success") == "Yes",
+            "Czas": float(match.group("time"))
         })
     return entries
 
-def connect_ftp():
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.set_pasv(True)
-    return ftp
+# --- Tworzenie tabeli z wynikami ---
+def create_dataframe(parsed_entries):
+    if not parsed_entries:
+        return None
 
-def download_and_parse_logs():
-    ftp = connect_ftp()
-    ftp.cwd(LOGS_DIR)
-    filenames = []
-    ftp.retrlines("LIST", lambda line: filenames.append(line.split()[-1]))
-    log_files = [name for name in filenames if name.startswith("gameplay_") and name.endswith(".log")]
-    all_entries = []
-    for filename in log_files:
-        with io.BytesIO() as bio:
-            try:
-                ftp.retrbinary(f"RETR {filename}", bio.write)
-                bio.seek(0)
-                content = bio.read().decode("utf-16-le", errors="ignore")
-                entries = parse_log_content(content)
-                all_entries.extend(entries)
-                print(f"[DEBUG] Przetwarzanie: {filename} - znaleziono {len(entries)} wpisów")
-            except Exception as e:
-                print(f"[ERROR] Błąd przy {filename}: {e}")
-    ftp.quit()
-    return all_entries
+    df = pd.DataFrame(parsed_entries)
+    grouped = df.groupby(["Nick", "Zamek"])
 
-def create_dataframe(entries):
-    df = pd.DataFrame(entries)
-    if df.empty:
-        return df
-    # Sortowanie lock_type według ustalonej kolejności
-    lock_order = ["VeryEasy", "Basic", "Medium", "Advanced", "DialLock"]
-    df["LockType"] = pd.Categorical(df["LockType"], categories=lock_order, ordered=True)
-    grouped = df.groupby(["Nick", "LockType"])
-    summary = grouped.agg(
-        Wszystkie=("Success", "count"),
-        Udane=("Success", "sum"),
-        Nieudane=("Success", lambda x: x.size - x.sum()),
-        Skutecznosc=("Success", lambda x: round(100 * x.sum() / x.size, 2)),
-        Sredni_czas=("Elapsed", "mean")
-    ).reset_index()
-    summary["Sredni_czas"] = summary["Sredni_czas"].round(2)
-    return summary.sort_values(by=["Nick", "LockType"])
+    result = []
+    for (nick, zamek), group in grouped:
+        total = len(group)
+        success_count = group["Sukces"].sum()
+        fail_count = total - success_count
+        avg_time = group["Czas"].mean() if success_count > 0 else 0
+        accuracy = (success_count / total) * 100 if total else 0
 
+        result.append({
+            "Nick": nick,
+            "Zamek": zamek,
+            "Ilość wszystkich prób": total,
+            "Udane": success_count,
+            "Nieudane": fail_count,
+            "Skuteczność": f"{accuracy:.1f}%",
+            "Średni czas": f"{avg_time:.2f}s"
+        })
+
+    lock_order = {"VeryEasy": 0, "Basic": 1, "Medium": 2, "Advanced": 3, "DialLock": 4}
+    result.sort(key=lambda x: (x["Nick"], lock_order.get(x["Zamek"], 99)))
+    return pd.DataFrame(result)
+
+# --- Wysyłka na Discord ---
 def send_to_discord(df):
-    if df.empty:
-        print("[DEBUG] Brak danych do wysłania.")
+    if df is None or df.empty:
+        print("[INFO] Brak danych do wysłania.")
         return
-    table = tabulate(
-        df,
-        headers=["Nick", "Zamek", "Wszystkie", "Udane", "Nieudane", "Skuteczność", "Średni czas"],
-        tablefmt="github",
-        colalign=("center",) * 7
-    )
-    print("[DEBUG] Tabela do wysłania:\n")
-    print(table)
-    payload = {"content": f"```\n{table}\n```"}
-    try:
-        response = requests.post(WEBHOOK_URL, json=payload)
-        if response.status_code == 204:
-            print("[OK] Wysłano dane na Discord webhook.")
-        else:
-            print(f"[ERROR] Webhook zwrócił status: {response.status_code}")
-    except Exception as e:
-        print(f"[ERROR] Błąd przy wysyłaniu na webhook: {e}")
 
+    table_str = tabulate(df, headers="keys", tablefmt="grid", stralign="center", numalign="center")
+    response = requests.post(WEBHOOK_URL, json={"content": f"```\n{table_str}\n```"})
+    if response.status_code == 204:
+        print("[INFO] Wysłano tabelę na Discord.")
+    else:
+        print(f"[ERROR] Nie udało się wysłać danych: {response.status_code} {response.text}")
+
+# --- Główna pętla ---
 def main_loop():
-    while True:
-        print("[DEBUG] Start programu")
-        try:
-            entries = download_and_parse_logs()
-            print(f"[DEBUG] Wszystkich wpisów: {len(entries)}")
-            df = create_dataframe(entries)
-            send_to_discord(df)
-        except Exception as e:
-            print(f"[ERROR] Wystąpił błąd w main_loop: {e}")
-        time.sleep(60)
+    print("[DEBUG] Start main_loop")
+    logs = fetch_logs_from_ftp()
+    all_entries = []
 
-if __name__ == '__main__':
+    for filename, content in logs:
+        parsed = parse_log_content(content)
+        print(f"[DEBUG] {filename}: {len(parsed)} rozpoznanych wpisów.")
+        all_entries.extend(parsed)
+
+    df = create_dataframe(all_entries)
+    send_to_discord(df)
+
+# --- Uruchomienie ---
+if __name__ == "__main__":
     main_loop()
     app.run(host='0.0.0.0', port=3000)
