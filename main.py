@@ -1,14 +1,17 @@
-import os
-import re
 import ftplib
+import io
+import re
 import psycopg2
-import ssl
+import requests
+from collections import defaultdict
 
+# --- KONFIGURACJA ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-FTP_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
@@ -18,102 +21,133 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-def parse_float_safely(s):
-    s = s.strip().replace(',', '.').rstrip('.')
-    try:
-        return float(s)
-    except ValueError:
-        return None
+# --- PARSER ---
+log_entry_pattern = re.compile(
+    r"\[LogMinigame\] \[LockpickingMinigame_C\] User: (?P<nick>.*?) \(\d+, \d+\)\. "
+    r"Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>\d+(\.\d+)?)\. "
+    r"Failed attempts: (?P<fail>\d+)\. Target object: .*?\. Lock type: (?P<locktype>\w+)\."
+)
 
 def parse_log_content(content):
-    pattern = re.compile(
-        r'User:\s+(?P<nick>\w+).*?Success:\s+(?P<success>\w+).*?Elapsed time:\s+(?P<czas>[\d.,]+).*?Failed attempts:\s+(?P<nieudane>\d+).*?Lock type:\s+(?P<zamek>\w+)',
-        re.DOTALL
-    )
-    entries = []
-    lines = content.splitlines()
-    for line in lines:
-        if "User:" in line and "Success:" in line:
-            match = pattern.search(line)
-            if match:
-                nick = match.group("nick")
-                success = match.group("success").strip().lower() in ["yes", "true", "1"]
-                czas_raw = match.group("czas")
-                czas_float = parse_float_safely(czas_raw)
-                if czas_float is None:
-                    print(f"[WARNING] Nieprawidłowy czas: '{czas_raw}' → linia: {line}")
-                    continue
-                czas_ms = int(czas_float * 1000)
-                nieudane = int(match.group("nieudane"))
-                zamek = match.group("zamek")
+    stats = defaultdict(lambda: {
+        "total": 0, "success": 0, "fail": 0, "sum_time": 0.0
+    })
 
-                entries.append({
-                    "nick": nick,
-                    "zamek": zamek,
-                    "sukces": success,
-                    "czas_ms": czas_ms,
-                    "nieudane": nieudane
-                })
-            else:
-                print(f"[DEBUG] Pominięto niedopasowaną linię: {line}")
-    return entries
+    for match in log_entry_pattern.finditer(content):
+        nick = match.group("nick").strip()
+        locktype = match.group("locktype").strip()
+        success = match.group("success") == "Yes"
+        time_str = match.group("time").strip().rstrip(".")
+        try:
+            elapsed = float(time_str)
+        except ValueError:
+            continue
 
-def save_to_database(entries):
-    try:
-        context = ssl.create_default_context()
-        conn = psycopg2.connect(**DB_CONFIG)
-        cur = conn.cursor()
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS lockpicking_logs (
-                id SERIAL PRIMARY KEY,
-                nick TEXT,
-                zamek TEXT,
-                sukces BOOLEAN,
-                czas_ms INTEGER,
-                nieudane INTEGER
-            )
-        """)
-        for e in entries:
-            cur.execute("""
-                INSERT INTO lockpicking_logs (nick, zamek, sukces, czas_ms, nieudane)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (e["nick"], e["zamek"], e["sukces"], e["czas_ms"], e["nieudane"]))
-        conn.commit()
-        cur.close()
-        conn.close()
-        print(f"[DB] Zapisano {len(entries)} rekordów do bazy")
-    except Exception as e:
-        print(f"[DB ERROR] {e}")
+        key = (nick, locktype)
+        stats[key]["total"] += 1
+        stats[key]["sum_time"] += elapsed
+        if success:
+            stats[key]["success"] += 1
+        else:
+            stats[key]["fail"] += 1
 
+    return stats
+
+# --- TABELA ---
+def build_table(stats):
+    headers = ["Nick", "Zamek", "Ilość prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
+    rows = []
+
+    for (nick, locktype), data in stats.items():
+        total = data["total"]
+        success = data["success"]
+        fail = data["fail"]
+        avg_time = round(data["sum_time"] / total, 2) if total else 0
+        acc = f"{(success / total * 100):.1f}%" if total else "0%"
+        rows.append([nick, locktype, str(total), str(success), str(fail), acc, str(avg_time)])
+
+    col_widths = [max(len(row[i]) for row in [headers] + rows) for i in range(len(headers))]
+
+    def format_row(row):
+        return " | ".join(cell.center(col_widths[i]) for i, cell in enumerate(row))
+
+    table = "```\n" + format_row(headers) + "\n" + "-+-".join("-" * w for w in col_widths) + "\n"
+    for row in rows:
+        table += format_row(row) + "\n"
+    return table + "```"
+
+# --- DANE FTP ---
 def fetch_and_parse_logs():
+    all_stats = defaultdict(lambda: {
+        "total": 0, "success": 0, "fail": 0, "sum_time": 0.0
+    })
+
     print("[DEBUG] Start programu")
-    entries = []
     with ftplib.FTP() as ftp:
         ftp.connect(FTP_HOST, FTP_PORT)
         ftp.login(FTP_USER, FTP_PASS)
-        ftp.cwd(FTP_DIR)
         print(f"[OK] Połączono z FTP: {FTP_HOST}:{FTP_PORT}")
-        files = []
-        ftp.retrlines("LIST", lambda line: files.append(line.split()[-1]))
-        target_files = [f for f in files if f.startswith("gameplay_") and f.endswith(".log")]
-        print(f"[INFO] Znaleziono {len(target_files)} plików gameplay_*.log")
-        for fname in target_files:
-            print(f"[INFO] Przetwarzanie: {fname}")
-            try:
-                from io import BytesIO
-                buffer = BytesIO()
-                ftp.retrbinary(f"RETR {fname}", buffer.write)
-                content = buffer.getvalue().decode("utf-16le", errors="ignore")
-                parsed = parse_log_content(content)
-                print(f"[INFO] Wpisy w {fname}: {len(parsed)}")
-                entries.extend(parsed)
-            except Exception as e:
-                print(f"[ERROR] Błąd przy pliku {fname}: {e}")
-    return entries
 
+        ftp.cwd(FTP_LOG_DIR)
+        filenames = []
+        ftp.retrlines("LIST", lambda line: filenames.append(line.split()[-1]))
+        log_files = [f for f in filenames if f.startswith("gameplay_") and f.endswith(".log")]
+
+        print(f"[INFO] Znaleziono {len(log_files)} plików gameplay_*.log")
+        for filename in log_files:
+            print(f"[INFO] Przetwarzanie: {filename}")
+            with io.BytesIO() as bio:
+                ftp.retrbinary(f"RETR {filename}", bio.write)
+                content = bio.getvalue().decode("utf-16-le", errors="ignore")
+                stats = parse_log_content(content)
+                for key, val in stats.items():
+                    for k in val:
+                        all_stats[key][k] += val[k]
+
+    return all_stats
+
+# --- DB ---
+def init_db():
+    conn = psycopg2.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS lockpicking_stats (
+            nick TEXT,
+            locktype TEXT,
+            total INT,
+            success INT,
+            fail INT,
+            avg_time FLOAT
+        )
+    """)
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def save_to_db(stats):
+    conn = psycopg2.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    cur.execute("DELETE FROM lockpicking_stats")  # reset przed zapisem
+
+    for (nick, locktype), data in stats.items():
+        avg_time = round(data["sum_time"] / data["total"], 2) if data["total"] else 0.0
+        cur.execute("""
+            INSERT INTO lockpicking_stats (nick, locktype, total, success, fail, avg_time)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (nick, locktype, data["total"], data["success"], data["fail"], avg_time))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# --- MAIN ---
 if __name__ == "__main__":
-    entries = fetch_and_parse_logs()
-    if entries:
-        save_to_database(entries)
+    init_db()
+    stats = fetch_and_parse_logs()
+    if stats:
+        save_to_db(stats)
+        tabela = build_table(stats)
+        print("[OK] Wygenerowano tabelę:\n", tabela)
+        requests.post(WEBHOOK_URL, json={"content": tabela})
     else:
-        print("[INFO] Brak danych do zapisania.")
+        print("[INFO] Brak danych do przetworzenia.")
