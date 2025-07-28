@@ -44,17 +44,22 @@ def create_table(conn):
         conn.commit()
     print("[DEBUG] Tabela lockpicking_stats sprawdzona/utworzona.")
 
+# Wyczyść tabelę przed nowym pełnym przetworzeniem
+def clear_table(conn):
+    with conn.cursor() as cur:
+        cur.execute("TRUNCATE TABLE lockpicking_stats;")
+        conn.commit()
+    print("[DEBUG] Tabela lockpicking_stats wyczyszczona.")
+
 # Pobranie listy plików gameplay_*.log z FTP bez NLST (obsługa błędu)
 def ftp_list_files(ftp, path):
     files = []
     try:
-        # Spróbuj MLSD - nowocześniejsze
         entries = list(ftp.mlsd(path))
         for name, facts in entries:
             if name.startswith("gameplay_") and name.endswith(".log"):
                 files.append(name)
     except (error_perm, AttributeError):
-        # MLSD niedostępne - fallback na LIST + filtrowanie
         lines = []
         ftp.retrlines(f"LIST {path}", lines.append)
         for line in lines:
@@ -91,19 +96,11 @@ def parse_log_content(content):
 def save_entries(conn, entries, log_file):
     with conn.cursor() as cur:
         for e in entries:
-            # Zapytanie INSERT, bez duplikatów na poziomie aplikacji
             cur.execute("""
                 INSERT INTO lockpicking_stats (nickname, lock_type, success, elapsed_time, log_file)
                 VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT DO NOTHING
             """, (e["nickname"], e["lock_type"], e["success"], e["elapsed_time"], log_file))
         conn.commit()
-
-# Sprawdzenie, czy plik został już przetworzony (na podstawie istnienia wpisu w bazie)
-def is_file_processed(conn, log_file):
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM lockpicking_stats WHERE log_file = %s LIMIT 1", (log_file,))
-        return cur.fetchone() is not None
 
 # Pobranie agregowanych danych z bazy do tabeli
 def fetch_aggregated_stats(conn):
@@ -160,6 +157,7 @@ def main():
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         create_table(conn)
+        clear_table(conn)  # <-- tu wyczyszczenie tabeli
     except Exception as e:
         print(f"[ERROR] Błąd bazy danych: {e}")
         return
@@ -172,12 +170,7 @@ def main():
         print(f"[ERROR] Błąd pobierania listy plików FTP: {e}")
         return
 
-    new_data = False
     for filename in sorted(files):
-        if is_file_processed(conn, filename):
-            print(f"[INFO] Pomijam już przetworzony plik: {filename}")
-            continue
-
         try:
             full_path = FTP_LOG_DIR + filename
             content = ftp_download_file(ftp, full_path)
@@ -186,18 +179,14 @@ def main():
             print(f"[DEBUG] {filename} -> {len(entries)} wpisów")
             if entries:
                 save_entries(conn, entries, filename)
-                new_data = True
             else:
                 print(f"[INFO] Plik {filename} nie zawiera rozpoznanych wpisów.")
         except Exception as e:
             print(f"[ERROR] Błąd przetwarzania pliku {filename}: {e}")
 
-    if new_data:
-        print("[INFO] Nowe dane zapisane do bazy. Agreguję i wyświetlam statystyki.")
-        rows = fetch_aggregated_stats(conn)
-        display_stats_table(rows)
-    else:
-        print("[INFO] Brak nowych wpisów do przetworzenia.")
+    # Agregacja i wyświetlenie statystyk
+    rows = fetch_aggregated_stats(conn)
+    display_stats_table(rows)
 
     # Zamknięcie połączeń
     try:
