@@ -1,8 +1,8 @@
 import os
-import ftplib
-import psycopg2
 import re
-from datetime import datetime
+import psycopg2
+from ftplib import FTP
+from io import BytesIO
 
 # --- KONFIGURACJA FTP ---
 FTP_HOST = "176.57.174.10"
@@ -11,7 +11,7 @@ FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 FTP_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 
-# --- KONFIGURACJA BAZY NEON POSTGRESQL ---
+# --- KONFIGURACJA DB ---
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -20,115 +20,95 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-# --- KATALOG DO LOKALNEGO ZAPISU PLIKÓW ---
-LOCAL_DIR = "downloaded_logs"
+# --- FOLDER NA POBRANE LOGI ---
+LOG_DIR = "downloaded_logs"
+os.makedirs(LOG_DIR, exist_ok=True)
 
-def debug(msg):
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] [DEBUG] {msg}")
-
-def connect_ftp():
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
-    ftp.login(FTP_USER, FTP_PASS)
-    debug(f"Połączono z FTP: {FTP_HOST}:{FTP_PORT}")
-    return ftp
-
-def list_log_files(ftp):
-    ftp.cwd(FTP_DIR)
-    debug(f"Zmieniono katalog na: {FTP_DIR}")
-    lines = []
-    ftp.retrlines('LIST', lambda line: lines.append(line))
-    files = [line.split()[-1] for line in lines if line.split()[-1].startswith("gameplay") and line.endswith(".log")]
-    debug(f"Znaleziono {len(files)} plików gameplay_*.log")
-    return files
-
-def download_files(ftp, filenames):
-    os.makedirs(LOCAL_DIR, exist_ok=True)
-    for filename in filenames:
-        local_path = os.path.join(LOCAL_DIR, filename)
-        with open(local_path, "wb") as f:
-            ftp.retrbinary("RETR " + filename, f.write)
-        debug(f"Pobrano: {filename}")
-
-def connect_db():
-    conn = psycopg2.connect(**DB_CONFIG)
-    debug("Połączono z bazą danych PostgreSQL")
-    return conn
-
-def init_db(conn):
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS lockpicks (
-                id SERIAL PRIMARY KEY,
-                nick TEXT,
-                zamek TEXT,
-                wynik TEXT,
-                czas_ms INTEGER,
-                data TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-            );
-        """)
-        conn.commit()
-        debug("Tabela 'lockpicks' przygotowana.")
-
+# --- PARSER ---
 def parse_log_content(content):
-    pattern = re.compile(r'\[(.*?)\] \[LockPicking\] Player (.+?) tried to pick (.+?): (SUCCESS|FAIL) in (\d+)ms')
     entries = []
+    pattern = re.compile(
+        r'User: (.+?) \(\d+, \d+\)\. Success: (Yes|No)\. Elapsed time: ([\d.]+).*?Target object: ([\w_]+)',
+        re.DOTALL
+    )
     for match in pattern.finditer(content):
-        _, nick, zamek, wynik, czas_ms = match.groups()
-        entries.append((nick.strip(), zamek.strip(), wynik, int(czas_ms)))
+        nick, wynik, czas_str, zamek = match.groups()
+        czas_ms = int(float(czas_str) * 1000)
+        entries.append((
+            nick.strip(),
+            zamek.strip(),
+            "SUCCESS" if wynik == "Yes" else "FAIL",
+            czas_ms
+        ))
     return entries
 
-def process_logs_and_save_to_db(conn):
-    total = 0
-    for filename in os.listdir(LOCAL_DIR):
-        if not filename.startswith("gameplay") or not filename.endswith(".log"):
-            continue
-
-        path = os.path.join(LOCAL_DIR, filename)
-        try:
-            with open(path, "r", encoding="utf-16-le") as f:
-                content = f.read()
-        except Exception as e:
-            debug(f"Błąd odczytu pliku {filename}: {e}")
-            continue
-
-        entries = parse_log_content(content)
-        if not entries:
-            debug(f"Brak danych lockpicking w {filename}")
-            continue
-
-        with conn.cursor() as cur:
-            cur.executemany("""
-                INSERT INTO lockpicks (nick, zamek, wynik, czas_ms)
-                VALUES (%s, %s, %s, %s);
-            """, entries)
-            conn.commit()
-            debug(f"Zapisano {len(entries)} rekordów z {filename}")
-            total += len(entries)
-
-    debug(f"Zapisano łącznie {total} wpisów do bazy danych.")
-
-def main():
-    debug("Start programu")
-
-    try:
-        ftp = connect_ftp()
-        files = list_log_files(ftp)
-        download_files(ftp, files)
-        ftp.quit()
-        debug("Rozłączono z FTP")
-    except Exception as e:
-        debug(f"[BŁĄD FTP] {e}")
+# --- ZAPIS DO DB ---
+def save_to_database(entries):
+    if not entries:
+        print("[INFO] Brak wpisów do zapisania.")
         return
 
-    try:
-        conn = connect_db()
-        init_db(conn)
-        process_logs_and_save_to_db(conn)
-        conn.close()
-        debug("Rozłączono z bazą danych")
-    except Exception as e:
-        debug(f"[BŁĄD DB] {e}")
+    conn = psycopg2.connect(**DB_CONFIG)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS lockpicking_attempts (
+            id SERIAL PRIMARY KEY,
+            nick TEXT,
+            zamek TEXT,
+            wynik TEXT,
+            czas_ms INTEGER
+        );
+    """)
+    for entry in entries:
+        cur.execute("""
+            INSERT INTO lockpicking_attempts (nick, zamek, wynik, czas_ms)
+            VALUES (%s, %s, %s, %s);
+        """, entry)
+    conn.commit()
+    cur.close()
+    conn.close()
+    print(f"[INFO] Zapisano {len(entries)} wpisów do bazy danych.")
 
+# --- POBIERZ LOGI ---
+def fetch_and_parse_logs():
+    ftp = FTP()
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=15)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.cwd(FTP_DIR)
+    print(f"[OK] Połączono z FTP: {FTP_HOST}:{FTP_PORT}")
+
+    filenames = []
+    ftp.retrlines("LIST", lambda line: filenames.append(line.split()[-1]))
+
+    log_files = [f for f in filenames if f.startswith("gameplay") and f.endswith(".log")]
+    print(f"[INFO] Znaleziono {len(log_files)} plików gameplay_*.log")
+
+    total_entries = []
+
+    for filename in log_files:
+        print(f"[INFO] Przetwarzanie: {filename}")
+        bio = BytesIO()
+        try:
+            ftp.retrbinary(f"RETR {filename}", bio.write)
+        except Exception as e:
+            print(f"[BŁĄD] Nie udało się pobrać {filename}: {e}")
+            continue
+
+        content = bio.getvalue().decode("utf-16-le", errors="ignore")
+        local_path = os.path.join(LOG_DIR, filename)
+        with open(local_path, "w", encoding="utf-16-le") as f:
+            f.write(content)
+
+        parsed = parse_log_content(content)
+        print(f"[INFO] {len(parsed)} wpisów w pliku {filename}")
+        total_entries.extend(parsed)
+
+    ftp.quit()
+    return total_entries
+
+# --- MAIN ---
 if __name__ == "__main__":
-    main()
+    print("[DEBUG] Start programu")
+    entries = fetch_and_parse_logs()
+    save_to_database(entries)
+    print("[DEBUG] Zakończono")
