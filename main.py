@@ -1,196 +1,55 @@
-import ftplib
-import io
-import re
-import psycopg2
-import requests
-import time
-from collections import defaultdict
-from tabulate import tabulate
+import os import re import psycopg2 import requests from flask import Flask from collections import defaultdict
 
-# Konfiguracja FTP i bazy danych
-FTP_HOST = "176.57.174.10"
-FTP_PORT = 50021
-FTP_USER = "gpftp37275281717442833"
-FTP_PASS = "LXNdGShY"
-LOG_PATH = "/SCUM/Saved/SaveFiles/Logs/"
+Konfiguracja webhooka
 
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-DB_CONFIG = {
-    "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
-    "dbname": "neondb",
-    "user": "neondb_owner",
-    "password": "npg_dRU1YCtxbh6v",
-    "sslmode": "require"
-}
+Konfiguracja bazy danych
 
-# Inicjalizacja bazy
-def init_db():
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lockpick_stats (
-            nick TEXT,
-            lock_type TEXT,
-            success_count INTEGER,
-            fail_count INTEGER,
-            total_time FLOAT
-        );
-    """)
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS processed_logs (
-            filename TEXT PRIMARY KEY
-        );
-    """)
-    conn.commit()
-    conn.close()
-    print("[DEBUG] Baza danych zainicjalizowana")
+DB_CONFIG = { "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech", "dbname": "neondb", "user": "neondb_owner", "password": "npg_dRU1YCtxbh6v", "sslmode": "require" }
 
-# Parsowanie pojedynczego wpisu
-def parse_log_content(content):
-    entries = []
-    pattern = re.compile(
-        r"User: (?P<nick>.*?) \(\d+, \d+\)\. Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>\d+\.\d+)\. Failed attempts: (?P<failed>\d+).*?Lock type: (?P<lock_type>\w+)",
-        re.MULTILINE
-    )
+def create_stats_table(): with psycopg2.connect(**DB_CONFIG) as conn: with conn.cursor() as cur: cur.execute(""" CREATE TABLE IF NOT EXISTS lockpick_stats ( nick TEXT, lock_type TEXT, total_attempts INTEGER, successes INTEGER, failures INTEGER, average_time FLOAT ) """) conn.commit() print("[DB] Tabela lockpick_stats sprawdzona lub utworzona.")
 
-    for match in pattern.finditer(content):
-        entries.append({
-            "nick": match.group("nick").strip(),
-            "success": match.group("success") == "Yes",
-            "time": float(match.group("time")),
-            "lock_type": match.group("lock_type")
-        })
+def insert_stats(stats): with psycopg2.connect(**DB_CONFIG) as conn: with conn.cursor() as cur: for (nick, lock_type), data in stats.items(): total = data['success'] + data['fail'] avg_time = sum(data['times']) / len(data['times']) if data['times'] else 0.0 cur.execute(""" INSERT INTO lockpick_stats (nick, lock_type, total_attempts, successes, failures, average_time) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (nick, lock_type) DO UPDATE SET total_attempts = EXCLUDED.total_attempts, successes = EXCLUDED.successes, failures = EXCLUDED.failures, average_time = EXCLUDED.average_time """, (nick, lock_type, total, data['success'], data['fail'], avg_time)) conn.commit() print("[DB] Wstawiono statystyki do lockpick_stats.")
 
-    return entries
+def parse_log_line(line): match = re.search( r"User: (.?) .?. Success: (Yes|No). Elapsed time: ([\d.]+). Failed attempts: \d+. .*?Lock type: (\w+)", line ) if match: nick = match.group(1) success = match.group(2) == "Yes" time = float(match.group(3)) lock_type = match.group(4) return nick, lock_type, success, time return None
 
-# Pobieranie i przetwarzanie logów z FTP
-def fetch_and_parse_logs():
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
+def generate_stats_table(stats): headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"] rows = [] for (nick, lock_type), data in stats.items(): total = data['success'] + data['fail'] success_rate = f"{(data['success'] / total * 100):.1f}%" if total else "0.0%" avg_time = f"{sum(data['times']) / len(data['times']):.2f}" if data['times'] else "0.00" rows.append([nick, lock_type, str(total), str(data['success']), str(data['fail']), success_rate, avg_time])
 
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    print(f"[OK] Połączono z FTP: {FTP_HOST}:{FTP_PORT}")
+# Znajdź maksymalną szerokość kolumn
+col_widths = [max(len(row[i]) for row in [headers] + rows) for i in range(len(headers))]
+def format_row(row):
+    return " | ".join(cell.center(col_widths[i]) for i, cell in enumerate(row))
 
-    ftp.cwd(LOG_PATH)
-    lines = []
-    ftp.dir(lines.append)
+table = "```
 
-    all_files = [line.split()[-1] for line in lines if "gameplay_" in line and line.endswith(".log")]
-    new_entries = []
+" + format_row(headers) + "\n" + "-+-".join("-" * w for w in col_widths) + "\n" table += "\n".join(format_row(row) for row in rows) + "\n```" return table
 
-    for filename in all_files:
-        cur.execute("SELECT 1 FROM processed_logs WHERE filename = %s", (filename,))
-        if cur.fetchone():
-            print(f"[INFO] Pominięto już przetworzony plik: {filename}")
-            continue
+def send_to_webhook(content): response = requests.post(WEBHOOK_URL, json={"content": content}) if response.status_code == 204: print("[WEBHOOK] Wysłano dane na Discorda.") else: print(f"[WEBHOOK] Błąd wysyłania: {response.status_code} - {response.text}")
 
-        bio = io.BytesIO()
-        try:
-            ftp.retrbinary(f"RETR {filename}", bio.write)
-        except Exception as e:
-            print(f"[ERROR] Nie udało się pobrać pliku {filename}: {e}")
-            continue
+def analyze_logs(): # Przykładowy log log_lines = [ "2025.07.20-13.09.52: [LogMinigame] [LockpickingMinigame_C] User: Anu (26, 76561197992396189). Success: Yes. Elapsed time: 6.63. Failed attempts: 0. Target object: BPLockpick_Weapon_Locker_Military_C(ID: N/A). Lock type: VeryEasy. User owner: N/A. Location: X=229088.922 Y=-437256.875 Z=8386.837", ]
 
-        content = bio.getvalue().decode('utf-16-le', errors='ignore')
-        entries = parse_log_content(content)
-        print(f"[DEBUG] Plik {filename} -> {len(entries)} wpisów")
-
-        if entries:
-            new_entries.extend(entries)
-            cur.execute("INSERT INTO processed_logs (filename) VALUES (%s)", (filename,))
-
-    conn.commit()
-    conn.close()
-    ftp.quit()
-    return new_entries
-
-# Aktualizacja danych w bazie
-def update_database(entries):
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
-
-    stats = defaultdict(lambda: {"success": 0, "fail": 0, "time": 0.0})
-
-    for entry in entries:
-        key = (entry["nick"], entry["lock_type"])
-        if entry["success"]:
+stats = defaultdict(lambda: {"success": 0, "fail": 0, "times": []})
+for line in log_lines:
+    parsed = parse_log_line(line)
+    if parsed:
+        nick, lock_type, success, time = parsed
+        key = (nick, lock_type)
+        if success:
             stats[key]["success"] += 1
         else:
             stats[key]["fail"] += 1
-        stats[key]["time"] += entry["time"]
+        stats[key]["times"].append(time)
+if stats:
+    insert_stats(stats)
+    table = generate_stats_table(stats)
+    send_to_webhook(table)
+else:
+    print("[INFO] Brak rozpoznanych danych w logu.")
 
-    for (nick, lock_type), data in stats.items():
-        cur.execute("""
-            SELECT success_count, fail_count, total_time
-            FROM lockpick_stats
-            WHERE nick = %s AND lock_type = %s
-        """, (nick, lock_type))
-        row = cur.fetchone()
+app = Flask(name)
 
-        if row:
-            new_success = row[0] + data["success"]
-            new_fail = row[1] + data["fail"]
-            new_time = row[2] + data["time"]
-            cur.execute("""
-                UPDATE lockpick_stats
-                SET success_count = %s, fail_count = %s, total_time = %s
-                WHERE nick = %s AND lock_type = %s
-            """, (new_success, new_fail, new_time, nick, lock_type))
-        else:
-            cur.execute("""
-                INSERT INTO lockpick_stats (nick, lock_type, success_count, fail_count, total_time)
-                VALUES (%s, %s, %s, %s, %s)
-            """, (nick, lock_type, data["success"], data["fail"], data["time"]))
+@app.route("/") def index(): return "Alive"
 
-    conn.commit()
-    conn.close()
-    print(f"[OK] Zaktualizowano {len(stats)} rekordów w bazie")
+if name == "main": print("[DEBUG] Uruchamianie aplikacji Flask...") create_stats_table() analyze_logs() port = int(os.environ.get("PORT", 10000)) app.run(host="0.0.0.0", port=port)
 
-# Tworzenie tabeli wyników
-def build_table():
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM lockpick_stats")
-    rows = cur.fetchall()
-    conn.close()
-
-    table_data = []
-    for row in rows:
-        nick, lock_type, succ, fail, total_time = row
-        total = succ + fail
-        effectiveness = f"{succ / total * 100:.1f}%" if total > 0 else "0%"
-        avg_time = f"{total_time / succ:.2f}s" if succ > 0 else "-"
-        table_data.append([nick, lock_type, total, succ, fail, effectiveness, avg_time])
-
-    headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
-    return tabulate(table_data, headers, tablefmt="grid", stralign="center", numalign="center")
-
-# Wysyłka tabeli na Discorda
-def send_to_discord(message):
-    payload = {"content": f"```\n{message}\n```"}
-    response = requests.post(WEBHOOK_URL, json=payload)
-    if response.status_code == 204:
-        print("[OK] Wysłano dane na Discorda")
-    else:
-        print(f"[ERROR] Nie udało się wysłać na Discorda: {response.status_code}")
-
-# Główna pętla
-def main_loop():
-    print("[DEBUG] Start programu")
-    init_db()
-    while True:
-        entries = fetch_and_parse_logs()
-        if entries:
-            print(f"[INFO] Znaleziono {len(entries)} nowych wpisów.")
-            update_database(entries)
-            table = build_table()
-            send_to_discord(table)
-        else:
-            print("[INFO] Brak nowych wpisów.")
-        time.sleep(60)
-
-if __name__ == "__main__":
-    main_loop()
