@@ -1,17 +1,18 @@
-import ftplib
-import io
+import time
 import re
+import io
+from ftplib import FTP, error_perm
 import psycopg2
-import requests
+import psycopg2.extras
+from tabulate import tabulate
 
-# Konfiguracja FTP
+# Konfiguracja FTP i bazy danych
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-FTP_PATH = "/SCUM/Saved/SaveFiles/Logs/"
+FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 
-# Konfiguracja bazy danych PostgreSQL Neon
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -20,219 +21,191 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-# Webhook Discord
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-
-# Regex do parsowania wpisów
-LOG_PATTERN = re.compile(
-    r"User: (?P<nick>.+?) \(.+?\)\. Success: (?P<success>Yes|No)\. "
-    r"Elapsed time: (?P<time>[0-9.]+)\. Failed attempts: \d+\. "
-    r"Target object: .+?\. Lock type: (?P<lock>.+?)\."
+LOG_ENTRY_REGEX = re.compile(
+    r"User: (?P<nick>\S+) \(\d+, \d+\)\. Success: (?P<success>Yes|No)\. "
+    r"Elapsed time: (?P<elapsed>\d+\.\d+)\. Failed attempts: \d+\. "
+    r"Target object: .+?\. Lock type: (?P<lock_type>\S+)\."
 )
 
-def connect_db():
-    conn = psycopg2.connect(
-        host=DB_CONFIG["host"],
-        dbname=DB_CONFIG["dbname"],
-        user=DB_CONFIG["user"],
-        password=DB_CONFIG["password"],
-        sslmode=DB_CONFIG["sslmode"]
-    )
-    return conn
-
-def create_tables(conn):
+# Tworzenie tabeli w bazie
+def create_table(conn):
     with conn.cursor() as cur:
-        # Tabela z historią przetworzonych plików
         cur.execute("""
-            CREATE TABLE IF NOT EXISTS processed_logs (
-                filename TEXT PRIMARY KEY
-            )
+        CREATE TABLE IF NOT EXISTS lockpicking_stats (
+            id SERIAL PRIMARY KEY,
+            nickname TEXT NOT NULL,
+            lock_type TEXT NOT NULL,
+            success BOOLEAN NOT NULL,
+            elapsed_time FLOAT NOT NULL,
+            log_file TEXT NOT NULL,
+            processed_at TIMESTAMP DEFAULT NOW()
+        );
         """)
-        # Tabela ze statystykami lockpicków
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS lockpick_stats (
-                nick TEXT,
-                lock_type TEXT,
-                attempts_total INTEGER,
-                attempts_success INTEGER,
-                attempts_fail INTEGER,
-                time_sum FLOAT,
-                PRIMARY KEY (nick, lock_type)
-            )
-        """)
-    conn.commit()
+        conn.commit()
+    print("[DEBUG] Tabela lockpicking_stats sprawdzona/utworzona.")
 
-def list_files_ftp(ftp):
+# Pobranie listy plików gameplay_*.log z FTP bez NLST (obsługa błędu)
+def ftp_list_files(ftp, path):
     files = []
-    lines = []
-    ftp.retrlines('LIST', lines.append)
-    for line in lines:
-        parts = line.split(maxsplit=8)
-        if len(parts) == 9:
-            filename = parts[8]
-            files.append(filename)
+    try:
+        # Spróbuj MLSD - nowocześniejsze
+        entries = list(ftp.mlsd(path))
+        for name, facts in entries:
+            if name.startswith("gameplay_") and name.endswith(".log"):
+                files.append(name)
+    except (error_perm, AttributeError):
+        # MLSD niedostępne - fallback na LIST + filtrowanie
+        lines = []
+        ftp.retrlines(f"LIST {path}", lines.append)
+        for line in lines:
+            parts = line.split()
+            if len(parts) >= 9:
+                fname = parts[-1]
+                if fname.startswith("gameplay_") and fname.endswith(".log"):
+                    files.append(fname)
     return files
 
-def is_log_processed(conn, filename):
-    with conn.cursor() as cur:
-        cur.execute("SELECT 1 FROM processed_logs WHERE filename=%s", (filename,))
-        return cur.fetchone() is not None
-
-def mark_log_processed(conn, filename):
-    with conn.cursor() as cur:
-        cur.execute("INSERT INTO processed_logs(filename) VALUES(%s) ON CONFLICT DO NOTHING", (filename,))
-    conn.commit()
-
-def download_log_file(ftp, filename):
+# Pobranie pliku i odczyt z kodowaniem UTF-16 LE
+def ftp_download_file(ftp, filepath):
     bio = io.BytesIO()
-    ftp.retrbinary(f"RETR {filename}", bio.write)
+    ftp.retrbinary(f"RETR {filepath}", bio.write)
     bio.seek(0)
-    content_bytes = bio.read()
-    # Dekodowanie UTF-16 LE
-    content = content_bytes.decode('utf-16le')
+    content = bio.read().decode("utf-16-le")
     return content
 
+# Parsowanie zawartości pliku logu - zwraca listę słowników
 def parse_log_content(content):
     entries = []
     for line in content.splitlines():
-        if "[LogMinigame] [LockpickingMinigame_C]" in line:
-            match = LOG_PATTERN.search(line)
-            if match:
-                nick = match.group("nick")
-                success = match.group("success") == "Yes"
-                time = float(match.group("time"))
-                lock_type = match.group("lock")
-                entries.append({
-                    "nick": nick,
-                    "success": success,
-                    "time": time,
-                    "lock_type": lock_type
-                })
+        m = LOG_ENTRY_REGEX.search(line)
+        if m:
+            entries.append({
+                "nickname": m.group("nick"),
+                "lock_type": m.group("lock_type"),
+                "success": m.group("success") == "Yes",
+                "elapsed_time": float(m.group("elapsed"))
+            })
     return entries
 
-def update_stats(conn, entries):
+# Zapis do bazy danych
+def save_entries(conn, entries, log_file):
     with conn.cursor() as cur:
         for e in entries:
-            # Pobierz aktualne statystyki
+            # Zapytanie INSERT, bez duplikatów na poziomie aplikacji
             cur.execute("""
-                SELECT attempts_total, attempts_success, attempts_fail, time_sum
-                FROM lockpick_stats
-                WHERE nick=%s AND lock_type=%s
-            """, (e["nick"], e["lock_type"]))
-            row = cur.fetchone()
-            if row:
-                attempts_total, attempts_success, attempts_fail, time_sum = row
-                attempts_total += 1
-                attempts_success += 1 if e["success"] else 0
-                attempts_fail += 0 if e["success"] else 1
-                time_sum += e["time"]
-                cur.execute("""
-                    UPDATE lockpick_stats
-                    SET attempts_total=%s, attempts_success=%s, attempts_fail=%s, time_sum=%s
-                    WHERE nick=%s AND lock_type=%s
-                """, (attempts_total, attempts_success, attempts_fail, time_sum, e["nick"], e["lock_type"]))
-            else:
-                attempts_total = 1
-                attempts_success = 1 if e["success"] else 0
-                attempts_fail = 0 if e["success"] else 1
-                time_sum = e["time"]
-                cur.execute("""
-                    INSERT INTO lockpick_stats (nick, lock_type, attempts_total, attempts_success, attempts_fail, time_sum)
-                    VALUES (%s, %s, %s, %s, %s, %s)
-                """, (e["nick"], e["lock_type"], attempts_total, attempts_success, attempts_fail, time_sum))
-    conn.commit()
+                INSERT INTO lockpicking_stats (nickname, lock_type, success, elapsed_time, log_file)
+                VALUES (%s, %s, %s, %s, %s)
+                ON CONFLICT DO NOTHING
+            """, (e["nickname"], e["lock_type"], e["success"], e["elapsed_time"], log_file))
+        conn.commit()
 
-def generate_markdown_table(conn):
+# Sprawdzenie, czy plik został już przetworzony (na podstawie istnienia wpisu w bazie)
+def is_file_processed(conn, log_file):
     with conn.cursor() as cur:
+        cur.execute("SELECT 1 FROM lockpicking_stats WHERE log_file = %s LIMIT 1", (log_file,))
+        return cur.fetchone() is not None
+
+# Pobranie agregowanych danych z bazy do tabeli
+def fetch_aggregated_stats(conn):
+    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
         cur.execute("""
-            SELECT nick, lock_type, attempts_total, attempts_success, attempts_fail, 
-                   CASE WHEN attempts_total>0 THEN ROUND(100.0*attempts_success/attempts_total,2) ELSE 0 END AS efficiency,
-                   CASE WHEN attempts_total>0 THEN ROUND(time_sum/attempts_total,2) ELSE 0 END AS avg_time
-            FROM lockpick_stats
-            ORDER BY nick, lock_type
+        SELECT
+            nickname,
+            lock_type,
+            COUNT(*) AS attempts,
+            SUM(CASE WHEN success THEN 1 ELSE 0 END) AS success_count,
+            SUM(CASE WHEN NOT success THEN 1 ELSE 0 END) AS fail_count,
+            ROUND(100.0 * SUM(CASE WHEN success THEN 1 ELSE 0 END) / COUNT(*), 2) AS efficiency,
+            ROUND(AVG(elapsed_time), 2) AS avg_elapsed_time
+        FROM lockpicking_stats
+        GROUP BY nickname, lock_type
+        ORDER BY nickname, lock_type
         """)
-        rows = cur.fetchall()
+        return cur.fetchall()
 
-    # Przygotowanie szerokości kolumn
-    headers = ["Nick", "Zamek", "Próby", "Udane", "Nieudane", "Skuteczność (%)", "Śr. czas"]
-    cols = list(zip(*([headers] + rows)))
-    col_widths = [max(len(str(x)) for x in col) for col in cols]
+# Wyświetlanie tabeli w konsoli
+def display_stats_table(rows):
+    if not rows:
+        print("[INFO] Brak danych do wyświetlenia.")
+        return
+    headers = ["Nick", "Lock Type", "Attempts", "Success", "Fail", "Efficiency [%]", "Avg Time [s]"]
+    table = []
+    for r in rows:
+        table.append([
+            r["nickname"],
+            r["lock_type"],
+            r["attempts"],
+            r["success_count"],
+            r["fail_count"],
+            r["efficiency"],
+            r["avg_elapsed_time"]
+        ])
+    print(tabulate(table, headers=headers, tablefmt="grid", stralign="center"))
 
-    # Generowanie tabeli Markdown z wyśrodkowaniem
-    def center_text(text, width):
-        text = str(text)
-        padding = width - len(text)
-        left_pad = padding // 2
-        right_pad = padding - left_pad
-        return " " * left_pad + text + " " * right_pad
-
-    header_line = "| " + " | ".join(center_text(h, w) for h, w in zip(headers, col_widths)) + " |"
-    sep_line = "|-" + "-|-".join("-" * w for w in col_widths) + "-|"
-    rows_lines = []
-    for row in rows:
-        rows_lines.append("| " + " | ".join(center_text(c, w) for c, w in zip(row, col_widths)) + " |")
-
-    table = "\n".join([header_line, sep_line] + rows_lines)
-    return table
-
-def print_table_console(table_text):
-    print("[TABLE]")
-    print(table_text)
-    print("[/TABLE]")
-
-def send_table_webhook(table_text):
-    data = {"content": f"```\n{table_text}\n```"}
-    resp = requests.post(WEBHOOK_URL, json=data)
-    if resp.status_code == 204:
-        print("[INFO] Wysłano tabelę na webhook.")
-    else:
-        print(f"[ERROR] Błąd wysyłki webhook: {resp.status_code} {resp.text}")
-
+# Główna funkcja programu
 def main():
     print("[DEBUG] Start programu")
+    # Połączenie z FTP
+    ftp = FTP()
     try:
-        conn = connect_db()
-        create_tables(conn)
-
-        ftp = ftplib.FTP()
-        ftp.connect(FTP_HOST, FTP_PORT)
+        ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
         ftp.login(FTP_USER, FTP_PASS)
-        ftp.cwd(FTP_PATH)
-
-        all_files = list_files_ftp(ftp)
-        log_files = [f for f in all_files if f.startswith("gameplay_") and f.endswith(".log")]
-
-        print(f"[DEBUG] Znaleziono plików: {len(log_files)}")
-
-        total_new_entries = 0
-        for filename in log_files:
-            if is_log_processed(conn, filename):
-                print(f"[INFO] Pomijam już przetworzony plik: {filename}")
-                continue
-
-            content = download_log_file(ftp, filename)
-            print(f"[INFO] Przetwarzam plik: {filename}")
-
-            entries = parse_log_content(content)
-            print(f"[DEBUG] {filename} -> {len(entries)} wpisów")
-
-            if entries:
-                update_stats(conn, entries)
-                mark_log_processed(conn, filename)
-                total_new_entries += len(entries)
-
-        if total_new_entries == 0:
-            print("[INFO] Brak nowych wpisów do przetworzenia.")
-        else:
-            table_text = generate_markdown_table(conn)
-            print_table_console(table_text)
-            send_table_webhook(table_text)
-
-        ftp.quit()
-        conn.close()
-
+        print(f"[OK] Połączono z FTP: {FTP_HOST}:{FTP_PORT}")
+        ftp.cwd(FTP_LOG_DIR)
     except Exception as e:
-        print(f"[ERROR] Wystąpił błąd: {e}")
+        print(f"[ERROR] Błąd FTP: {e}")
+        return
+
+    # Połączenie z bazą danych
+    try:
+        conn = psycopg2.connect(**DB_CONFIG)
+        create_table(conn)
+    except Exception as e:
+        print(f"[ERROR] Błąd bazy danych: {e}")
+        return
+
+    # Pobranie listy plików
+    try:
+        files = ftp_list_files(ftp, FTP_LOG_DIR)
+        print(f"[DEBUG] Znaleziono plików: {len(files)}")
+    except Exception as e:
+        print(f"[ERROR] Błąd pobierania listy plików FTP: {e}")
+        return
+
+    new_data = False
+    for filename in sorted(files):
+        if is_file_processed(conn, filename):
+            print(f"[INFO] Pomijam już przetworzony plik: {filename}")
+            continue
+
+        try:
+            full_path = FTP_LOG_DIR + filename
+            content = ftp_download_file(ftp, full_path)
+            entries = parse_log_content(content)
+            print(f"[INFO] Przetwarzam plik: {filename}")
+            print(f"[DEBUG] {filename} -> {len(entries)} wpisów")
+            if entries:
+                save_entries(conn, entries, filename)
+                new_data = True
+            else:
+                print(f"[INFO] Plik {filename} nie zawiera rozpoznanych wpisów.")
+        except Exception as e:
+            print(f"[ERROR] Błąd przetwarzania pliku {filename}: {e}")
+
+    if new_data:
+        print("[INFO] Nowe dane zapisane do bazy. Agreguję i wyświetlam statystyki.")
+        rows = fetch_aggregated_stats(conn)
+        display_stats_table(rows)
+    else:
+        print("[INFO] Brak nowych wpisów do przetworzenia.")
+
+    # Zamknięcie połączeń
+    try:
+        ftp.quit()
+    except:
+        pass
+    conn.close()
+    print("[DEBUG] Koniec programu")
 
 if __name__ == "__main__":
     main()
