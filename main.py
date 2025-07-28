@@ -2,23 +2,23 @@ import os
 import re
 import time
 import ftplib
-import pandas as pd
 import psycopg2
+import pandas as pd
 from tabulate import tabulate
 from flask import Flask
 from io import BytesIO
+from datetime import datetime
+import requests
 
-# Konfiguracja połączenia z FTP
+# --- Konfiguracja FTP i Webhook ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
-
-# Konfiguracja Webhooka
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# Konfiguracja bazy danych PostgreSQL
+# --- Konfiguracja bazy danych PostgreSQL ---
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -27,124 +27,134 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-# Flask keep-alive
+# --- Flask ---
 app = Flask(__name__)
-
-@app.route("/")
+@app.route('/')
 def index():
     return "Alive"
 
-def connect_db():
-    return psycopg2.connect(**DB_CONFIG)
+# --- Funkcje pomocnicze ---
 
-def get_ftp_log_files():
-    print("[DEBUG] Nawiązywanie połączenia FTP...")
+def connect_ftp():
     ftp = ftplib.FTP()
     ftp.connect(FTP_HOST, FTP_PORT)
     ftp.login(FTP_USER, FTP_PASS)
     ftp.cwd(LOG_DIR)
-    files = ftp.nlst()
-    log_files = [f for f in files if f.startswith("gameplay_") and f.endswith(".log")]
-    print(f"[DEBUG] Znaleziono {len(log_files)} plików logów.")
-    return ftp, log_files
+    return ftp
+
+def list_log_files(ftp):
+    files = []
+    ftp.retrlines('LIST', lambda line: files.append(line.split()[-1]))
+    return [f for f in files if f.startswith("gameplay_") and f.endswith(".log")]
 
 def parse_log_content(content):
-    decoded = content.decode("utf-16-le", errors="ignore")
-    pattern = re.compile(
-        r"\[LogMinigame\] \[LockpickingMinigame_C\] User: (?P<nick>\w+).*?Type: (?P<lock>.+?)\..*?Success: (?P<success>Yes|No).*?Elapsed time: (?P<time>[\d.]+)",
-        re.DOTALL
-    )
-    entries = []
-    for match in pattern.finditer(decoded):
-        entries.append({
-            "nick": match.group("nick"),
-            "lock": match.group("lock"),
-            "success": match.group("success") == "Yes",
-            "time": float(match.group("time"))
-        })
-    print(f"[DEBUG] Rozpoznano {len(entries)} wpisów lockpick.")
-    return entries
+    data = []
+    lines = content.splitlines()
+    for line in lines:
+        if "[LogMinigame] [LockpickingMinigame_C]" in line:
+            user_match = re.search(r"User:\s*(\w+)", line)
+            lock_match = re.search(r"Lock:\s*(\w+)", line)
+            success_match = re.search(r"Success:\s*(Yes|No)", line)
+            time_match = re.search(r"Elapsed time:\s*([\d\.]+)", line)
+            if user_match and lock_match and success_match and time_match:
+                data.append({
+                    "Nick": user_match.group(1),
+                    "Zamek": lock_match.group(1),
+                    "Sukces": success_match.group(1) == "Yes",
+                    "Czas": float(time_match.group(1))
+                })
+    return data
 
-def save_entries_to_db(entries):
-    conn = connect_db()
+def save_to_database(data):
+    if not data:
+        return
+    conn = psycopg2.connect(**DB_CONFIG)
     cur = conn.cursor()
     cur.execute("""
-        CREATE TABLE IF NOT EXISTS lockpick_stats (
+        CREATE TABLE IF NOT EXISTS lockpicking (
             nick TEXT,
-            lock TEXT,
-            success BOOLEAN,
-            time FLOAT
+            zamek TEXT,
+            sukces BOOLEAN,
+            czas REAL
         )
     """)
-    for e in entries:
-        cur.execute("INSERT INTO lockpick_stats (nick, lock, success, time) VALUES (%s, %s, %s, %s)",
-                    (e["nick"], e["lock"], e["success"], e["time"]))
+    for entry in data:
+        cur.execute(
+            "INSERT INTO lockpicking (nick, zamek, sukces, czas) VALUES (%s, %s, %s, %s)",
+            (entry["Nick"], entry["Zamek"], entry["Sukces"], entry["Czas"])
+        )
     conn.commit()
     cur.close()
     conn.close()
-    print(f"[DEBUG] Zapisano {len(entries)} wpisów do bazy.")
 
-def generate_stats_table():
-    conn = connect_db()
-    df = pd.read_sql_query("SELECT * FROM lockpick_stats", conn)
+def create_dataframe():
+    conn = psycopg2.connect(**DB_CONFIG)
+    df = pd.read_sql_query("SELECT * FROM lockpicking", conn)
     conn.close()
 
     if df.empty:
         return None
 
-    grouped = df.groupby(["nick", "lock"]).agg(
-        Wszystkie=pd.NamedAgg(column="success", aggfunc="count"),
-        Udane=pd.NamedAgg(column="success", aggfunc="sum"),
-        Nieudane=pd.NamedAgg(column="success", aggfunc=lambda x: (~x).sum()),
-        Skuteczność=pd.NamedAgg(column="success", aggfunc=lambda x: f"{(x.sum() / len(x) * 100):.1f}%"),
-        Średni_czas=pd.NamedAgg(column="time", aggfunc=lambda x: f"{x.mean():.2f}s")
-    ).reset_index()
+    summary = (
+        df.groupby(['Nick', 'Zamek'])
+        .agg(
+            Proby=('Sukces', 'count'),
+            Udane=('Sukces', lambda x: x.sum()),
+            Nieudane=('Sukces', lambda x: (~x).sum()),
+            Skutecznosc=('Sukces', lambda x: f"{(x.sum() / len(x)) * 100:.1f}%"),
+            SredniCzas=('Czas', 'mean')
+        )
+        .reset_index()
+    )
 
-    grouped.columns = ["Nick", "Zamek", "Wszystkie", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
-    table = tabulate(grouped, headers="keys", tablefmt="github", stralign="center", numalign="center")
-    return table
+    summary['SredniCzas'] = summary['SredniCzas'].map(lambda x: f"{x:.2f}s")
+    return summary
 
-def send_webhook_message(table):
-    if table is None:
+def format_table(df):
+    df_centered = df.applymap(lambda x: str(x).center(len(str(x)) + 2))
+    return "```\n" + tabulate(df_centered, headers="keys", tablefmt="github") + "\n```"
+
+def print_table_to_console(df):
+    print("[DEBUG] Tabela wyników:")
+    print(tabulate(df, headers="keys", tablefmt="grid", showindex=False))
+
+def send_to_discord(df):
+    if df is None or df.empty:
         print("[DEBUG] Brak danych do wysłania.")
         return
-    payload = {"content": f"```\n{table}\n```"}
-    import requests
+    message = format_table(df)
+    print_table_to_console(df)
+    payload = {"content": message}
     response = requests.post(WEBHOOK_URL, json=payload)
-    print(f"[DEBUG] Wysłano dane do webhooka: {response.status_code}")
+    if response.status_code == 204:
+        print("[INFO] Tabela wysłana do Discorda.")
+    else:
+        print(f"[ERROR] Nie udało się wysłać do Discorda: {response.status_code}")
 
-def process_logs():
-    ftp, log_files = get_ftp_log_files()
-    processed = 0
-    for fname in log_files:
-        with BytesIO() as bio:
-            ftp.retrbinary(f"RETR {fname}", bio.write)
-            bio.seek(0)
-            content = bio.read()
-            entries = parse_log_content(content)
-            if entries:
-                save_entries_to_db(entries)
-                processed += 1
-    ftp.quit()
-    print(f"[DEBUG] Przetworzono {processed} plików logów.")
-    return processed > 0
-
+# --- Główna pętla przetwarzania ---
 def main_loop():
     print("[DEBUG] Start programu")
-    if process_logs():
-        table = generate_stats_table()
-        send_webhook_message(table)
-    else:
-        print("[DEBUG] Brak nowych danych.")
+    try:
+        print("[DEBUG] Nawiązywanie połączenia FTP...")
+        ftp = connect_ftp()
+        log_files = list_log_files(ftp)
+        print(f"[DEBUG] Znaleziono plików: {len(log_files)}")
+        all_data = []
+        for filename in log_files:
+            print(f"[DEBUG] Przetwarzanie: {filename}")
+            buffer = BytesIO()
+            ftp.retrbinary(f"RETR {filename}", buffer.write)
+            content = buffer.getvalue().decode("utf-16-le", errors="ignore")
+            data = parse_log_content(content)
+            all_data.extend(data)
+        ftp.quit()
+        print(f"[DEBUG] Wszystkich wpisów: {len(all_data)}")
+        save_to_database(all_data)
+        df = create_dataframe()
+        send_to_discord(df)
+    except Exception as e:
+        print(f"[ERROR] Wystąpił błąd: {e}")
 
 if __name__ == "__main__":
-    from threading import Thread
-    t = Thread(target=lambda: app.run(host="0.0.0.0", port=3000))
-    t.start()
-
-    while True:
-        try:
-            main_loop()
-        except Exception as e:
-            print(f"[ERROR] Wystąpił błąd: {e}")
-        time.sleep(60)
+    main_loop()
+    app.run(host="0.0.0.0", port=3000)
