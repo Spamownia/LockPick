@@ -1,17 +1,19 @@
-import ftplib
+import os
 import io
 import re
+import ftplib
 import psycopg2
 import requests
 from collections import defaultdict
 
-# Dane dostępowe do FTP
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
+FTP_LOG_PATH = "/SCUM/Saved/SaveFiles/Logs/"
 
-# Dane dostępowe do PostgreSQL (Neon)
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
@@ -20,128 +22,131 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-# Webhook Discord
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# Parsowanie danych z logów
+def download_logs():
+    entries = []
+    with ftplib.FTP() as ftp:
+        print("[DEBUG] Connecting to FTP...")
+        ftp.connect(FTP_HOST, FTP_PORT)
+        ftp.login(FTP_USER, FTP_PASS)
+        ftp.cwd(FTP_LOG_PATH)
+
+        files = []
+        ftp.retrlines("LIST", lambda x: files.append(x))
+        log_filenames = [line.split()[-1] for line in files if line.split()[-1].startswith("gameplay_")]
+
+        print(f"[DEBUG] Found {len(log_filenames)} gameplay logs")
+
+        for filename in log_filenames:
+            print(f"[DEBUG] Downloading {filename}...")
+            bio = io.BytesIO()
+            ftp.retrbinary(f"RETR {filename}", bio.write)
+            content = bio.getvalue().decode("utf-16-le", errors="ignore")
+            parsed = parse_log_content(content)
+            entries.extend(parsed)
+            print(f"[DEBUG] Parsed {len(parsed)} entries from {filename}")
+
+    return entries
+
+
 def parse_log_content(content):
     pattern = re.compile(
-        r'User:\s+(.*?)\s+\(.*?\)\.\s+Success:\s+(Yes|No)\.\s+Elapsed time:\s+([\d.]+)\.\s+Failed attempts:\s+(\d+).*?Lock type:\s+(.*?)\.',
-        re.MULTILINE
+        r"User: (?P<nick>.+?) \(\d+, \d+\)\. Success: (?P<success>Yes|No)\. Elapsed time: (?P<elapsed>\d+\.\d+)"
+        r"\. Failed attempts: (?P<fails>\d+).+?Lock type: (?P<locktype>\w+)", re.DOTALL
     )
-    results = []
-
+    entries = []
     for match in pattern.finditer(content):
-        nick = match.group(1)
-        success = match.group(2) == 'Yes'
-        elapsed = float(match.group(3).rstrip('.'))
-        fails = int(match.group(4))
-        locktype = match.group(5)
-
-        results.append({
-            "nick": nick,
-            "success": success,
-            "elapsed": elapsed,
-            "fails": fails,
-            "locktype": locktype
+        entries.append({
+            "nick": match.group("nick"),
+            "success": match.group("success") == "Yes",
+            "elapsed": float(match.group("elapsed")),
+            "fails": int(match.group("fails")),
+            "locktype": match.group("locktype")
         })
-    return results
+    return entries
 
-# Zapis danych do bazy PostgreSQL
+
 def save_to_db(entries):
     with psycopg2.connect(**DB_CONFIG) as conn:
         with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS lockpicking_logs (
-                    id SERIAL PRIMARY KEY,
-                    nick TEXT,
-                    locktype TEXT,
-                    success BOOLEAN,
-                    elapsed FLOAT,
-                    fails INTEGER
-                );
-            """)
+            cur.execute("CREATE TABLE IF NOT EXISTS lockpicking_logs (id SERIAL PRIMARY KEY);")
+            required_columns = {
+                "nick": "TEXT",
+                "locktype": "TEXT",
+                "success": "BOOLEAN",
+                "elapsed": "FLOAT",
+                "fails": "INTEGER"
+            }
+            for col, coltype in required_columns.items():
+                try:
+                    cur.execute(f"ALTER TABLE lockpicking_logs ADD COLUMN {col} {coltype};")
+                except psycopg2.errors.DuplicateColumn:
+                    conn.rollback()
+
             for e in entries:
                 cur.execute("""
                     INSERT INTO lockpicking_logs (nick, locktype, success, elapsed, fails)
                     VALUES (%s, %s, %s, %s, %s);
                 """, (e["nick"], e["locktype"], e["success"], e["elapsed"], e["fails"]))
         conn.commit()
+        print(f"[DEBUG] Saved {len(entries)} entries to DB")
 
-# Pobieranie i przetwarzanie logów z FTP
-def fetch_and_parse_logs():
-    print("[DEBUG] Start programu")
-    all_entries = []
-    with ftplib.FTP() as ftp:
-        ftp.connect(FTP_HOST, FTP_PORT)
-        ftp.login(FTP_USER, FTP_PASS)
-        print(f"[OK] Połączono z FTP: {FTP_HOST}:{FTP_PORT}")
-        ftp.cwd("/SCUM/Saved/SaveFiles/Logs/")
-        filenames = []
-        ftp.retrlines('LIST', lambda line: filenames.append(line.split()[-1]))
-        log_files = [f for f in filenames if f.startswith("gameplay_") and f.endswith(".log")]
-        print(f"[INFO] Znaleziono {len(log_files)} plików gameplay_*.log")
 
-        for filename in log_files:
-            print(f"[INFO] Przetwarzanie: {filename}")
-            bio = io.BytesIO()
-            ftp.retrbinary(f"RETR {filename}", bio.write)
-            content = bio.getvalue().decode("utf-16-le", errors="ignore")
-            parsed = parse_log_content(content)
-            print(f"[DEBUG] Rozpoznano {len(parsed)} wpisów")
-            all_entries.extend(parsed)
+def fetch_summary():
+    with psycopg2.connect(**DB_CONFIG) as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT nick, locktype,
+                       COUNT(*) AS total,
+                       COUNT(*) FILTER (WHERE success) AS successes,
+                       COUNT(*) FILTER (WHERE NOT success) AS failures,
+                       ROUND(100.0 * COUNT(*) FILTER (WHERE success) / NULLIF(COUNT(*), 0), 2) AS accuracy,
+                       ROUND(AVG(elapsed), 2) AS avg_time
+                FROM lockpicking_logs
+                GROUP BY nick, locktype
+                ORDER BY nick, locktype;
+            """)
+            return cur.fetchall()
 
-    return all_entries
 
-# Generowanie i wysyłka tabeli
-def generate_table(entries):
-    grouped = defaultdict(list)
-    for e in entries:
-        key = (e["nick"], e["locktype"])
-        grouped[key].append(e)
-
+def format_table(data):
     headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
-    table = [headers]
+    col_widths = [len(h) for h in headers]
 
-    for (nick, locktype), records in grouped.items():
-        total = len(records)
-        success = sum(1 for r in records if r["success"])
-        fails = total - success
-        avg_time = sum(r["elapsed"] for r in records if r["success"]) / success if success else 0
-        acc = f"{(success / total * 100):.1f}%" if total else "0%"
-        table.append([
-            nick,
-            locktype,
-            str(total),
-            str(success),
-            str(fails),
-            acc,
-            f"{avg_time:.2f}s"
-        ])
+    rows = []
+    for row in data:
+        str_row = [str(v) for v in row]
+        for i, v in enumerate(str_row):
+            col_widths[i] = max(col_widths[i], len(v))
+        rows.append(str_row)
 
-    # Wyśrodkowanie i formatowanie kolumn
-    col_widths = [max(len(row[i]) for row in table) for i in range(len(headers))]
-    formatted = ""
-    for row in table:
-        formatted += " | ".join(f"{cell.center(col_widths[i])}" for i, cell in enumerate(row)) + "\n"
+    def format_row(r):
+        return " | ".join(v.center(col_widths[i]) for i, v in enumerate(r))
 
-    return f"```\n{formatted}```"
+    header_line = format_row(headers)
+    separator = "-+-".join("-" * w for w in col_widths)
+    lines = [header_line, separator] + [format_row(r) for r in rows]
+    return "```\n" + "\n".join(lines) + "\n```"
 
-# Wysyłanie danych do Discorda
-def send_to_discord(message):
-    data = {"content": message}
-    response = requests.post(WEBHOOK_URL, json=data)
-    if response.status_code != 204:
-        print(f"[ERROR] Wysyłka do Discord nie powiodła się: {response.status_code}")
-    else:
-        print("[OK] Wysłano wiadomość na Discord")
 
-# Główna pętla
-if __name__ == "__main__":
-    entries = fetch_and_parse_logs()
+def send_to_discord(table_text):
+    print("[DEBUG] Sending summary to Discord...")
+    response = requests.post(WEBHOOK_URL, json={"content": table_text})
+    print(f"[DEBUG] Discord response: {response.status_code}")
+
+
+def main():
+    print("[DEBUG] Start main()")
+    entries = download_logs()
     if not entries:
-        print("[INFO] Brak rozpoznanych wpisów w logach.")
-    else:
-        save_to_db(entries)
-        message = generate_table(entries)
-        send_to_discord(message)
+        print("[DEBUG] No entries parsed.")
+        return
+    save_to_db(entries)
+    summary = fetch_summary()
+    table_text = format_table(summary)
+    send_to_discord(table_text)
+    print("[DEBUG] Done.")
+
+
+if __name__ == "__main__":
+    main()
