@@ -1,202 +1,80 @@
-import os
-import time
-import re
-import pandas as pd
-import psycopg2
-import requests
-from tabulate import tabulate
-from flask import Flask
-from ftplib import FTP
-from io import BytesIO
+import os import re import time import ftplib import psycopg2 import pandas as pd from tabulate import tabulate from datetime import datetime from flask import Flask import requests
 
-# Konfiguracja bazy danych Neon
-DB_CONFIG = {
-    'host': "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
-    'dbname': "neondb",
-    'user': "neondb_owner",
-    'password': "npg_dRU1YCtxbh6v",
-    'sslmode': "require"
-}
+Konfiguracja FTP i DB
 
-# Konfiguracja FTP
-FTP_HOST = "176.57.174.10"
-FTP_PORT = 50021
-FTP_USER = "gpftp37275281717442833"
-FTP_PASS = "LXNdGShY"
-FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+FTP_HOST = "176.57.174.10" FTP_PORT = 50021 FTP_USER = "gpftp37275281717442833" FTP_PASS = "LXNdGShY" FTP_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 
-# Webhook Discord
+DB_CONFIG = { "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech", "dbname": "neondb", "user": "neondb_owner", "password": "npg_dRU1YCtxbh6v", "sslmode": "require", }
+
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# Globalne ID ostatnio przetworzonej linii
-last_log_line_id = None
+app = Flask(name)
 
+@app.route('/') def index(): return "Alive"
 
-def connect_db():
-    return psycopg2.connect(**DB_CONFIG)
+def connect_db(): return psycopg2.connect(**DB_CONFIG)
 
+def initialize_db(): with connect_db() as conn: with conn.cursor() as cur: cur.execute(""" CREATE TABLE IF NOT EXISTS lockpicking_stats ( id SERIAL PRIMARY KEY, nick TEXT, lock_type TEXT, success BOOLEAN, elapsed_time FLOAT, timestamp TIMESTAMP ) """) conn.commit() print("[DEBUG] Baza danych gotowa.")
 
-def init_db():
-    with connect_db() as conn, conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS lockpick_logs (
-                id SERIAL PRIMARY KEY,
-                nick TEXT,
-                lock TEXT,
-                success BOOLEAN,
-                time FLOAT,
-                UNIQUE(nick, lock, success, time)
-            );
-        """)
-        conn.commit()
+def list_log_files(ftp): ftp.cwd(FTP_DIR) files = [] ftp.retrlines("LIST", lambda line: files.append(line.split()[-1])) return sorted([f for f in files if f.startswith("gameplay_") and f.endswith(".log")])
 
+def download_log_file(ftp, filename): from io import BytesIO bio = BytesIO() ftp.retrbinary(f"RETR {filename}", bio.write) bio.seek(0) return bio.read().decode("utf-16le", errors="ignore")
 
-def parse_log_entries(content):
-    pattern = re.compile(
-        r"User:\s*(?P<nick>\w+).*?Type:\s*(?P<lock>\w+).*?Success:\s*(?P<success>Yes|No).*?Elapsed time:\s*(?P<time>\d+\.\d+)",
-        re.DOTALL
-    )
-    matches = pattern.findall(content)
-    return [
-        {
-            "nick": match[0],
-            "lock": match[1],
-            "success": match[2] == "Yes",
-            "time": float(match[3])
-        }
-        for match in matches
-    ]
+def parse_log_content(content): entries = [] pattern = re.compile(r"\[LogMinigame] \[LockpickingMinigame_C] User: (.?) .?Type: (.?) .?Success: (Yes|No).*?Elapsed time: ([\d.]+)") for match in pattern.finditer(content): nick, lock_type, success, elapsed = match.groups() entries.append({ "nick": nick.strip(), "lock_type": lock_type.strip(), "success": success == "Yes", "elapsed_time": float(elapsed), "timestamp": datetime.utcnow() }) return entries
 
+def insert_new_entries(entries): new_count = 0 if not entries: return 0 with connect_db() as conn: with conn.cursor() as cur: for entry in entries: cur.execute(""" SELECT 1 FROM lockpicking_stats WHERE nick = %s AND lock_type = %s AND success = %s AND elapsed_time = %s ORDER BY id DESC LIMIT 1 """, (entry["nick"], entry["lock_type"], entry["success"], entry["elapsed_time"])) if cur.fetchone() is None: cur.execute(""" INSERT INTO lockpicking_stats (nick, lock_type, success, elapsed_time, timestamp) VALUES (%s, %s, %s, %s, %s) """, (entry["nick"], entry["lock_type"], entry["success"], entry["elapsed_time"], entry["timestamp"])) new_count += 1 conn.commit() return new_count
 
-def fetch_latest_log():
-    ftp = FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(FTP_LOG_DIR)
+def create_dataframe(): with connect_db() as conn: df = pd.read_sql_query("SELECT * FROM lockpicking_stats", conn) if df.empty: return "Brak danych." grouped = df.groupby(["nick", "lock_type"]).agg( total_attempts=pd.NamedAgg(column="success", aggfunc="count"), successes=pd.NamedAgg(column="success", aggfunc="sum"), failures=pd.NamedAgg(column="success", aggfunc=lambda x: (~x).sum()), effectiveness=pd.NamedAgg(column="success", aggfunc="mean"), avg_time=pd.NamedAgg(column="elapsed_time", aggfunc="mean") ).reset_index() grouped["effectiveness"] = (grouped["effectiveness"] * 100).round(1).astype(str) + "%" grouped["avg_time"] = grouped["avg_time"].round(2) return tabulate(grouped, headers=["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"], tablefmt="github", stralign="center", numalign="center")
 
-    filenames = []
-    ftp.retrlines("MLSD", lambda line: filenames.append(line))
-    log_files = [line.split(";")[-1].strip() for line in filenames if "gameplay_" in line]
-    log_files.sort(reverse=True)
-    latest_file = log_files[0]
+def send_to_discord(table_text): payload = {"content": f"``` {table_text}
 
-    buffer = BytesIO()
-    ftp.retrbinary(f"RETR {latest_file}", buffer.write)
-    ftp.quit()
-
-    return latest_file, buffer.getvalue().decode("utf-16-le", errors="ignore")
-
-
-def insert_new_logs(entries):
-    new_entries = 0
-    with connect_db() as conn, conn.cursor() as cur:
-        for entry in entries:
-            try:
-                cur.execute("""
-                    INSERT INTO lockpick_logs (nick, lock, success, time)
-                    VALUES (%s, %s, %s, %s)
-                    ON CONFLICT DO NOTHING;
-                """, (entry['nick'], entry['lock'], entry['success'], entry['time']))
-                new_entries += cur.rowcount
-        conn.commit()
-    return new_entries
-
-
-def create_dataframe():
-    with connect_db() as conn:
-        df = pd.read_sql_query("SELECT * FROM lockpick_logs;", conn)
-
-    if df.empty:
-        return None
-
-    summary = (
-        df.groupby(['nick', 'lock'])
-        .agg(
-            attempts=('success', 'count'),
-            successes=('success', 'sum'),
-            failures=('success', lambda x: (~x).sum()),
-            avg_time=('time', 'mean')
-        )
-        .reset_index()
-    )
-    summary['accuracy'] = (summary['successes'] / summary['attempts'] * 100).round(2)
-
-    summary = summary.rename(columns={
-        'nick': 'Nick',
-        'lock': 'Zamek',
-        'attempts': 'Ilość wszystkich prób',
-        'successes': 'Udane',
-        'failures': 'Nieudane',
-        'accuracy': 'Skuteczność (%)',
-        'avg_time': 'Średni czas'
-    })
-
-    return summary
-
-
-def send_to_discord(df):
-    table = tabulate(df, headers='keys', tablefmt='grid', stralign="center", numalign="center")
-    message = f"```\n{table}\n```"
-    requests.post(WEBHOOK_URL, json={"content": message})
-
+response = requests.post(WEBHOOK_URL, json=payload)
+    print("[DEBUG] Webhook status:", response.status_code)
 
 def main_loop():
-    global last_log_line_id
-    print("[DEBUG] Start programu")
-
+    print("[DEBUG] Start main_loop")
+    last_log = ""
+    last_content = ""
     while True:
         try:
-            print("[DEBUG] Sprawdzanie nowego logu...")
-            filename, content = fetch_latest_log()
+            print("[DEBUG] Iteracja pętli o", datetime.utcnow())
+            with ftplib.FTP() as ftp:
+                ftp.connect(FTP_HOST, FTP_PORT)
+                ftp.login(FTP_USER, FTP_PASS)
+                log_files = list_log_files(ftp)
+                if not log_files:
+                    print("[DEBUG] Brak plików gameplay_*.log")
+                    time.sleep(60)
+                    continue
 
-            if not content:
-                print("[DEBUG] Log pusty lub niepobrany.")
-                time.sleep(60)
-                continue
+                newest_log = log_files[-1]
+                if newest_log != last_log:
+                    print(f"[DEBUG] Nowy plik logu: {newest_log}")
+                    last_log = newest_log
+                    last_content = ""
 
-            current_line_id = hash(content)
-            if current_line_id == last_log_line_id:
-                print("[DEBUG] Brak nowych wpisów w logu.")
-                time.sleep(60)
-                continue
+                content = download_log_file(ftp, newest_log)
+                if content == last_content:
+                    print("[DEBUG] Brak nowych wpisów w logu.")
+                    time.sleep(60)
+                    continue
 
-            entries = parse_log_entries(content)
-            print(f"[DEBUG] Rozpoznano {len(entries)} wpisów.")
+                entries = parse_log_content(content)
+                new_count = insert_new_entries(entries)
+                if new_count:
+                    print(f"[DEBUG] Dodano {new_count} nowych wpisów.")
+                    table = create_dataframe()
+                    send_to_discord(table)
+                else:
+                    print("[DEBUG] Nie znaleziono nowych wpisów do dodania.")
 
-            if not entries:
-                print("[DEBUG] Brak rozpoznanych wpisów w ostatnim pliku.")
-                last_log_line_id = current_line_id
-                time.sleep(60)
-                continue
-
-            new_count = insert_new_logs(entries)
-            print(f"[DEBUG] Dodano {new_count} nowych wpisów do bazy.")
-
-            if new_count > 0:
-                df = create_dataframe()
-                if df is not None:
-                    send_to_discord(df)
-                    print("[DEBUG] Tabela wysłana na webhook.")
-            else:
-                print("[DEBUG] Brak nowych unikalnych wpisów.")
-
-            last_log_line_id = current_line_id
-
+                last_content = content
         except Exception as e:
-            print(f"[ERROR] Wystąpił błąd: {e}")
-
+            print(f"[ERROR] {e}")
         time.sleep(60)
 
-
-# Flask do pingowania
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Alive"
-
-if __name__ == '__main__':
-    init_db()
-    import threading
-    threading.Thread(target=main_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=3000)
+if __name__ == "__main__":
+    initialize_db()
+    main_loop()
+    app.run(host='
+    0.0.0.0', port=3000)
