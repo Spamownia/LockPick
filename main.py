@@ -1,28 +1,21 @@
 import os
-import time
 import re
+import time
+import ftplib
 import psycopg2
 import pandas as pd
-from tabulate import tabulate
-from flask import Flask
-from datetime import datetime
-from ftplib import FTP
+import datetime
 import requests
-
-# --- Flask keep-alive ---
-app = Flask(__name__)
-
-@app.route('/')
-def index():
-    return "Alive"
+from io import StringIO
+from flask import Flask
+from tabulate import tabulate
 
 # --- Konfiguracja ---
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
-
+FTP_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 DB_CONFIG = {
@@ -33,145 +26,161 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-# --- Baza danych ---
+CHECK_INTERVAL = 60  # seconds
+PROCESSED_FILES = set()
+
+app = Flask(__name__)
+
+@app.route('/')
+def index():
+    return "Alive"
+
+def connect_db():
+    return psycopg2.connect(**DB_CONFIG)
+
 def init_db():
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lockpicking (
-            nick TEXT,
-            castle TEXT,
-            success BOOLEAN,
-            elapsed_time FLOAT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS lockpick_stats (
+                    nick TEXT,
+                    lock_type TEXT,
+                    success BOOLEAN,
+                    elapsed_time FLOAT,
+                    timestamp TIMESTAMPTZ DEFAULT now()
+                )
+            """)
+            conn.commit()
 
-def insert_data(rows):
-    conn = psycopg2.connect(**DB_CONFIG)
-    cur = conn.cursor()
-    for row in rows:
-        cur.execute("""
-            INSERT INTO lockpicking (nick, castle, success, elapsed_time)
-            VALUES (%s, %s, %s, %s)
-        """, row)
-    conn.commit()
-    cur.close()
-    conn.close()
+def get_ftp_file_list():
+    with ftplib.FTP() as ftp:
+        ftp.connect(FTP_HOST, FTP_PORT)
+        ftp.login(FTP_USER, FTP_PASS)
+        ftp.cwd(FTP_DIR)
+        files = []
+        ftp.retrlines("LIST", lambda line: files.append(line.split()[-1]))
+        return [f for f in files if f.startswith("gameplay_") and f.endswith(".log")]
 
-# --- Logika FTP ---
-def download_log_files():
-    ftp = FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(LOG_DIR)
-    files = []
-    ftp.retrlines("LIST", lambda line: files.append(line.split()[-1]))
-    log_files = [f for f in files if f.startswith("gameplay_") and f.endswith(".log")]
-    
-    logs = {}
-    for filename in log_files:
-        try:
-            with open(filename, "wb") as f:
-                ftp.retrbinary(f"RETR {filename}", f.write)
-            with open(filename, "r", encoding="utf-16-le") as f:
-                logs[filename] = f.readlines()
-            os.remove(filename)
-        except Exception as e:
-            print(f"[ERROR] Problem z plikiem {filename}: {e}")
-    ftp.quit()
-    return logs
+def download_ftp_file(filename):
+    with ftplib.FTP() as ftp:
+        ftp.connect(FTP_HOST, FTP_PORT)
+        ftp.login(FTP_USER, FTP_PASS)
+        ftp.cwd(FTP_DIR)
+        contents = []
+        ftp.retrbinary(f"RETR {filename}", contents.append)
+        return b"".join(contents).decode("utf-16le", errors="ignore")
 
-# --- Parser logów ---
-def parse_log_content(log_lines, last_processed_entries):
+def parse_log_content(content):
     pattern = re.compile(
-        r"User:\s*(?P<nick>\w+).*?Lock type:\s*(?P<castle>\w+).*?Success:\s*(?P<success>\w+).*?Elapsed time:\s*(?P<time>[\d.]+)",
-        re.IGNORECASE
+        r"User:\s+(?P<nick>.+?)\s+.*?Type:\s+(?P<lock_type>\w+).*?Success:\s+(?P<success>Yes|No).*?Elapsed time:\s+(?P<time>\d+\.\d+)",
+        re.DOTALL
     )
-    new_entries = []
-    for line in log_lines:
-        if line in last_processed_entries:
-            continue
-        match = pattern.search(line)
-        if match:
-            nick = match.group("nick")
-            castle = match.group("castle")
-            success = match.group("success").lower() == "yes"
-            elapsed = float(match.group("time"))
-            new_entries.append((nick, castle, success, elapsed))
-            last_processed_entries.add(line)
-    return new_entries
+    return [
+        {
+            "nick": match.group("nick").strip(),
+            "lock_type": match.group("lock_type").strip(),
+            "success": match.group("success") == "Yes",
+            "elapsed_time": float(match.group("time"))
+        }
+        for match in pattern.finditer(content)
+    ]
 
-# --- Generowanie tabeli ---
+def insert_data(entries):
+    if not entries:
+        return
+    with connect_db() as conn:
+        with conn.cursor() as cur:
+            for entry in entries:
+                cur.execute("""
+                    INSERT INTO lockpick_stats (nick, lock_type, success, elapsed_time)
+                    VALUES (%s, %s, %s, %s)
+                """, (entry["nick"], entry["lock_type"], entry["success"], entry["elapsed_time"]))
+            conn.commit()
+
 def create_dataframe():
-    conn = psycopg2.connect(**DB_CONFIG)
-    df = pd.read_sql("SELECT * FROM lockpicking", conn)
-    conn.close()
-    
+    with connect_db() as conn:
+        df = pd.read_sql_query("SELECT * FROM lockpick_stats", conn)
+
     if df.empty:
-        return "Brak danych"
+        return None
 
-    grouped = df.groupby(["nick", "castle"]).agg(
-        Proby=('success', 'count'),
-        Udane=('success', 'sum'),
-        Nieudane=('success', lambda x: (~x).sum()),
-        Skutecznosc=('success', lambda x: f"{x.mean() * 100:.1f}%"),
-        SredniCzas=('elapsed_time', lambda x: f"{x.mean():.2f}s")
-    ).reset_index()
-
-    table = tabulate(
-        grouped,
-        headers=["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"],
-        tablefmt="grid",
-        stralign="center",
-        numalign="center"
+    summary = (
+        df.groupby(["nick", "lock_type"])
+        .agg(
+            attempts=pd.NamedAgg(column="success", aggfunc="count"),
+            success=pd.NamedAgg(column="success", aggfunc="sum"),
+            fail=pd.NamedAgg(column="success", aggfunc=lambda x: (~x).sum()),
+            effectiveness=pd.NamedAgg(column="success", aggfunc=lambda x: f"{100 * x.mean():.1f}%"),
+            avg_time=pd.NamedAgg(column="elapsed_time", aggfunc=lambda x: f"{x.mean():.2f}s")
+        )
+        .reset_index()
     )
 
-    print("[DEBUG] Wygenerowana tabela statystyk:")
-    print(table)
-    return f"```\n{table}\n```"
+    return summary
 
-# --- Webhook ---
+def format_table(df):
+    if df is None or df.empty:
+        return "Brak danych do wyświetlenia."
+
+    headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
+    rows = df.values.tolist()
+    return "```" + tabulate(rows, headers=headers, tablefmt="grid", stralign="center") + "```"
+
 def send_to_discord(message):
-    data = {"content": message}
-    response = requests.post(WEBHOOK_URL, json=data)
-    if response.status_code != 204:
-        print(f"[ERROR] Webhook status: {response.status_code}")
-    else:
-        print("[DEBUG] Wysłano dane na webhook.")
+    requests.post(WEBHOOK_URL, json={"content": message})
+
+# --- Funkcje debugujące ---
+def has_new_entries(entries, conn):
+    if not entries:
+        return False
+    with conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) FROM lockpick_stats")
+        old_count = cur.fetchone()[0]
+        new_count = old_count + len(entries)
+        return new_count > old_count
+
+def debug_log_diff(entries):
+    print(f"[DEBUG] Liczba znalezionych wpisów: {len(entries)}")
+    for e in entries:
+        print(f"[DEBUG] → {e}")
+
+def debug_table(df):
+    print("[DEBUG] Aktualna tabela:")
+    print(format_table(df))
 
 # --- Główna pętla ---
 def main_loop():
     print("[DEBUG] Start main_loop")
     init_db()
-    last_processed_entries = set()
-
     while True:
-        print(f"[DEBUG] --- Sprawdzanie logów: {datetime.utcnow().isoformat()} ---")
-        logs = download_log_files()
-        all_new_entries = []
+        print(f"[DEBUG] --- Sprawdzanie logów: {datetime.datetime.now(datetime.timezone.utc).isoformat()} ---")
+        try:
+            filenames = get_ftp_file_list()
+            new_files = [f for f in filenames if f not in PROCESSED_FILES]
+            print(f"[DEBUG] Nowe pliki do analizy: {new_files}")
+            new_entries = []
+            for filename in new_files:
+                content = download_ftp_file(filename)
+                entries = parse_log_content(content)
+                debug_log_diff(entries)
+                new_entries.extend(entries)
+                PROCESSED_FILES.add(filename)
 
-        for filename, lines in logs.items():
-            print(f"[DEBUG] Przetwarzanie: {filename}, linie: {len(lines)}")
-            new_entries = parse_log_content(lines, last_processed_entries)
-            print(f"[DEBUG] Nowe wpisy: {len(new_entries)}")
             if new_entries:
-                all_new_entries.extend(new_entries)
+                with connect_db() as conn:
+                    insert_data(new_entries)
+                    df = create_dataframe()
+                    debug_table(df)
+                    send_to_discord(format_table(df))
+            else:
+                print("[DEBUG] Brak nowych wpisów w logach.")
 
-        if all_new_entries:
-            insert_data(all_new_entries)
-            tabela = create_dataframe()
-            send_to_discord(tabela)
-        else:
-            print("[DEBUG] Brak nowych zdarzeń w logach.")
+        except Exception as e:
+            print(f"[ERROR] {e}")
 
-        time.sleep(60)
+        time.sleep(CHECK_INTERVAL)
 
-# --- Start aplikacji ---
 if __name__ == "__main__":
     from threading import Thread
-    Thread(target=main_loop).start()
+    Thread(target=main_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=3000)
