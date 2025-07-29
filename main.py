@@ -1,196 +1,186 @@
 import os
 import re
-import io
 import time
 import ftplib
 import psycopg2
 import pandas as pd
-import datetime
-import requests
-from flask import Flask
+from io import BytesIO
+from datetime import datetime, timezone
 from tabulate import tabulate
+from flask import Flask
+import requests
 
-# === KONFIGURACJA ===
+# --- KONFIGURACJA ---
+FTP_HOST = "176.57.174.10"
+FTP_PORT = 50021
+FTP_USER = "gpftp37275281717442833"
+FTP_PASS = "LXNdGShY"
+LOGS_PATH = "/SCUM/Saved/SaveFiles/Logs/"
 
-FTP_CONFIG = {
-    "host": "176.57.174.10",
-    "port": 50021,
-    "user": "gpftp37275281717442833",
-    "passwd": "LXNdGShY"
-}
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 DB_CONFIG = {
     "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
     "dbname": "neondb",
     "user": "neondb_owner",
     "password": "npg_dRU1YCtxbh6v",
-    "sslmode": "require"
+    "sslmode": "require",
 }
 
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-LOGS_DIR = "/SCUM/Saved/SaveFiles/Logs/"
-LOG_PATTERN = re.compile(r'^\[LogMinigame] \[LockpickingMinigame_C] User: (?P<nick>.*?) \((?P<id>.*?)\) Lock: (?P<lock>.*?) Success: (?P<success>Yes|No).+?Elapsed time: (?P<time>[0-9.]+)', re.MULTILINE)
-
-# === FLASK (ping) ===
+# --- FLASK ---
 app = Flask(__name__)
 
 @app.route('/')
 def index():
     return "Alive"
 
-# === FUNKCJE ===
-
-def connect_db():
-    conn = psycopg2.connect(**DB_CONFIG)
-    return conn
-
-def init_db():
-    conn = connect_db()
-    cur = conn.cursor()
-    cur.execute("""
-        CREATE TABLE IF NOT EXISTS lockpicking_results (
-            nick TEXT,
-            lock TEXT,
-            success BOOLEAN,
-            elapsed_time FLOAT,
-            timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-    conn.commit()
-    cur.close()
-    conn.close()
-    print("[DEBUG] Baza danych zainicjalizowana.")
-
-def fetch_log_files():
-    print("[DEBUG] Łączenie z FTP...")
+# --- FUNKCJE ---
+def connect_ftp():
     ftp = ftplib.FTP()
-    ftp.connect(FTP_CONFIG["host"], FTP_CONFIG["port"])
-    ftp.login(FTP_CONFIG["user"], FTP_CONFIG["passwd"])
-    ftp.cwd(LOGS_DIR)
+    ftp.connect(FTP_HOST, FTP_PORT)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.cwd(LOGS_PATH)
+    return ftp
 
+def fetch_log_files(ftp):
     files = []
-    ftp.retrlines('LIST', lambda line: files.append(line.split()[-1]))
-    gameplay_logs = [f for f in files if f.startswith("gameplay_") and f.endswith(".log")]
-    print(f"[DEBUG] Znaleziono pliki logów: {gameplay_logs}")
+    ftp.retrlines('LIST', lambda line: files.append(line))
+    log_filenames = [line.split()[-1] for line in files if line.split()[-1].startswith("gameplay_") and line.endswith(".log")]
+    return log_filenames
 
-    logs = {}
-    for filename in gameplay_logs:
-        bio = io.BytesIO()
-        ftp.retrbinary(f"RETR {filename}", bio.write)
-        content = bio.getvalue().decode("utf-16le", errors="ignore")
-        logs[filename] = content
-        print(f"[DEBUG] Pobrano: {filename} ({len(content)} znaków)")
-    ftp.quit()
-    return logs
+def download_file(ftp, filename):
+    buffer = BytesIO()
+    ftp.retrbinary(f"RETR {filename}", buffer.write)
+    buffer.seek(0)
+    return buffer.read().decode("utf-16le", errors="ignore")
 
-def parse_log_content(log_text):
+def parse_log_content(content):
+    pattern = re.compile(
+        r"\[LogMinigame\] \[LockpickingMinigame_C\] User: (.+?) "
+        r"used (.+?) lockpick on (.+?) lock: (.+?)\. Success: (Yes|No)\. "
+        r"Elapsed time: ([\d.]+)s"
+    )
     entries = []
-    for match in LOG_PATTERN.finditer(log_text):
-        data = match.groupdict()
+    for match in pattern.finditer(content):
+        user, lockpick, lock_type, target, success, elapsed = match.groups()
         entries.append({
-            "nick": data["nick"],
-            "lock": data["lock"],
-            "success": data["success"] == "Yes",
-            "elapsed_time": float(data["time"])
+            "Nick": user,
+            "Zamek": lock_type,
+            "Udane": 1 if success == "Yes" else 0,
+            "Nieudane": 0 if success == "Yes" else 1,
+            "Czas": float(elapsed),
+            "raw": match.group(0),
         })
-    print(f"[DEBUG] Przetworzono {len(entries)} wpisów z logu.")
     return entries
 
-def load_existing_entries():
-    conn = connect_db()
-    cur = conn.cursor()
-    cur.execute("SELECT nick, lock, success, elapsed_time FROM lockpicking_results")
-    rows = cur.fetchall()
-    cur.close()
+def init_db():
+    conn = psycopg2.connect(**DB_CONFIG)
+    with conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS lockpicking_logs (
+                    id SERIAL PRIMARY KEY,
+                    raw TEXT UNIQUE,
+                    nick TEXT,
+                    zamek TEXT,
+                    success BOOLEAN,
+                    czas FLOAT,
+                    ts TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                );
+            """)
     conn.close()
-    return set(tuple(row) for row in rows)
 
-def save_new_entries(new_entries):
-    conn = connect_db()
-    cur = conn.cursor()
-    for entry in new_entries:
-        cur.execute("""
-            INSERT INTO lockpicking_results (nick, lock, success, elapsed_time)
-            VALUES (%s, %s, %s, %s)
-        """, (entry["nick"], entry["lock"], entry["success"], entry["elapsed_time"]))
-    conn.commit()
-    cur.close()
+def insert_new_entries(entries):
+    conn = psycopg2.connect(**DB_CONFIG)
+    new_rows = 0
+    with conn:
+        with conn.cursor() as cur:
+            for e in entries:
+                try:
+                    cur.execute("""
+                        INSERT INTO lockpicking_logs (raw, nick, zamek, success, czas)
+                        VALUES (%s, %s, %s, %s, %s)
+                        ON CONFLICT (raw) DO NOTHING;
+                    """, (e["raw"], e["Nick"], e["Zamek"], e["Udane"] == 1, e["Czas"]))
+                    new_rows += cur.rowcount
+                except Exception as ex:
+                    print("[ERROR] Insert error:", ex)
     conn.close()
-    print(f"[DEBUG] Zapisano {len(new_entries)} nowych wpisów do bazy.")
+    return new_rows
 
-def create_dataframe(entries):
-    df = pd.DataFrame(entries)
+def create_dataframe():
+    conn = psycopg2.connect(**DB_CONFIG)
+    df = pd.read_sql_query("SELECT nick, zamek, success, czas FROM lockpicking_logs", conn)
+    conn.close()
+
     if df.empty:
         return None
-    grouped = df.groupby(["nick", "lock"]).agg(
-        Attempts=("success", "count"),
-        Successes=("success", "sum"),
-        Failures=("success", lambda x: (~x).sum()),
-        Efficiency=("success", "mean"),
-        AvgTime=("elapsed_time", "mean")
-    ).reset_index()
 
-    grouped["Efficiency"] = (grouped["Efficiency"] * 100).round(1).astype(str) + "%"
-    grouped["AvgTime"] = grouped["AvgTime"].round(2).astype(str) + "s"
+    df["Udane"] = df["success"].astype(int)
+    df["Nieudane"] = (~df["success"]).astype(int)
+    df["Próby"] = 1
 
-    table = tabulate(
-        grouped,
-        headers=["Nick", "Zamek", "Ilość prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"],
-        tablefmt="github",
-        showindex=False,
-        stralign="center",
-        numalign="center"
-    )
-    return table
+    grouped = df.groupby(["nick", "zamek"]).agg({
+        "Próby": "sum",
+        "Udane": "sum",
+        "Nieudane": "sum",
+        "czas": "mean"
+    }).reset_index()
 
-def send_to_discord(message):
-    if message:
-        data = {"content": f"```\n{message}\n```"}
-        response = requests.post(WEBHOOK_URL, json=data)
-        if response.status_code == 204:
-            print("[DEBUG] Wysłano tabelę do Discorda.")
-        else:
-            print(f"[ERROR] Nie udało się wysłać: {response.status_code}")
-    else:
+    grouped["Skuteczność"] = (grouped["Udane"] / grouped["Próby"] * 100).round(1).astype(str) + "%"
+    grouped["Średni czas"] = grouped["czas"].round(2).astype(str) + "s"
+
+    final_df = grouped[["nick", "zamek", "Próby", "Udane", "Nieudane", "Skuteczność", "Średni czas"]]
+    final_df.columns = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
+
+    return final_df
+
+def send_to_discord(df):
+    if df is None or df.empty:
         print("[DEBUG] Brak danych do wysłania.")
+        return
+
+    table_str = tabulate(df.values.tolist(), headers=df.columns, tablefmt="github", stralign="center")
+    payload = {
+        "content": f"**Statystyki wytrychów:**\n```{table_str}```"
+    }
+    response = requests.post(WEBHOOK_URL, json=payload)
+    print("[DEBUG] Wysłano dane na Discord:", response.status_code)
 
 def main_loop():
-    init_db()
-    last_known_entries = load_existing_entries()
     print("[DEBUG] Start main_loop")
-
+    init_db()
     while True:
-        print(f"[DEBUG] --- Sprawdzanie logów: {datetime.datetime.now(datetime.timezone.utc).isoformat()} ---")
+        print(f"[DEBUG] --- Sprawdzanie logów: {datetime.now(timezone.utc).isoformat()} ---")
         try:
-            logs = fetch_log_files()
+            ftp = connect_ftp()
+            files = fetch_log_files(ftp)
+            print(f"[DEBUG] Znaleziono {len(files)} plików logów.")
             all_entries = []
+            for fname in files:
+                content = download_file(ftp, fname)
+                entries = parse_log_content(content)
+                print(f"[DEBUG] {fname} => {len(entries)} wpisów LockpickingMinigame.")
+                all_entries.extend(entries)
+            ftp.quit()
 
-            for filename, content in logs.items():
-                parsed = parse_log_content(content)
-                all_entries.extend(parsed)
-
-            current_entries_set = set((e["nick"], e["lock"], e["success"], e["elapsed_time"]) for e in all_entries)
-            new_entries = [e for e in all_entries if (e["nick"], e["lock"], e["success"], e["elapsed_time"]) not in last_known_entries]
-
-            if new_entries:
-                print(f"[DEBUG] Wykryto {len(new_entries)} nowych wpisów.")
-                save_new_entries(new_entries)
-                last_known_entries.update(current_entries_set)
-                table = create_dataframe(all_entries)
-                send_to_discord(table)
+            if not all_entries:
+                print("[DEBUG] Brak wpisów do analizy.")
             else:
-                print("[DEBUG] Brak nowych wpisów w logach.")
+                new_rows = insert_new_entries(all_entries)
+                print(f"[DEBUG] Dodano {new_rows} nowych wpisów do bazy.")
+                if new_rows > 0:
+                    df = create_dataframe()
+                    send_to_discord(df)
+                else:
+                    print("[DEBUG] Brak nowych wpisów – wysyłka pominięta.")
 
         except Exception as e:
-            print(f"[ERROR] Wystąpił błąd w pętli głównej: {e}")
+            print("[ERROR]", e)
 
         time.sleep(60)
 
-# === START APLIKACJI ===
 if __name__ == "__main__":
-    from threading import Thread
-    thread = Thread(target=main_loop)
-    thread.daemon = True
-    thread.start()
-
+    import threading
+    threading.Thread(target=main_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=3000)
