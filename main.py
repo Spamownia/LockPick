@@ -37,65 +37,55 @@ def index():
     return "Alive"
 
 # --- Funkcje pomocnicze ---
+
 def connect_ftp():
-    try:
-        ftp = ftplib.FTP()
-        ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
-        ftp.login(FTP_USER, FTP_PASS)
-        ftp.cwd(FTP_DIR)
-        print("[DEBUG] Połączono z FTP")
-        return ftp
-    except Exception as e:
-        print(f"[ERROR] Błąd połączenia z FTP: {e}")
-        return None
+    ftp = ftplib.FTP()
+    ftp.connect(FTP_HOST, FTP_PORT)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.cwd(FTP_DIR)
+    print(f"[DEBUG] Połączono z FTP: {FTP_HOST}:{FTP_PORT}, katalog: {FTP_DIR}")
+    return ftp
 
 def list_log_files(ftp):
-    try:
-        files = []
-        ftp.retrlines("LIST", lambda line: files.append(line))
-        log_files = [line.split()[-1] for line in files if line.split()[-1].startswith("gameplay_") and line.endswith(".log")]
-        print(f"[DEBUG] Lista plików logów: {log_files}")
-        return log_files
-    except Exception as e:
-        print(f"[ERROR] Błąd listowania plików FTP: {e}")
-        return []
+    lines = []
+    ftp.retrlines("LIST", lines.append)
+    files = []
+    for line in lines:
+        parts = line.split()
+        filename = parts[-1]
+        if filename.startswith("gameplay_") and filename.endswith(".log"):
+            files.append(filename)
+    print(f"[DEBUG] Znaleziono pliki: {files}")
+    return files
 
 def download_logs():
     ftp = connect_ftp()
-    if ftp is None:
-        return ""
     log_files = list_log_files(ftp)
     logs = []
     for filename in log_files:
+        print(f"[DEBUG] Pobieranie pliku: {filename}")
+        content = []
+        ftp.retrbinary(f"RETR {filename}", lambda data: content.append(data))
         try:
-            print(f"[DEBUG] Przetwarzanie pliku: {filename}")
-            content = []
-            ftp.retrbinary(f"RETR {filename}", lambda data: content.append(data))
             log_data = b"".join(content).decode("utf-16le", errors="ignore")
-            logs.append(log_data)
-            print(f"[DEBUG] Pobrano plik: {filename}, długość: {len(log_data)} znaków")
         except Exception as e:
-            print(f"[ERROR] Błąd pobierania pliku {filename}: {e}")
-    try:
-        ftp.quit()
-    except Exception as e:
-        print(f"[WARNING] Błąd zamknięcia FTP: {e}")
-    return "\n".join(logs)
+            print(f"[ERROR] Błąd dekodowania {filename}: {e}")
+            continue
+        logs.append((filename, log_data))
+    ftp.quit()
+    return logs
 
 def parse_log_content(log_text):
+    # Regex zgodny z formatem podanym
     pattern = re.compile(
         r"\[LogMinigame\] \[LockpickingMinigame_C\] User: (?P<nick>\w+) .*? Lock: (?P<lock>\w+).*? Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[\d.]+)",
         re.DOTALL
     )
     entries = []
-    total_found = 0
     for match in pattern.finditer(log_text):
-        total_found += 1
         raw_line = match.group(0)
         if raw_line in SEEN_LINES:
-            print(f"[DEBUG] Pominięto powtórzony wpis: {raw_line}")
             continue
-        print(f"[DEBUG] Rozpoznany nowy wpis: {raw_line}")
         SEEN_LINES.add(raw_line)
         entries.append({
             "Nick": match.group("nick"),
@@ -103,12 +93,11 @@ def parse_log_content(log_text):
             "Sukces": match.group("success") == "Yes",
             "Czas": float(match.group("time"))
         })
-    print(f"[DEBUG] Razem znalezionych wpisów: {total_found}, nowych: {len(entries)}")
     return entries
 
 def save_to_db(entries):
     if not entries:
-        print("[DEBUG] Brak wpisów do zapisu w bazie")
+        print("[DEBUG] Brak nowych wpisów do zapisu w DB")
         return
     try:
         conn = psycopg2.connect(**DB_CONFIG)
@@ -127,75 +116,78 @@ def save_to_db(entries):
                 (entry["Nick"], entry["Zamek"], entry["Sukces"], entry["Czas"])
             )
         conn.commit()
-        print(f"[DEBUG] Zapisano {len(entries)} wpisów do bazy")
+        cur.close()
+        conn.close()
+        print(f"[DEBUG] Zapisano {len(entries)} nowych wpisów do bazy danych")
     except Exception as e:
-        print(f"[ERROR] Błąd zapisu do bazy: {e}")
-    finally:
-        try:
-            cur.close()
-            conn.close()
-        except:
-            pass
+        print(f"[ERROR] Błąd zapisu do DB: {e}")
 
 def create_dataframe():
     try:
         conn = psycopg2.connect(**DB_CONFIG)
         df = pd.read_sql_query("SELECT * FROM lockpicking", conn)
         conn.close()
-        if df.empty:
-            print("[DEBUG] Brak danych w bazie do tworzenia tabeli")
-            return None
-        grouped = df.groupby(["nick", "zamek"]).agg(
-            Proby=('sukces', 'count'),
-            Udane=('sukces', 'sum'),
-            Nieudane=('sukces', lambda x: (~x).sum()),
-            SredniCzas=('czas', 'mean')
-        ).reset_index()
-        grouped['Skutecznosc'] = (grouped['Udane'] / grouped['Proby'] * 100).round(1)
-        grouped['SredniCzas'] = grouped['SredniCzas'].round(2)
-        print(f"[DEBUG] Utworzono DataFrame z {len(grouped)} wierszami")
-        return grouped
     except Exception as e:
-        print(f"[ERROR] Błąd tworzenia DataFrame: {e}")
+        print(f"[ERROR] Błąd odczytu z DB: {e}")
         return None
+    if df.empty:
+        print("[DEBUG] Brak danych w tabeli lockpicking")
+        return None
+    grouped = df.groupby(["nick", "zamek"]).agg(
+        Proby=('sukces', 'count'),
+        Udane=('sukces', 'sum'),
+        Nieudane=('sukces', lambda x: (~x).sum()),
+        SredniCzas=('czas', 'mean')
+    ).reset_index()
+    grouped['Skutecznosc'] = (grouped['Udane'] / grouped['Proby'] * 100).round(1)
+    grouped['SredniCzas'] = grouped['SredniCzas'].round(2)
+    return grouped
 
 def send_to_discord(df):
-    if df is None or df.empty:
-        print("[DEBUG] Brak danych do wysłania na Discord")
-        return
+    df.columns = ["Nick", "Zamek", "Ilość prób", "Udane", "Nieudane", "Średni czas", "Skuteczność"]
+    for col in df.columns:
+        df[col] = df[col].astype(str)
+    tabela = tabulate(df.values.tolist(), headers=df.columns.tolist(), tablefmt="github", stralign="center", numalign="center")
+    payload = {"content": f"```\n{tabela}\n```"}
     try:
-        df.columns = ["Nick", "Zamek", "Ilość prób", "Udane", "Nieudane", "Średni czas", "Skuteczność"]
-        for col in df.columns:
-            df[col] = df[col].astype(str)
-        tabela = tabulate(df.values.tolist(), headers=df.columns.tolist(), tablefmt="github", stralign="center", numalign="center")
-        payload = {"content": f"```\n{tabela}\n```"}
         response = requests.post(WEBHOOK_URL, json=payload)
         print(f"[DEBUG] Wysłano dane do Discorda, status: {response.status_code}")
     except Exception as e:
-        print(f"[ERROR] Błąd wysyłania na Discord: {e}")
+        print(f"[ERROR] Błąd wysyłki do Discorda: {e}")
 
 def main_loop():
     print("[DEBUG] Start main_loop")
     while True:
         print(f"[DEBUG] --- Sprawdzanie logów: {datetime.utcnow().isoformat()} ---")
-        log_text = download_logs()
-        if not log_text:
-            print("[DEBUG] Brak tekstu logów do przetworzenia")
+        try:
+            logs = download_logs()
+        except Exception as e:
+            print(f"[ERROR] Błąd pobierania logów z FTP: {e}")
             time.sleep(CHECK_INTERVAL)
             continue
-        new_entries = parse_log_content(log_text)
-        if new_entries:
-            print(f"[DEBUG] Nowe wpisy: {len(new_entries)}")
-            save_to_db(new_entries)
+
+        total_new_entries = 0
+        for filename, log_text in logs:
+            print(f"[DEBUG] Przetwarzanie: {filename}, linie: {log_text.count(chr(10))}")
+            new_entries = parse_log_content(log_text)
+            if new_entries:
+                total_new_entries += len(new_entries)
+                save_to_db(new_entries)
+
+        if total_new_entries > 0:
             df = create_dataframe()
             if df is not None:
                 send_to_discord(df)
+            else:
+                print("[DEBUG] Brak danych do wysłania po zgrupowaniu")
         else:
-            print("[DEBUG] Brak nowych zdarzeń w logach")
+            print("[DEBUG] Brak nowych wpisów w logach")
+
         time.sleep(CHECK_INTERVAL)
 
 # --- Uruchomienie wątku pętli głównej ---
 threading.Thread(target=main_loop, daemon=True).start()
 
 # --- Uruchomienie serwera Flask ---
-app.run(host='0.0.0.0', port=3000)
+if __name__ == "__main__":
+    app.run(host='0.0.0.0', port=3000)
