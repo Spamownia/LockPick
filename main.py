@@ -62,5 +62,5 @@ if filename not in PROCESSED_LINES:
 
 --- Uruchomienie ---
 
-if name == "main": from threading import Thread Thread(target=main_loop).start() app.run(host='0.0.0.0', port=3000)
-
+if name == "main": from threading import Thread Thread(target=main_loop).start() app.run(ho
+st='0.0.0.0', port=3000)
