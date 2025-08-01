@@ -59,8 +59,8 @@ def analyze_data(entries):
         Nieudane=("Sukces", lambda x: (~x).sum()),
         Średni_czas=("Czas", "mean"),
     )
-    grouped["Skuteczność"] = (grouped["Udane"] / grouped["Wszystkie"] * 100).round(1)
-    grouped["Średni_czas"] = grouped["Średni_czas"].round(2)
+    grouped["Skuteczność"] = (grouped["Udane"] / grouped["Wszystkie"] * 100).round(1).astype(str) + "%"
+    grouped["Średni_czas"] = grouped["Średni_czas"].round(2).astype(str) + "s"
     grouped = grouped.reset_index()
     grouped = grouped.sort_values(by=["Nick", "Zamek"])
     print("Analiza zakończona. Oto podsumowanie:")
