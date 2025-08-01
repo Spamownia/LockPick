@@ -124,4 +124,12 @@ def main_loop_test():
         print(table_text)
         send_to_discord(table_text)
     else:
-        print("[DEBUG] Brak danych do wyświet
+        print("[DEBUG] Brak danych do wyświetlenia.")
+
+@app.route('/')
+def index():
+    return "Alive"
+
+if __name__ == "__main__":
+    main_loop_test()
+    app.run(host="0.0.0.0", port=3000)
