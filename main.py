@@ -15,7 +15,7 @@ log_data = """2025.07.28-08.00.38: Game version: 1.0.1.3.96391
 """
 
 # === Webhook ===
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3/"
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 # === Parsowanie wpisów minigry ===
 pattern = re.compile(
