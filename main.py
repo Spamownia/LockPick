@@ -5,7 +5,7 @@ import time
 import requests
 from tabulate import tabulate
 from flask import Flask
-from datetime import datetime
+from datetime import datetime, UTC
 import threading
 
 # === Konfiguracja bazy danych ===
@@ -105,7 +105,7 @@ def init_db():
 def main_loop():
     print("[DEBUG] Start main_loop (tryb testowy)")
     while True:
-        print(f"[DEBUG] Pętla sprawdzania {datetime.utcnow()}")
+        print(f"[DEBUG] Pętla sprawdzania {datetime.now(UTC)}")
         entries = parse_log_content(TEST_LOG_CONTENT)
         df = create_dataframe(entries)
         send_to_discord(df)
