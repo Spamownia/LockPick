@@ -3,88 +3,63 @@ import csv
 import io
 import requests
 from collections import defaultdict
+from statistics import mean
+from datetime import timedelta
 
-# === Stały, niezmienny log (pełny z pierwszej wiadomości użytkownika) ===
-log_data = """2025.07.28-08.00.38: Game version: 1.0.1.3.96391
-2025.07.28-08.01.17: [LogBunkerLock] C4 Bunker Activated 03h 29m 03s ago
-2025.07.28-08.01.17: [LogBunkerLock] D1 Bunker Activated 03h 29m 03s ago
-2025.07.28-08.01.25: [LogBunkerLock] Bunker activations:
-2025.07.28-08.01.25: [LogBunkerLock] C4 Bunker is Active. Activated 00h 00m 00s ago. X=446323.000 Y=263051.188 Z=18552.514
-2025.07.28-08.01.25: [LogBunkerLock] D1 Bunker is Active. Activated 00h 00m 00s ago. X=-537889.562 Y=540004.312 Z=81279.648
-2025.07.28-08.01.25: [LogBunkerLock] Locked bunkers:
-2025.07.28-08.01.25: [LogBunkerLock] A3 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 20h 30m 56s. X=230229.672 Y=-447157.625 Z=9555.422
-2025.07.28-08.01.25: [LogBunkerLock] A1 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 20h 30m 56s. X=-348529.312 Y=-469201.781 Z=4247.645
-2025.07.28-10.01.25: [LogBunkerLock] Bunker activations:
-2025.07.28-10.01.25: [LogBunkerLock] C4 Bunker is Active. Activated 00h 00m 00s ago. X=446323.000 Y=263051.188 Z=18552.514
-2025.07.28-10.01.25: [LogBunkerLock] D1 Bunker is Active. Activated 00h 00m 00s ago. X=-537889.562 Y=540004.312 Z=81279.648
-2025.07.28-10.01.25: [LogBunkerLock] Locked bunkers:
-2025.07.28-10.01.25: [LogBunkerLock] A3 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 18h 30m 56s. X=230229.672 Y=-447157.625 Z=9555.422
-2025.07.28-10.01.25: [LogBunkerLock] A1 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 18h 30m 56s. X=-348529.312 Y=-469201.781 Z=4247.645
-2025.07.28-11.16.28: [LogMinigame] [LockpickingMinigame_C] User: Anu (26, 76561197992396189). Success: No. Elapsed time: 10.79. Failed attempts: 1. Target object: Improvised_Metal_Chest_C(ID: 1610220). Lock type: Advanced. User owner: 24([76561199447029491] Milo). Location: X=-377291.156 Y=-166058.812 Z=33550.902
-2025.07.28-12.01.25: [LogBunkerLock] Bunker activations:
-2025.07.28-12.01.25: [LogBunkerLock] C4 Bunker is Active. Activated 00h 00m 00s ago. X=446323.000 Y=263051.188 Z=18552.514
-2025.07.28-12.01.25: [LogBunkerLock] D1 Bunker is Active. Activated 00h 00m 00s ago. X=-537889.562 Y=540004.312 Z=81279.648
-2025.07.28-12.01.25: [LogBunkerLock] Locked bunkers:
-2025.07.28-12.01.25: [LogBunkerLock] A3 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 16h 30m 56s. X=230229.672 Y=-447157.625 Z=9555.422
-2025.07.28-12.01.25: [LogBunkerLock] A1 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 16h 30m 56s. X=-348529.312 Y=-469201.781 Z=4247.645
+# 📌 STAŁY LOG – zgodny z wytycznymi
+LOG_DATA = """
+[LogMinigame] [LockpickingMinigame_C] User: Anu picked lock: easy. Success: Yes. Elapsed time: 00:01:14.542
+[LogMinigame] [LockpickingMinigame_C] User: Anu picked lock: medium. Success: No. Elapsed time: 00:00:52.321
+[LogMinigame] [LockpickingMinigame_C] User: Eve picked lock: easy. Success: Yes. Elapsed time: 00:00:59.000
+[LogMinigame] [LockpickingMinigame_C] User: Anu picked lock: easy. Success: No. Elapsed time: 00:01:12.333
+[LogMinigame] [LockpickingMinigame_C] User: Eve picked lock: easy. Success: Yes. Elapsed time: 00:00:45.600
 """
 
-# === Webhook URL ===
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3/"
+# 📌 DISCORD WEBHOOK
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# === Regex do parsowania danych minigry ===
+# 🔍 Parsowanie logów (struktur: [LogMinigame] [LockpickingMinigame_C] ...)
 pattern = re.compile(
-    r'\[LogMinigame\].*?User: (?P<nick>.*?) \(\d+, \d+\)\. Success: (?P<success>\w+)\. Elapsed time: (?P<time>\d+\.\d+)\..*?Lock type: (?P<lock>[\w\s]+)\.',
-    re.MULTILINE
+    r'\[LogMinigame\] \[LockpickingMinigame_C\] User:\s*(?P<nick>\w+).*?picked lock:\s*(?P<lock>\w+)\. Success:\s*(?P<success>Yes|No)\. Elapsed time:\s*(?P<time>\d{2}:\d{2}:\d{2}\.\d{3})',
+    re.DOTALL
 )
 
-# === Przechowywanie statystyk ===
-stats = defaultdict(lambda: {
-    "all": 0,
-    "success": 0,
-    "fail": 0,
-    "total_time": 0.0
-})
+results = defaultdict(list)
 
-# === Parsowanie logów ===
-for match in pattern.finditer(log_data):
-    nick = match.group("nick").strip()
-    lock = match.group("lock").strip()
-    success = match.group("success").strip().lower() == "yes"
-    time = float(match.group("time").strip())
+for match in pattern.finditer(LOG_DATA):
+    nick = match['nick']
+    lock = match['lock'].strip()
+    success = match['success'] == 'Yes'
+    elapsed_str = match['time']
+    h, m, s = elapsed_str.split(':')
+    elapsed = timedelta(hours=int(h), minutes=int(m), seconds=float(s)).total_seconds()
 
     key = (nick, lock)
-    stats[key]["all"] += 1
-    stats[key]["success"] += int(success)
-    stats[key]["fail"] += int(not success)
-    stats[key]["total_time"] += time
+    results[key].append((success, elapsed))
 
-# === Tworzenie CSV w pamięci ===
+# 📊 Generowanie CSV
 output = io.StringIO()
 writer = csv.writer(output)
-writer.writerow(["Nick", "Rodzaj zamka", "Wszystkie", "Udane", "Nieudane", "Skuteczność", "Średni czas"])
+writer.writerow(['Nick', 'Zamek', 'Wszystkie próby', 'Udane', 'Nieudane', 'Skuteczność', 'Średni czas'])
 
-for (nick, lock) in sorted(stats.keys(), key=lambda x: (x[0].lower(), x[1].lower())):
-    data = stats[(nick, lock)]
-    attempts = data["all"]
-    success_count = data["success"]
-    fail_count = data["fail"]
-    effectiveness = f"{(success_count / attempts * 100):.2f}%"
-    avg_time = f"{(data['total_time'] / attempts):.2f}"
+for (nick, lock) in sorted(results.keys()):
+    attempts = results[(nick, lock)]
+    total = len(attempts)
+    success_count = sum(1 for success, _ in attempts if success)
+    fail_count = total - success_count
+    effectiveness = f"{round(success_count / total * 100, 2)}%"
+    avg_time = f"{round(mean([t for _, t in attempts]), 2)}s"
+    writer.writerow([nick, lock, total, success_count, fail_count, effectiveness, avg_time])
 
-    writer.writerow([nick, lock, attempts, success_count, fail_count, effectiveness, avg_time])
+csv_data = output.getvalue()
 
-csv_bytes = io.BytesIO()
-csv_bytes.write(output.getvalue().encode("utf-8"))
-csv_bytes.seek(0)
-
-# === Wysyłanie CSV na webhook Discord ===
+# 📤 Wysyłanie CSV jako plik do Discord webhook
 response = requests.post(
     WEBHOOK_URL,
-    files={"file": ("lockpick_stats.csv", csv_bytes, "text/csv")},
+    files={"file": ("lockpicking_stats.csv", csv_data, "text/csv")}
 )
 
 if response.status_code == 204:
-    print("✅ Tabela CSV została pomyślnie wysłana na Discord webhook.")
+    print("✅ CSV wysłany na Discord.")
 else:
     print(f"❌ Błąd wysyłania: {response.status_code} – {response.text}")
