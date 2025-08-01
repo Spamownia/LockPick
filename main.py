@@ -1,91 +1,94 @@
 import re
 import requests
-from collections import defaultdict
-from statistics import mean
-from datetime import timedelta
+import pandas as pd
+from tabulate import tabulate
 
-# 📌 STAŁY LOG – przykład zgodny z Twoimi wytycznymi
-LOG_DATA = """
-[LogMinigame] [LockpickingMinigame_C] User: Anu picked lock: easy. Success: Yes. Elapsed time: 00:01:14.542
-[LogMinigame] [LockpickingMinigame_C] User: Anu picked lock: medium. Success: No. Elapsed time: 00:00:52.321
-[LogMinigame] [LockpickingMinigame_C] User: Eve picked lock: easy. Success: Yes. Elapsed time: 00:00:59.000
-[LogMinigame] [LockpickingMinigame_C] User: Anu picked lock: easy. Success: No. Elapsed time: 00:01:12.333
-[LogMinigame] [LockpickingMinigame_C] User: Eve picked lock: easy. Success: Yes. Elapsed time: 00:00:45.600
+# Stały log testowy (dokładnie z pierwszej wiadomości)
+LOG_CONTENT = """
+2025.07.28-08.00.38: Game version: 1.0.1.3.96391
+2025.07.28-08.01.17: [LogBunkerLock] C4 Bunker Activated 03h 29m 03s ago
+2025.07.28-08.01.17: [LogBunkerLock] D1 Bunker Activated 03h 29m 03s ago
+2025.07.28-08.01.25: [LogBunkerLock] Bunker activations:
+2025.07.28-08.01.25: [LogBunkerLock] C4 Bunker is Active. Activated 00h 00m 00s ago. X=446323.000 Y=263051.188 Z=18552.514
+2025.07.28-08.01.25: [LogBunkerLock] D1 Bunker is Active. Activated 00h 00m 00s ago. X=-537889.562 Y=540004.312 Z=81279.648
+2025.07.28-08.01.25: [LogBunkerLock] Locked bunkers:
+2025.07.28-08.01.25: [LogBunkerLock] A3 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 20h 30m 56s. X=230229.672 Y=-447157.625 Z=9555.422
+2025.07.28-08.01.25: [LogBunkerLock] A1 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 20h 30m 56s. X=-348529.312 Y=-469201.781 Z=4247.645
+2025.07.28-10.01.25: [LogBunkerLock] Bunker activations:
+2025.07.28-10.01.25: [LogBunkerLock] C4 Bunker is Active. Activated 00h 00m 00s ago. X=446323.000 Y=263051.188 Z=18552.514
+2025.07.28-10.01.25: [LogBunkerLock] D1 Bunker is Active. Activated 00h 00m 00s ago. X=-537889.562 Y=540004.312 Z=81279.648
+2025.07.28-10.01.25: [LogBunkerLock] Locked bunkers:
+2025.07.28-10.01.25: [LogBunkerLock] A3 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 18h 30m 56s. X=230229.672 Y=-447157.625 Z=9555.422
+2025.07.28-10.01.25: [LogBunkerLock] A1 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 18h 30m 56s. X=-348529.312 Y=-469201.781 Z=4247.645
+2025.07.28-11.16.28: [LogMinigame] [LockpickingMinigame_C] User: Anu (26, 76561197992396189). Success: No. Elapsed time: 10.79. Failed attempts: 1. Target object: Improvised_Metal_Chest_C(ID: 1610220). Lock type: Advanced. User owner: 24([76561199447029491] Milo). Location: X=-377291.156 Y=-166058.812 Z=33550.902
+2025.07.28-12.01.25: [LogBunkerLock] Bunker activations:
+2025.07.28-12.01.25: [LogBunkerLock] C4 Bunker is Active. Activated 00h 00m 00s ago. X=446323.000 Y=263051.188 Z=18552.514
+2025.07.28-12.01.25: [LogBunkerLock] D1 Bunker is Active. Activated 00h 00m 00s ago. X=-537889.562 Y=540004.312 Z=81279.648
+2025.07.28-12.01.25: [LogBunkerLock] Locked bunkers:
+2025.07.28-12.01.25: [LogBunkerLock] A3 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 16h 30m 56s. X=230229.672 Y=-447157.625 Z=9555.422
+2025.07.28-12.01.25: [LogBunkerLock] A1 Bunker is Locked. Locked 00h 00m 00s ago, next Activation in 16h 30m 56s. X=-348529.312 Y=-469201.781 Z=4247.645
 """
 
-# 📌 Webhook Discord
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# 🔍 Parsowanie logów
-pattern = re.compile(
-    r'\[LogMinigame\] \[LockpickingMinigame_C\] User:\s*(?P<nick>\w+).*?picked lock:\s*(?P<lock>\w+)\. Success:\s*(?P<success>Yes|No)\. Elapsed time:\s*(?P<time>\d{2}:\d{2}:\d{2}\.\d{3})',
-    re.DOTALL
-)
+def parse_log_minigame(log_text):
+    print("🔍 Rozpoczynam parsowanie loga...")
+    pattern = re.compile(
+        r"\[LogMinigame\] \[LockpickingMinigame_C\] User: (?P<user>\w+).*?Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[\d\.]+)\. .*?Lock type: (?P<lock>\w+)\."
+    )
+    matches = pattern.finditer(log_text)
+    data = []
+    count = 0
+    for match in matches:
+        count += 1
+        user = match.group("user")
+        success = match.group("success") == "Yes"
+        time = float(match.group("time"))
+        lock = match.group("lock")
+        print(f"  • Wpis #{count}: Użytkownik={user}, Sukces={success}, Czas={time}, Rodzaj zamka={lock}")
+        data.append((user, lock, success, time))
+    print(f"Parsowanie zakończone, znaleziono {count} wpisów.")
+    return data
 
-results = defaultdict(list)
+def analyze_data(entries):
+    print("📊 Analizuję dane...")
+    df = pd.DataFrame(entries, columns=["Nick", "Zamek", "Sukces", "Czas"])
+    grouped = df.groupby(["Nick", "Zamek"]).agg(
+        Wszystkie=("Sukces", "count"),
+        Udane=("Sukces", "sum"),
+        Nieudane=("Sukces", lambda x: (~x).sum()),
+        Średni_czas=("Czas", "mean"),
+    )
+    grouped["Skuteczność"] = (grouped["Udane"] / grouped["Wszystkie"] * 100).round(1)
+    grouped["Średni_czas"] = grouped["Średni_czas"].round(2)
+    grouped = grouped.reset_index()
+    grouped = grouped.sort_values(by=["Nick", "Zamek"])
+    print("Analiza zakończona. Oto podsumowanie:")
+    print(grouped)
+    return grouped[["Nick", "Zamek", "Wszystkie", "Udane", "Nieudane", "Skuteczność", "Średni_czas"]]
 
-for match in pattern.finditer(LOG_DATA):
-    nick = match['nick']
-    lock = match['lock']
-    success = match['success'] == 'Yes'
-    h, m, s = match['time'].split(':')
-    elapsed = timedelta(hours=int(h), minutes=int(m), seconds=float(s)).total_seconds()
-    results[(nick, lock)].append((success, elapsed))
+def format_table(df):
+    print("📝 Tworzę tabelę markdown z wyśrodkowaniem...")
+    table = tabulate(
+        df.values,
+        headers=df.columns,
+        tablefmt="github",
+        stralign="center",
+        numalign="center"
+    )
+    print("Tabela gotowa.")
+    return f"```\n{table}\n```"
 
-# 📊 Tworzenie danych do tabeli
-table_data = []
-for (nick, lock) in sorted(results.keys()):
-    attempts = results[(nick, lock)]
-    total = len(attempts)
-    success_count = sum(1 for s, _ in attempts if s)
-    fail_count = total - success_count
-    effectiveness = f"{round(success_count / total * 100, 2)}%"
-    avg_time = f"{round(mean([t for _, t in attempts]), 2)}s"
-    table_data.append([
-        str(nick),
-        str(lock),
-        str(total),
-        str(success_count),
-        str(fail_count),
-        effectiveness,
-        avg_time
-    ])
+def send_to_discord(content):
+    print("🚀 Wysyłam tabelę na Discord webhook...")
+    response = requests.post(WEBHOOK_URL, json={"content": content})
+    if response.status_code in (200, 204):
+        print("✅ Wysłano pomyślnie.")
+    else:
+        print(f"❌ Błąd wysyłania: {response.status_code} – {response.text}")
 
-headers = ["Nick", "Rodzaj zamka", "Wszystkie", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
-
-# 📏 Oblicz szerokości kolumn
-all_rows = [headers] + table_data
-col_widths = [max(len(row[i]) for row in all_rows) for i in range(len(headers))]
-
-# 📐 Funkcja do wyśrodkowywania komórek
-def center_cell(text, width):
-    padding = width - len(text)
-    left = padding // 2
-    right = padding - left
-    return " " * left + text + " " * right
-
-# 🧾 Budowanie wyśrodkowanej tabeli jako tekst
-lines = []
-
-# linia nagłówka
-header_line = "| " + " | ".join(center_cell(h, col_widths[i]) for i, h in enumerate(headers)) + " |"
-separator_line = "+-" + "-+-".join("-" * col_widths[i] for i in range(len(headers))) + "-+"
-lines.append(separator_line)
-lines.append(header_line)
-lines.append(separator_line)
-
-# wiersze danych
-for row in table_data:
-    data_line = "| " + " | ".join(center_cell(row[i], col_widths[i]) for i in range(len(headers))) + " |"
-    lines.append(data_line)
-lines.append(separator_line)
-
-table_text = "```" + "\n".join(lines) + "```"
-
-# 📤 Wysyłka do webhooka Discorda
-response = requests.post(WEBHOOK_URL, json={"content": table_text})
-
-if response.status_code == 204:
-    print("✅ Tabela wysłana na Discord.")
-else:
-    print(f"❌ Błąd wysyłania: {response.status_code} – {response.text}")
+if __name__ == "__main__":
+    parsed_entries = parse_log_minigame(LOG_CONTENT)
+    analyzed_df = analyze_data(parsed_entries)
+    table_text = format_table(analyzed_df)
+    send_to_discord(table_text)
