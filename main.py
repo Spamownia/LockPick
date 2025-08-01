@@ -1,12 +1,10 @@
 import re
 import pandas as pd
 from datetime import datetime, timezone
-import requests
 from flask import Flask
+import requests
 
 app = Flask(__name__)
-
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 # Dokładnie taki log, jaki przesłałeś:
 TEST_LOG = """
@@ -37,6 +35,8 @@ TEST_LOG = """
 LOG_MINIGAME_PATTERN = re.compile(
     r"\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}: \[LogMinigame\] \[LockpickingMinigame_C\] User: (?P<nick>\w+) \(\d+, \d+\)\. Success: (?P<success>Yes|No)\. Elapsed time: (?P<elapsed_time>[\d.]+)\. Failed attempts: (?P<failed_attempts>\d+)\. Target object: [\w_]+\(ID: \d+\)\. Lock type: (?P<lock_type>\w+)\. .*"
 )
+
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 def parse_log_content(log_content):
     entries = []
@@ -69,51 +69,43 @@ def create_dataframe(entries):
     ).reset_index()
     summary["Skuteczność"] = (summary["Udane"] / summary["Próby"] * 100).round(2)
     summary["Średni_czas"] = summary["Średni_czas"].round(2)
-    # Sortowanie po Nick, potem Zamek
-    summary = summary.sort_values(by=["Nick", "Zamek"]).reset_index(drop=True)
+    summary = summary.sort_values(by=["Nick", "Zamek"])
     return summary
 
 def format_table_for_webhook(df):
-    # Kolumny zgodnie z Twoim zapytaniem, wyśrodkowane
-    headers = ["Nick", "Zamek", "Próby", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
-    # Zaokrąglenie i formatowanie kolumny "Skuteczność" i "Średni czas" z df jest już wykonane
-    # Tworzymy tabelę Markdown
-    # Ustalamy szerokości kolumn na podstawie max długości w kolumnie i nagłówku
+    headers_display = ["Nick", "Zamek", "Próby", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
+    headers_df = ["Nick", "Zamek", "Próby", "Udane", "Nieudane", "Skuteczność", "Średni_czas"]
+
     col_widths = []
-    for col in headers:
-        max_len = max(df[col].astype(str).map(len).max(), len(col))
+    for col in headers_df:
+        max_len = max(df[col].astype(str).map(len).max(), len(headers_display[headers_df.index(col)]))
         col_widths.append(max_len)
-    # Funkcja do wyśrodkowania tekstu w kolumnie
+
     def center_text(text, width):
         text = str(text)
         space = width - len(text)
         left = space // 2
         right = space - left
         return " " * left + text + " " * right
-    # Tworzymy nagłówek
-    header_line = "| " + " | ".join(center_text(h, w) for h, w in zip(headers, col_widths)) + " |"
+
+    header_line = "| " + " | ".join(center_text(h, w) for h, w in zip(headers_display, col_widths)) + " |"
     separator_line = "|-" + "-|-".join("-" * w for w in col_widths) + "-|"
-    # Tworzymy wiersze
+
     rows = []
     for _, row in df.iterrows():
-        row_line = "| " + " | ".join(center_text(row[h], w) for h, w in zip(headers, col_widths)) + " |"
+        row_line = "| " + " | ".join(center_text(row[col], w) for col, w in zip(headers_df, col_widths)) + " |"
         rows.append(row_line)
-    # Złączamy wszystko
+
     table_text = "\n".join([header_line, separator_line] + rows)
     return table_text
 
-def send_to_webhook(message: str):
-    data = {
-        "content": f"```markdown\n{message}\n```"
-    }
-    try:
-        response = requests.post(WEBHOOK_URL, json=data)
-        if response.status_code == 204:
-            print("[DEBUG] Wysłano tabelę na webhook.")
-        else:
-            print(f"[DEBUG] Błąd wysyłki webhook: {response.status_code} {response.text}")
-    except Exception as e:
-        print(f"[DEBUG] Wyjątek podczas wysyłki webhook: {e}")
+def send_to_discord(content):
+    data = {"content": f"```\n{content}\n```"}
+    response = requests.post(WEBHOOK_URL, json=data)
+    if response.status_code != 204:
+        print(f"[ERROR] Błąd wysyłki webhook: {response.status_code} - {response.text}")
+    else:
+        print("[DEBUG] Wysłano tabelę na webhook Discord.")
 
 def main_loop_test():
     print("[DEBUG] Baza danych zainicjalizowana.")
@@ -122,21 +114,14 @@ def main_loop_test():
 
     entries = parse_log_content(TEST_LOG)
     print(f"[DEBUG] Rozpoznano {len(entries)} wpisów w logu.")
-
+    
     df = create_dataframe(entries)
     if not df.empty:
         print("[DEBUG] Stworzono DataFrame:")
         print(df.to_string(index=False))
-        # Wysyłamy tabelę na webhook
         table_text = format_table_for_webhook(df)
-        send_to_webhook(table_text)
+        print("[DEBUG] Tabela do wysłania na webhook:")
+        print(table_text)
+        send_to_discord(table_text)
     else:
-        print("[DEBUG] Brak danych do wyświetlenia.")
-
-@app.route('/')
-def index():
-    return "Alive"
-
-if __name__ == "__main__":
-    main_loop_test()
-    app.run(host="0.0.0.0", port=3000)
+        print("[DEBUG] Brak danych do wyświet
