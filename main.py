@@ -1,127 +1,152 @@
+from flask import Flask
 import ftplib
 import io
-import re
 import pandas as pd
-import psycopg2
+import re
 import ssl
-from tabulate import tabulate
-from flask import Flask
 from datetime import datetime
+from tabulate import tabulate
+import requests
+import threading
 import time
 
-# === KONFIGURACJE ===
+# ---------- Konfiguracja ----------
+
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
-
+FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-DB_CONFIG = {
-    "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech",
-    "dbname": "neondb",
-    "user": "neondb_owner",
-    "password": "npg_dRU1YCtxbh6v",
-    "sslmode": "require"
-}
-
-# === FLASK ===
 app = Flask(__name__)
 
-# === FUNKCJE ===
+# ---------- Funkcje ----------
 
 def fetch_log_files_from_ftp():
-    print("🔄 Rozpoczynanie pobierania logów z FTP...")
-    logs = []
-    with ftplib.FTP() as ftp:
-        ftp.connect(FTP_HOST, FTP_PORT)
-        ftp.login(FTP_USER, FTP_PASS)
-        ftp.cwd(LOG_DIR)
+    print(f"[{datetime.now()}] 🔄 Pobieranie logów z FTP...")
+    log_contents = []
+    try:
+        context = ssl._create_unverified_context()
+        with ftplib.FTP() as ftp:
+            ftp.connect(FTP_HOST, FTP_PORT)
+            ftp.login(FTP_USER, FTP_PASS)
+            ftp.cwd(FTP_LOG_DIR)
+            filenames = ftp.nlst()
 
-        files = []
-        ftp.retrlines('LIST', lambda line: files.append(line.split()[-1]))
+            for filename in filenames:
+                if filename.startswith("gameplay_") and filename.endswith(".log"):
+                    print(f"📁 Pobieranie pliku: {filename}")
+                    content = io.BytesIO()
+                    ftp.retrbinary(f"RETR {filename}", content.write)
+                    content.seek(0)
+                    log_contents.append(content.read().decode("utf-16-le"))
+    except Exception as e:
+        print(f"❌ Błąd FTP: {e}")
 
-        for filename in files:
-            if filename.startswith("gameplay_") and filename.endswith(".log"):
-                print(f"📁 Pobieranie: {filename}")
-                bio = io.BytesIO()
-                ftp.retrbinary(f"RETR {filename}", bio.write)
-                content = bio.getvalue().decode('utf-16-le', errors='ignore')
-                logs.append(content)
-    print(f"✅ Pobieranie zakończone. Liczba plików: {len(logs)}")
-    return "\n".join(logs)
+    print(f"✅ Liczba plików pobranych: {len(log_contents)}\n")
+    return log_contents
 
 
-def parse_log_content(log_data):
-    print("🔍 Analiza logów...")
+def parse_log_content(log_contents):
+    print(f"[{datetime.now()}] 🧩 Parsowanie zawartości logów...")
     pattern = re.compile(
-        r'\[LogMinigame\] \[LockpickingMinigame_C\] User: (?P<user>.*?) \[.*?\] Lock: (?P<lock>.*?) Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>\d+\.\d+)'
+        r"\[LogMinigame\] \[LockpickingMinigame_C\] User: (.*?) "
+        r"started lockpicking. Lock: (.*?)\. Success: (Yes|No)\. Elapsed time: ([\d.]+)"
     )
 
-    data = []
-    for match in pattern.finditer(log_data):
-        data.append({
-            "Nick": match.group("user"),
-            "Zamek": match.group("lock"),
-            "Sukces": match.group("success") == "Yes",
-            "Czas (s)": float(match.group("time"))
-        })
+    entries = []
+    for content in log_contents:
+        matches = pattern.findall(content)
+        for match in matches:
+            user, lock, success, elapsed = match
+            entries.append({
+                "Nick": user,
+                "Zamek": lock,
+                "Sukces": success == "Yes",
+                "Czas": float(elapsed)
+            })
 
-    print(f"✅ Rozpoznano poprawnie wpisów: {len(data)}")
-    return pd.DataFrame(data)
-
-
-def aggregate_statistics(df):
-    print("📊 Agregowanie danych...")
-    grouped = df.groupby(["Nick", "Zamek"]).agg(
-        Ilość=('Sukces', 'count'),
-        Udane=('Sukces', 'sum'),
-        Nieudane=('Sukces', lambda x: (~x).sum()),
-        Skuteczność=('Sukces', lambda x: f"{(x.sum() / len(x)) * 100:.2f}%"),
-        Średni_czas=('Czas (s)', lambda x: f"{x.mean():.2f}s")
-    ).reset_index()
-    return grouped
+    print(f"✅ Liczba wpisów rozpoznanych: {len(entries)}\n")
+    return entries
 
 
-def format_table(df):
-    print("📋 Formatowanie tabeli...")
-    table = tabulate(df, headers="keys", tablefmt="grid", showindex=False, stralign="center", numalign="center")
-    return f"```{table}```"
-
-
-def send_to_discord(message):
-    print("📤 Wysyłanie danych do Discorda...")
-    import requests
-    payload = {"content": message}
-    response = requests.post(WEBHOOK_URL, json=payload)
-    print(f"📬 Odpowiedź Discorda: {response.status_code}")
-
-
-def run_analysis():
-    log_data = fetch_log_files_from_ftp()
-    df = parse_log_content(log_data)
-
+def create_dataframe(entries):
+    print(f"[{datetime.now()}] 📊 Tworzenie tabeli wyników...")
+    df = pd.DataFrame(entries)
     if df.empty:
-        print("⚠️ Brak danych do analizy.")
+        print("⚠️ Brak danych do analizy.\n")
+        return ""
+
+    grouped = df.groupby(["Nick", "Zamek"]).agg(
+        Proby=("Sukces", "count"),
+        Udane=("Sukces", "sum"),
+        Nieudane=("Sukces", lambda x: (~x).sum()),
+        SredniCzas=("Czas", "mean")
+    ).reset_index()
+
+    grouped["Skuteczność"] = (grouped["Udane"] / grouped["Proby"] * 100).round(2)
+    grouped["SredniCzas"] = grouped["SredniCzas"].round(2)
+
+    grouped["SredniCzas"] = grouped["SredniCzas"].astype(str) + " s"
+    grouped["Skuteczność"] = grouped["Skuteczność"].astype(str) + " %"
+
+    tabela = tabulate(
+        grouped,
+        headers=["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Średni czas", "Skuteczność"],
+        tablefmt="github",
+        stralign="center",
+        numalign="center"
+    )
+
+    print("✅ Tabela gotowa:\n")
+    print(tabela)
+    return tabela
+
+
+def send_to_discord(tabela):
+    if not tabela:
+        print("⚠️ Brak danych do wysłania na Discord.\n")
         return
 
-    summary_df = aggregate_statistics(df)
-    table_message = format_table(summary_df)
-    send_to_discord(table_message)
-    print("✅ Operacja zakończona pomyślnie.\n")
+    print(f"[{datetime.now()}] 🚀 Wysyłanie tabeli na Discord...")
+    try:
+        response = requests.post(WEBHOOK_URL, json={"content": f"```\n{tabela}\n```"})
+        if response.status_code == 204:
+            print("✅ Webhook wysłany poprawnie.\n")
+        else:
+            print(f"❌ Błąd webhooka: {response.status_code} - {response.text}\n")
+    except Exception as e:
+        print(f"❌ Wyjątek przy wysyłce: {e}\n")
 
+
+def analyze_and_send_loop():
+    print(f"🔁 Rozpoczynam automatyczny tryb przetwarzania co 60 sekund...\n")
+    while True:
+        try:
+            log_data = fetch_log_files_from_ftp()
+            parsed = parse_log_content(log_data)
+            tabela = create_dataframe(parsed)
+            send_to_discord(tabela)
+        except Exception as e:
+            print(f"❌ Błąd głównej pętli: {e}\n")
+        time.sleep(60)
+
+
+# ---------- Flask endpoint (info) ----------
 
 @app.route("/")
 def index():
-    return "🔐 Lockpick Analyzer działa. Wejdź na /run aby uruchomić analizę."
+    return "Lockpick Analyzer działa w tle i wysyła dane co 60s."
 
 
-@app.route("/run")
-def trigger_run():
-    run_analysis()
-    return "✅ Analiza zakończona i wysłana na Discorda."
+# ---------- Start aplikacji ----------
 
-# === URUCHOMIENIE ===
 if __name__ == "__main__":
+    # Uruchomienie pętli automatycznej w osobnym wątku
+    thread = threading.Thread(target=analyze_and_send_loop)
+    thread.daemon = True
+    thread.start()
+
+    # Flask tylko do testu działania — dostępne pod / w razie potrzeby
     app.run(host="0.0.0.0", port=10000)
