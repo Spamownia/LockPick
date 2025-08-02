@@ -1,19 +1,21 @@
-import os
-import io
 import ftplib
-import psycopg2
+import io
+import re
 import pandas as pd
+import psycopg2
+import ssl
 from tabulate import tabulate
 from flask import Flask
 from datetime import datetime
-import requests
+import time
 
-# --- KONFIGURACJE ---
+# === KONFIGURACJE ===
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-FTP_LOG_PATH = "/SCUM/Saved/SaveFiles/Logs/"
+LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+
 WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
 DB_CONFIG = {
@@ -24,121 +26,102 @@ DB_CONFIG = {
     "sslmode": "require"
 }
 
-# --- FLASK APP ---
+# === FLASK ===
 app = Flask(__name__)
 
-@app.route('/')
-def index():
-    return "Lockpick log parser is running."
-
-# --- FUNKCJE ---
+# === FUNKCJE ===
 
 def fetch_log_files_from_ftp():
     print("🔄 Rozpoczynanie pobierania logów z FTP...")
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(FTP_LOG_PATH)
+    logs = []
+    with ftplib.FTP() as ftp:
+        ftp.connect(FTP_HOST, FTP_PORT)
+        ftp.login(FTP_USER, FTP_PASS)
+        ftp.cwd(LOG_DIR)
 
-    try:
-        entries = list(ftp.mlsd())
-        filenames = [name for name, facts in entries if name.startswith("gameplay_") and name.endswith(".log")]
-    except ftplib.error_perm as e:
-        print(f"❌ Błąd listowania plików: {e}")
-        ftp.quit()
-        return ""
+        files = []
+        ftp.retrlines('LIST', lambda line: files.append(line.split()[-1]))
 
-    all_content = ""
-    for filename in filenames:
-        print(f"📄 Pobieranie pliku: {filename}")
-        with io.BytesIO() as bio:
-            ftp.retrbinary(f"RETR {filename}", bio.write)
-            content = bio.getvalue().decode("utf-16-le", errors="ignore")
-            all_content += content + "\n"
+        for filename in files:
+            if filename.startswith("gameplay_") and filename.endswith(".log"):
+                print(f"📁 Pobieranie: {filename}")
+                bio = io.BytesIO()
+                ftp.retrbinary(f"RETR {filename}", bio.write)
+                content = bio.getvalue().decode('utf-16-le', errors='ignore')
+                logs.append(content)
+    print(f"✅ Pobieranie zakończone. Liczba plików: {len(logs)}")
+    return "\n".join(logs)
 
-    ftp.quit()
-    print("✅ Pobieranie zakończone.")
-    return all_content
 
-def parse_log_content(log_content):
-    lines = log_content.splitlines()
-    records = []
+def parse_log_content(log_data):
+    print("🔍 Analiza logów...")
+    pattern = re.compile(
+        r'\[LogMinigame\] \[LockpickingMinigame_C\] User: (?P<user>.*?) \[.*?\] Lock: (?P<lock>.*?) Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>\d+\.\d+)'
+    )
 
-    for line in lines:
-        if "[LogMinigame]" in line and "User:" in line and "Success:" in line:
-            try:
-                user_part = line.split("User:")[1].split()[0]
-                lock_part = next((part for part in line.split() if part.startswith("LockType:")), None)
-                success_part = line.split("Success:")[1].split(".")[0].strip()
-                time_part = line.split("Elapsed time:")[1].split("s")[0].strip()
+    data = []
+    for match in pattern.finditer(log_data):
+        data.append({
+            "Nick": match.group("user"),
+            "Zamek": match.group("lock"),
+            "Sukces": match.group("success") == "Yes",
+            "Czas (s)": float(match.group("time"))
+        })
 
-                nick = user_part
-                lock_type = lock_part.split(":")[1] if lock_part else "Unknown"
-                success = success_part == "Yes"
-                elapsed = float(time_part)
+    print(f"✅ Rozpoznano poprawnie wpisów: {len(data)}")
+    return pd.DataFrame(data)
 
-                records.append({
-                    "Nick": nick,
-                    "Zamek": lock_type,
-                    "Sukces": success,
-                    "Czas": elapsed
-                })
-            except Exception as e:
-                print(f"⚠️ Błąd parsowania linii: {line}\n{e}")
 
-    print(f"🔍 Rozpoznano {len(records)} wpisów.")
-    return records
-
-def aggregate_statistics(records):
-    df = pd.DataFrame(records)
-    if df.empty:
-        print("⚠️ Brak danych do przetworzenia.")
-        return ""
-
+def aggregate_statistics(df):
+    print("📊 Agregowanie danych...")
     grouped = df.groupby(["Nick", "Zamek"]).agg(
-        Próby=("Sukces", "count"),
-        Udane=("Sukces", "sum"),
-        Średni_czas=("Czas", "mean")
+        Ilość=('Sukces', 'count'),
+        Udane=('Sukces', 'sum'),
+        Nieudane=('Sukces', lambda x: (~x).sum()),
+        Skuteczność=('Sukces', lambda x: f"{(x.sum() / len(x)) * 100:.2f}%"),
+        Średni_czas=('Czas (s)', lambda x: f"{x.mean():.2f}s")
     ).reset_index()
+    return grouped
 
-    grouped["Nieudane"] = grouped["Próby"] - grouped["Udane"]
-    grouped["Skuteczność"] = grouped["Udane"] / grouped["Próby"] * 100
-    grouped["Średni_czas"] = grouped["Średni_czas"].map(lambda x: f"{x:.2f} s")
-    grouped["Skuteczność"] = grouped["Skuteczność"].map(lambda x: f"{x:.0f}%")
 
-    final_df = grouped[["Nick", "Zamek", "Próby", "Udane", "Nieudane", "Skuteczność", "Średni_czas"]]
-    table = tabulate(final_df, headers="keys", tablefmt="grid", stralign="center", numalign="center")
+def format_table(df):
+    print("📋 Formatowanie tabeli...")
+    table = tabulate(df, headers="keys", tablefmt="grid", showindex=False, stralign="center", numalign="center")
+    return f"```{table}```"
 
-    print("📊 Tabela skuteczności wygenerowana.")
-    return table
 
-def send_to_discord(table_text):
+def send_to_discord(message):
     print("📤 Wysyłanie danych do Discorda...")
-    payload = {
-        "content": f"```\n{table_text}\n```"
-    }
+    import requests
+    payload = {"content": message}
     response = requests.post(WEBHOOK_URL, json=payload)
-    if response.status_code == 204:
-        print("✅ Wysłano poprawnie.")
-    else:
-        print(f"❌ Błąd wysyłania: {response.status_code} – {response.text}")
+    print(f"📬 Odpowiedź Discorda: {response.status_code}")
 
-def run():
+
+def run_analysis():
     log_data = fetch_log_files_from_ftp()
-    if not log_data:
-        print("🚫 Brak danych do analizy.")
+    df = parse_log_content(log_data)
+
+    if df.empty:
+        print("⚠️ Brak danych do analizy.")
         return
 
-    records = parse_log_content(log_data)
-    if not records:
-        print("🚫 Nie znaleziono poprawnych wpisów.")
-        return
+    summary_df = aggregate_statistics(df)
+    table_message = format_table(summary_df)
+    send_to_discord(table_message)
+    print("✅ Operacja zakończona pomyślnie.\n")
 
-    table = aggregate_statistics(records)
-    if table:
-        send_to_discord(table)
 
-# --- URUCHOMIENIE ---
+@app.route("/")
+def index():
+    return "🔐 Lockpick Analyzer działa. Wejdź na /run aby uruchomić analizę."
+
+
+@app.route("/run")
+def trigger_run():
+    run_analysis()
+    return "✅ Analiza zakończona i wysłana na Discorda."
+
+# === URUCHOMIENIE ===
 if __name__ == "__main__":
-    run()
     app.run(host="0.0.0.0", port=10000)
