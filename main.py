@@ -1,109 +1,71 @@
-import os import time from utils.parser import parse_lockpicking_log from utils.db import insert_entries, fetch_lockpicking_stats from utils.image_generator import generate_table_image from utils.discord_webhook import send_webhook
+import time from utils.parser import parse_lockpicking_log from utils.db import insert_lockpicking_entry, fetch_lockpicking_stats from utils.image_generator import generate_stats_image from utils.discord_webhook import send_webhook
 
-LAST_IMAGE_HASH = ""
+LOG_FILE_PATH = "logs/latest_log.txt" WEBHOOK_URL = "https://discord.com/api/webhooks/XXX/YYY"  # <- ZMIEŃ TO
 
-def file_hash(path): import hashlib with open(path, "rb") as f: return hashlib.md5(f.read()).hexdigest()
+last_sent_hash = None
 
-def main_loop(): global LAST_IMAGE_HASH LOG_PATH = "logs/latest_log.txt" IMAGE_PATH = "output/lock_stats.png"
+while True: try: entries = parse_lockpicking_log(LOG_FILE_PATH) for entry in entries: insert_lockpicking_entry(entry)
 
-if not os.path.exists("output"):
-    os.makedirs("output")
+stats = fetch_lockpicking_stats()
+    image_path = "output/stats.png"
+    current_hash = hash(str(stats))
 
-while True:
-    if not os.path.exists(LOG_PATH):
-        print("Brak logu.")
-        time.sleep(15)
-        continue
+    if current_hash != last_sent_hash:
+        generate_stats_image(stats, image_path)
+        send_webhook("Lockpicking Stats", file_path=image_path, webhook_url=WEBHOOK_URL)
+        last_sent_hash = current_hash
 
-    try:
-        entries = parse_lockpicking_log(LOG_PATH)
-        insert_entries(entries)
-        stats = fetch_lockpicking_stats()
-        generate_table_image(stats, IMAGE_PATH)
+except Exception as e:
+    print(f"[ERROR] {e}")
 
-        current_hash = file_hash(IMAGE_PATH)
-        if current_hash != LAST_IMAGE_HASH:
-            send_webhook(
-                username="SCUM LockpickBot",
-                content="\ud83d\udd10 Statystyki lockpickingu:",
-                file_path=IMAGE_PATH,
-                webhook_url="https://discord.com/api/webhooks/..."  # <--- Wstaw swój webhook
-            )
-            LAST_IMAGE_HASH = current_hash
-            print("\ud83d\udfe2 Wysłano nowy obrazek na Discord.")
-        else:
-            print("\ud83d\udd01 Brak zmian — nic nie wysyłamy.")
-    except Exception as e:
-        print("\u274c Błąd:", e)
-
-    time.sleep(15)
-
-if name == "main": main_loop()
+time.sleep(15)
 
 utils/parser.py
 
-import re
-
-def parse_lockpicking_log(filepath): pattern = re.compile( r'   (?P<nick>\w+) (?P<result>FAILED|SUCCESSFULLY) lockpicking (?P<lock>\w+).*?in (?P<time>\d+.\d+) seconds' )
-
-entries = []
-
-with open(filepath, "r", encoding="utf-8") as f:
-    for line in f:
-        match = pattern.search(line)
-        if match:
-            entries.append({
-                "nick": match.group("nick"),
-                "lock": match.group("lock"),
-                "result": "Success" if match.group("result") == "SUCCESSFULLY" else "Failure",
-                "time": float(match.group("time"))
-            })
-return entries
+def parse_lockpicking_log(filepath): entries = [] with open(filepath, "r", encoding="utf-16") as f: for line in f: if "[LogMinigame] [LockpickingMinigame_C]" in line: try: nick = line.split("Character=")[1].split()[0] lock = line.split("Target:")[1].split()[0] result = "Success" if "Success" in line else "Failure" time_taken = float(line.split("Time:")[1].split()[0]) entries.append({"nick": nick, "lock": lock, "result": result, "time": time_taken}) except Exception as e: print(f"[PARSE ERROR] {e} in line: {line}") return entries
 
 utils/db.py
 
 import psycopg
 
-DB_CONFIG = { "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech", "dbname": "neondb", "user": "neondb_owner", "password": "npg_dRU1YCtxbh6v", "sslmode": "require", "channel_binding": "require" }
+def get_conn(): return psycopg.connect( host='ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech', dbname='neondb', user='neondb_owner', password='npg_dRU1YCtxbh6v', sslmode='require', channel_binding='require' )
 
-def insert_entries(entries): if not entries: return with psycopg.connect(**DB_CONFIG) as conn: with conn.cursor() as cur: for entry in entries: cur.execute(""" INSERT INTO lockpicking_logs (nick, lock, result, time) VALUES (%s, %s, %s, %s) """, (entry['nick'], entry['lock'], entry['result'], entry['time'])) conn.commit()
+def insert_lockpicking_entry(entry): with get_conn() as conn: with conn.cursor() as cur: cur.execute(""" INSERT INTO lockpicking_logs (nick, lock, result, time) VALUES (%s, %s, %s, %s) """, (entry["nick"], entry["lock"], entry["result"], entry["time"]))
 
-def fetch_lockpicking_stats(): with psycopg.connect(**DB_CONFIG) as conn: with conn.cursor() as cur: cur.execute(""" SELECT nick, lock, COUNT() AS total_attempts, SUM(CASE WHEN result = 'Success' THEN 1 ELSE 0 END) AS successes, SUM(CASE WHEN result = 'Failure' THEN 1 ELSE 0 END) AS failures, ROUND(SUM(CASE WHEN result = 'Success' THEN 1 ELSE 0 END)::float / COUNT() * 100, 1) AS accuracy, ROUND(AVG(time), 2) AS avg_time FROM lockpicking_logs GROUP BY nick, lock ORDER BY accuracy DESC """) return cur.fetchall()
+def fetch_lockpicking_stats(): with get_conn() as conn: with conn.cursor() as cur: cur.execute(""" SELECT nick, lock, COUNT() AS total, SUM(CASE WHEN result = 'Success' THEN 1 ELSE 0 END) AS success, SUM(CASE WHEN result = 'Failure' THEN 1 ELSE 0 END) AS failure, ROUND(SUM(CASE WHEN result = 'Success' THEN 1 ELSE 0 END)::float / COUNT() * 100, 1) AS accuracy, ROUND(AVG(time), 2) AS avg_time FROM lockpicking_logs GROUP BY nick, lock """) return cur.fetchall()
 
 utils/image_generator.py
 
 from PIL import Image, ImageDraw, ImageFont
 
-def generate_table_image(data, output_path): headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"] font = ImageFont.truetype("arial.ttf", 20)
+def generate_stats_image(data, output_path): headers = ["Nick", "Zamek", "Próby", "Udane", "Nieudane", "Skuteczność", "Śr. czas"] font = ImageFont.load_default()
 
-col_widths = [max(len(str(val)) for val in [h] + [row[i] for row in data]) * 14 for i, h in enumerate(headers)]
+row_height = 25
+padding = 10
+col_widths = [max(len(str(row[i])) for row in data + [headers]) * 10 for i in range(len(headers))]
+width = sum(col_widths) + padding * 2
+height = (len(data) + 1) * row_height + padding * 2
 
-total_width = sum(col_widths) + len(headers) * 10
-row_height = 40
-img_height = (len(data) + 1) * row_height + 20
+img = Image.new("RGB", (width, height), "black")
+draw = ImageDraw.Draw(img)
 
-image = Image.new("RGB", (total_width, img_height), "black")
-draw = ImageDraw.Draw(image)
-
-y = 10
-x = 0
-for i, h in enumerate(headers):
-    draw.text((x + 5, y), h, font=font, fill="white")
-    x += col_widths[i] + 10
+y = padding
+for i, header in enumerate(headers):
+    x = padding + sum(col_widths[:i])
+    draw.text((x, y), header, fill="white", font=font)
 
 y += row_height
 for row in data:
-    x = 0
-    for i, val in enumerate(row):
-        draw.text((x + 5, y), str(val), font=font, fill="white")
-        x += col_widths[i] + 10
+    for i, cell in enumerate(row):
+        x = padding + sum(col_widths[:i])
+        draw.text((x, y), str(cell), fill="white", font=font)
     y += row_height
 
-image.save(output_path)
+img.save(output_path)
 
 utils/discord_webhook.py
 
 import requests
 
-def send_webhook(username, content, file_path, webhook_url): with open(file_path, 'rb') as f: files = {'file': f} data = { 'username': username, 'content': content } requests.post(webho
-                                                                                                                                                                                    ok_url, data=data, files=files)
+def send_webhook(username, file_path, webhook_url): with open(file_path, "rb") as f: requests.post( webhook_url, data={"username": username}, files={"file": f} )
+
