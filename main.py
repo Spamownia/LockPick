@@ -1,172 +1,133 @@
-import io
+import os
 import re
 import time
-import threading
+import ftplib
 import requests
-import pandas as pd
-from ftplib import FTP
-from tabulate import tabulate
 from flask import Flask
+from threading import Thread
+from dotenv import load_dotenv
 
-# === KONFIGURACJA ===
-FTP_HOST = "176.57.174.10"
-FTP_PORT = 50021
-FTP_USER = "gpftp37275281717442833"
-FTP_PASS = "LXNdGShY"
-FTP_LOG_PATH = "/SCUM/Saved/SaveFiles/Logs/"
-WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+load_dotenv()
 
-last_offset = 0
-last_filename = None
+FTP_HOST = os.getenv("FTP_HOST")
+FTP_PORT = int(os.getenv("FTP_PORT", "21"))
+FTP_USER = os.getenv("FTP_USER")
+FTP_PASS = os.getenv("FTP_PASS")
+FTP_DIR = os.getenv("FTP_DIR", "/SCUM/Saved/SaveFiles/Logs")
+WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
+SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "15"))  # sekund
 
-# === FLASK (utrzymanie działania) ===
 app = Flask(__name__)
+last_seen_line = ""
 
-@app.route("/")
-def index():
-    return "", 200  # Pusty 200 OK
+LOG_LINE_REGEX = re.compile(
+    r'(?P<timestamp>\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}): \[LogMinigame\] \[LockpickingMinigame_C\] '
+    r'User: (?P<user>.+?) \(\d+, (?P<steamid>\d+)\)\. '
+    r'Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[\d.]+)\. '
+    r'Failed attempts: (?P<fails>\d+)\. Target object: (?P<object>.+?)\(ID: (?P<object_id>\d+)\)\. '
+    r'Lock type: (?P<lock_type>\w+)\. User owner: \d+\(\[(?P<owner_steamid>\d+)\] (?P<owner>.+?)\)\. '
+    r'Location: X=(?P<x>-?[\d.]+) Y=(?P<y>-?[\d.]+) Z=(?P<z>-?[\d.]+)'
+)
 
-# === FTP: NAJNOWSZY PLIK ===
+def ftp_connect():
+    ftp = ftplib.FTP()
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.encoding = "windows-1250"
+    return ftp
+
 def get_latest_log_file():
-    ftp = FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(FTP_LOG_PATH)
+    ftp = ftp_connect()
+    ftp.cwd(FTP_DIR)
 
-    filenames = []
+    files = []
+    ftp.retrlines("LIST", files.append)
 
-    def parse_line(line):
-        parts = line.split()
-        if len(parts) >= 9:
-            name = parts[-1]
-            if name.startswith("gameplay_") and name.endswith(".log"):
-                filenames.append(name)
+    log_files = [f.split()[-1] for f in files if f.split()[-1].startswith("log_")]
+    log_files.sort(reverse=True)
 
-    ftp.retrlines('LIST', parse_line)
-
-    if not filenames:
+    if not log_files:
         ftp.quit()
-        return None, None
+        return None, []
 
-    latest = sorted(filenames)[-1]
-    bio = io.BytesIO()
-    ftp.retrbinary(f"RETR {latest}", bio.write)
+    latest = log_files[0]
+    lines = []
+    ftp.retrlines(f"RETR {latest}", lines.append)
     ftp.quit()
-    bio.seek(0)
-    return latest, bio.read().decode("utf-16le", errors="ignore")
+    return latest, lines
 
-# === FTP: NOWE DANE Z OFFSETU ===
-def get_new_log_data(filename, start_offset):
-    ftp = FTP()
-    ftp.connect(FTP_HOST, FTP_PORT)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(FTP_LOG_PATH)
-    bio = io.BytesIO()
-    def handle_binary(data):
-        bio.write(data)
+def send_to_discord(data):
+    embed = {
+        "title": f"🔐 Lockpicking Attempt - {data['user']}",
+        "color": 0x3498db if data['success'] == "Yes" else 0xe74c3c,
+        "fields": [
+            {"name": "👤 Użytkownik", "value": data['user'], "inline": True},
+            {"name": "✅ Sukces", "value": data['success'], "inline": True},
+            {"name": "⏱️ Czas", "value": f"{data['time']}s", "inline": True},
+            {"name": "🔒 Próby", "value": data['fails'], "inline": True},
+            {"name": "🎯 Obiekt", "value": data['object'], "inline": True},
+            {"name": "🔧 Typ zamka", "value": data['lock_type'], "inline": True},
+            {"name": "📦 Właściciel", "value": data['owner'], "inline": True},
+            {"name": "📍 Lokalizacja", "value": f"X={data['x']} Y={data['y']} Z={data['z']}", "inline": False},
+        ],
+        "timestamp": f"{data['timestamp'].replace('.', '-', 2).replace('.', ':', 2)}"
+    }
+
+    payload = {
+        "username": "LockpickingLogger",
+        "embeds": [embed]
+    }
+
     try:
-        ftp.sendcmd("TYPE I")
-        size = ftp.size(filename)
-        if start_offset >= size:
-            ftp.quit()
-            return "", start_offset
-        ftp.retrbinary(f"RETR {filename}", callback=handle_binary, rest=start_offset)
+        response = requests.post(WEBHOOK_URL, json=payload)
+        if response.status_code != 204:
+            print(f"❌ Błąd wysyłania webhooka: {response.status_code} - {response.text}")
     except Exception as e:
-        print(f"❌ Błąd FTP: {e}")
-        ftp.quit()
-        return "", start_offset
-    ftp.quit()
-    bio.seek(0)
-    return bio.read().decode("utf-16le", errors="ignore"), size
+        print(f"❌ Wyjątek podczas wysyłania webhooka: {e}")
 
-# === PARSOWANIE ===
-def parse_log_minigame(log_text):
-    pattern = re.compile(
-        r"\[LogMinigame\] \[LockpickingMinigame_C\] User: (?P<user>\w+).*?Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[\d\.]+)\..*?Lock type: (?P<lock>\w+)\.",
-        re.DOTALL
-    )
-    entries = []
-    for match in pattern.finditer(log_text):
-        user = match.group("user")
-        success = match.group("success") == "Yes"
-        time_taken = float(match.group("time"))
-        lock_type = match.group("lock")
-        entries.append((user, lock_type, success, time_taken))
-    return entries
+def poll_logs():
+    global last_seen_line
 
-# === ANALIZA DANYCH ===
-def analyze_data(entries):
-    if not entries:
-        return pd.DataFrame()
-    df = pd.DataFrame(entries, columns=["Nick", "Zamek", "Sukces", "Czas"])
-    grouped = df.groupby(["Nick", "Zamek"]).agg(
-        Wszystkie=("Sukces", "count"),
-        Udane=("Sukces", "sum"),
-        Nieudane=("Sukces", lambda x: (~x).sum()),
-        Średni_czas=("Czas", "mean"),
-    )
-    grouped["Skuteczność"] = (grouped["Udane"] / grouped["Wszystkie"] * 100).round(1).astype(str) + "%"
-    grouped["Średni_czas"] = grouped["Średni_czas"].round(2).astype(str) + "s"
-    grouped = grouped.reset_index().sort_values(by=["Nick", "Zamek"])
-    return grouped[["Nick", "Zamek", "Wszystkie", "Udane", "Nieudane", "Skuteczność", "Średni_czas"]]
-
-# === FORMATOWANIE TABELI ===
-def format_table(df):
-    if df.empty:
-        return None
-    return "```\n" + tabulate(
-        df.values,
-        headers=df.columns,
-        tablefmt="github",
-        stralign="center",
-        numalign="center"
-    ) + "\n```"
-
-# === WYSYŁKA NA DISCORDA ===
-def send_to_discord(content):
-    response = requests.post(WEBHOOK_URL, json={"content": content})
-    if response.status_code in (200, 204):
-        print("✅ Wysłano na Discord.")
-    else:
-        print(f"❌ Błąd wysyłania: {response.status_code} – {response.text}")
-
-# === PĘTLA BOTA ===
-def bot_loop():
-    global last_filename, last_offset
-    print("🚀 Start bota LockpickingLogger...")
-    last_filename, full_log = get_latest_log_file()
-    if not last_filename:
-        print("❌ Brak plików logów do analizy.")
-        return
-
-    print(f"📁 Ostatni log: {last_filename}")
-    parsed = parse_log_minigame(full_log)
-    last_offset = len(full_log.encode("utf-16le"))
-    analyzed = analyze_data(parsed)
-    msg = format_table(analyzed)
-    if msg:
-        send_to_discord(msg)
+    print("🕵️‍♂️ Start monitorowania FTP...")
 
     while True:
-        time.sleep(60)
-        print(f"🔄 Sprawdzanie nowości w {last_filename}...")
-        new_data, new_offset = get_new_log_data(last_filename, last_offset)
-        if new_data:
-            new_entries = parse_log_minigame(new_data)
-            if new_entries:
-                analyzed = analyze_data(new_entries)
-                msg = format_table(analyzed)
-                if msg:
-                    send_to_discord(msg)
-                else:
-                    print("ℹ️ Brak nowych wpisów do wysyłki.")
-            else:
-                print("ℹ️ Nie znaleziono nowych prób.")
-            last_offset = new_offset
-        else:
-            print("⏳ Brak nowych danych.")
+        try:
+            filename, log_lines = get_latest_log_file()
+            if not filename or not log_lines:
+                print("📄 Brak logów.")
+                time.sleep(SCAN_INTERVAL)
+                continue
 
-# === START ===
+            new_lines = []
+            if last_seen_line in log_lines:
+                index = log_lines.index(last_seen_line) + 1
+                new_lines = log_lines[index:]
+            else:
+                new_lines = log_lines[-50:]  # startowo tylko ostatnie 50 linii
+
+            for line in new_lines:
+                if "[LockpickingMinigame_C]" in line:
+                    match = LOG_LINE_REGEX.match(line)
+                    if match:
+                        data = match.groupdict()
+                        print(f"🔐 Log: {data}")
+                        send_to_discord(data)
+                    else:
+                        print(f"⚠️ Niedopasowana linia: {line}")
+
+            if log_lines:
+                last_seen_line = log_lines[-1]
+
+        except Exception as e:
+            print(f"❌ Błąd: {e}")
+
+        time.sleep(SCAN_INTERVAL)
+
+@app.route("/")
+def home():
+    return "LockpickingLogger działa! 🔐"
+
 if __name__ == "__main__":
-    threading.Thread(target=bot_loop, daemon=True).start()
+    print("🚀 Start bota LockpickingLogger...")
+    Thread(target=poll_logs, daemon=True).start()
     app.run(host="0.0.0.0", port=8080)
