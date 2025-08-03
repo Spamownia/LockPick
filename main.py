@@ -23,13 +23,23 @@ def get_latest_log_file():
     ftp.connect(FTP_HOST, FTP_PORT)
     ftp.login(FTP_USER, FTP_PASS)
     ftp.cwd(FTP_LOG_PATH)
+
     filenames = []
-    ftp.retrlines('NLST', filenames.append)
-    gameplay_logs = sorted([f for f in filenames if f.startswith("gameplay_") and f.endswith(".log")])
-    if not gameplay_logs:
+
+    def parse_line(line):
+        parts = line.split()
+        if len(parts) >= 9:
+            name = parts[-1]
+            if name.startswith("gameplay_") and name.endswith(".log"):
+                filenames.append(name)
+
+    ftp.retrlines('LIST', parse_line)
+
+    if not filenames:
         ftp.quit()
         return None, None
-    latest = gameplay_logs[-1]
+
+    latest = sorted(filenames)[-1]
     bio = io.BytesIO()
     ftp.retrbinary(f"RETR {latest}", bio.write)
     ftp.quit()
@@ -50,12 +60,12 @@ def get_new_log_data(filename, start_offset):
         size = ftp.size(filename)
         if start_offset >= size:
             ftp.quit()
-            return ""
+            return "", start_offset
         ftp.retrbinary(f"RETR {filename}", callback=handle_binary, rest=start_offset)
     except Exception as e:
         print(f"❌ Błąd przy pobieraniu danych od offsetu: {e}")
         ftp.quit()
-        return ""
+        return "", start_offset
     ftp.quit()
     bio.seek(0)
     return bio.read().decode("utf-16le", errors="ignore"), size
