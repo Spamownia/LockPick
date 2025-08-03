@@ -1,130 +1,148 @@
+import io
 import re
 import time
-import threading
-from ftplib import FTP
-from flask import Flask
 import requests
+import pandas as pd
+from ftplib import FTP
+from tabulate import tabulate
+from flask import Flask
+import threading
 
 # === KONFIGURACJA ===
+
 FTP_HOST = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
-FTP_PASS = "npg_dRU1YCtxbh6v"
-LOG_PATH = "/SCUM/Saved/SaveFiles/Logs"
-CHECK_INTERVAL = 15
-WEBHOOK_URL = "https://discord.com/api/webhooks/1383407890663997450/hr2zvr2PjO20IDLIk5nZd8juZDxG9kYkOOZ0c2_sqzGtuXra8Dz-HbhtnhtF3Yb0Hsgi"
+FTP_PASS = "LXNdGShY"
+FTP_LOG_PATH = "/SCUM/Saved/SaveFiles/Logs/"
+WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# === STAN ===
-PROCESSED_FILES = set()
+CHECK_INTERVAL = 60  # sekundy
 
-# === FLASK ===
 app = Flask(__name__)
-@app.route("/")
-def index():
-    return "LockpickingLogger is running."
+seen_entries = set()  # unikalne wpisy, aby nie duplikować
+last_filename = None
 
-def run_flask():
-    app.run(host="0.0.0.0", port=8080)
+# === FUNKCJE POMOCNICZE ===
 
-# === FTP ===
 def connect_ftp():
     ftp = FTP()
-    ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+    ftp.connect(FTP_HOST, FTP_PORT)
     ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(LOG_PATH)
+    ftp.cwd(FTP_LOG_PATH)
     return ftp
 
-def list_log_files(ftp):
-    return [f for f in ftp.nlst() if f.startswith("log") and f.endswith(".log")]
+def get_log_filenames(ftp):
+    filenames = []
+    def parse_line(line):
+        parts = line.split()
+        if len(parts) >= 9:
+            fname = parts[-1]
+            if fname.startswith("gameplay_") and fname.endswith(".log"):
+                filenames.append(fname)
+    ftp.retrlines('LIST', parse_line)
+    return sorted(filenames)
 
 def read_log_file(ftp, filename):
-    lines = []
-    ftp.retrbinary(f"RETR {filename}", lambda data: lines.append(data))
-    content = b"".join(lines).decode("windows-1250", errors="ignore")
-    return content.splitlines()
+    bio = io.BytesIO()
+    ftp.retrbinary(f"RETR {filename}", bio.write)
+    bio.seek(0)
+    return bio.read().decode("utf-16le")
 
-# === PARSER + DISCORD ===
-def parse_lockpicking_line(line):
-    pattern = (
-        r"\[LockpickingMinigame_C\] User: (?P<nick>.+?) \(\d+, (?P<steam_id>\d+)\)\. "
-        r"Success: (?P<success>\w+)\. Elapsed time: (?P<elapsed>[\d.]+)\. "
-        r"Failed attempts: (?P<fails>\d+)\. Target object: (?P<object>.+?)\(ID: (?P<id>\d+)\)\. "
-        r"Lock type: (?P<lock_type>\w+)\. User owner: \d+\(\[(?P<owner_steam>\d+)\] (?P<owner_nick>.+?)\)\. "
-        r"Location: X=(?P<x>[-\d.]+) Y=(?P<y>[-\d.]+) Z=(?P<z>[-\d.]+)"
+def parse_log_minigame(log_text):
+    pattern = re.compile(
+        r"\[LogMinigame\] \[LockpickingMinigame_C\].*?User: (?P<user>\w+).*?Success: (?P<success>Yes|No).*?Elapsed time: (?P<time>[\d.]+).*?Lock type: (?P<lock>\w+)",
+        re.DOTALL
     )
-    match = re.search(pattern, line)
-    if not match:
-        print(f"⚠️ Nieparsowalna linia:\n{line}")
-        return
+    entries = []
+    for match in pattern.finditer(log_text):
+        raw_line = match.group(0)
+        if raw_line not in seen_entries:
+            seen_entries.add(raw_line)
+            user = match.group("user")
+            success = match.group("success") == "Yes"
+            time_taken = float(match.group("time"))
+            lock_type = match.group("lock")
+            entries.append((user, lock_type, success, time_taken))
+    return entries
 
-    data = match.groupdict()
-    print(f"🔓 {data['nick']} próbował lockpickingu ({data['success']})")
+def analyze_data(entries):
+    df = pd.DataFrame(entries, columns=["Nick", "Zamek", "Sukces", "Czas"])
+    if df.empty:
+        return pd.DataFrame()
+    grouped = df.groupby(["Nick", "Zamek"]).agg(
+        Wszystkie=("Sukces", "count"),
+        Udane=("Sukces", "sum"),
+        Nieudane=("Sukces", lambda x: (~x).sum()),
+        Średni_czas=("Czas", "mean"),
+    )
+    grouped["Skuteczność"] = (grouped["Udane"] / grouped["Wszystkie"] * 100).round(1).astype(str) + "%"
+    grouped["Średni_czas"] = grouped["Średni_czas"].round(2).astype(str) + "s"
+    grouped = grouped.reset_index().sort_values(by=["Nick", "Zamek"])
+    return grouped[["Nick", "Zamek", "Wszystkie", "Udane", "Nieudane", "Skuteczność", "Średni_czas"]]
 
-    embed = {
-        "title": f"🔐 Lockpicking {'sukces' if data['success'] == 'true' else 'porażka'}",
-        "color": 3066993 if data['success'] == 'true' else 15158332,
-        "fields": [
-            {"name": "Gracz", "value": f"{data['nick']} ({data['steam_id']})", "inline": True},
-            {"name": "Czas", "value": f"{data['elapsed']}s", "inline": True},
-            {"name": "Nieudane próby", "value": data['fails'], "inline": True},
-            {"name": "Zamek", "value": data['lock_type'], "inline": True},
-            {"name": "Obiekt", "value": data['object'], "inline": False},
-            {"name": "Właściciel", "value": f"{data['owner_nick']} ({data['owner_steam']})", "inline": False},
-            {"name": "Pozycja", "value": f"X={data['x']}, Y={data['y']}, Z={data['z']}", "inline": False}
-        ],
-        "footer": {"text": "SCUM Lockpicking Logger"},
-    }
+def format_table(df):
+    if df.empty:
+        return "Brak nowych danych do wyświetlenia."
+    table = tabulate(df.values, headers=df.columns, tablefmt="github", stralign="center", numalign="center")
+    return f"\n{table}\n"
 
+def send_to_discord(content):
+    response = requests.post(WEBHOOK_URL, json={"content": content})
+    if response.status_code not in (200, 204):
+        print(f"❌ Błąd wysyłania na Discord: {response.status_code} – {response.text}")
+
+# === GŁÓWNA PĘTLA ===
+
+def monitor_loop():
+    global last_filename
+    print("🚀 Start bota LockpickingLogger...")
+
+    # Initial scan
     try:
-        requests.post(WEBHOOK_URL, json={"embeds": [embed]})
-    except Exception as e:
-        print(f"❌ Błąd wysyłania do Discorda: {e}")
-
-# === PRZETWARZANIE ===
-def process_lines(lines):
-    for line in lines:
-        if "[LogMinigame] [LockpickingMinigame_C]" in line:
-            parse_lockpicking_line(line)
-
-def scan_all_logs_at_startup():
-    print("🔍 Skanowanie wszystkich logów przy starcie...")
-    try:
+        print("🔍 Skanowanie wszystkich logów przy starcie...")
         ftp = connect_ftp()
-        log_files = list_log_files(ftp)
-        for filename in log_files:
-            content = read_log_file(ftp, filename)
-            process_lines(content)
-            PROCESSED_FILES.add(filename)
+        all_files = get_log_filenames(ftp)
+        for fname in all_files:
+            content = read_log_file(ftp, fname)
+            entries = parse_log_minigame(content)
         ftp.quit()
+        print(f"✅ Wczytano i zindeksowano {len(seen_entries)} unikalnych wpisów.")
     except Exception as e:
         print(f"❌ Błąd FTP (startup): {e}")
 
-def monitor_ftp():
-    print("🕵️‍♂️ Start monitorowania FTP...")
+    # Loop
     while True:
         try:
             ftp = connect_ftp()
-            current_files = list_log_files(ftp)
-            new_files = [f for f in current_files if f not in PROCESSED_FILES]
-            for filename in new_files:
-                content = read_log_file(ftp, filename)
-                process_lines(content)
-                PROCESSED_FILES.add(filename)
+            filenames = get_log_filenames(ftp)
+            if not filenames:
+                print("⚠️ Brak plików logów.")
+                time.sleep(CHECK_INTERVAL)
+                continue
+            latest_file = filenames[-1]
+            if last_filename != latest_file:
+                print(f"📁 Nowy plik logów: {latest_file}")
+                last_filename = latest_file
+            content = read_log_file(ftp, latest_file)
             ftp.quit()
+            new_entries = parse_log_minigame(content)
+            if new_entries:
+                df = analyze_data(new_entries)
+                table = format_table(df)
+                send_to_discord(table)
+            else:
+                print("⏱️ Brak nowych wpisów.")
         except Exception as e:
             print(f"❌ Błąd monitorowania FTP: {e}")
         time.sleep(CHECK_INTERVAL)
 
-# === START ===
+# === FLASK KEEP-ALIVE ===
+
+@app.route("/")
+def index():
+    return "LockpickingLogger działa 🚀"
+
 if __name__ == "__main__":
-    print("🚀 Start bota LockpickingLogger...")
-
-    # Skan przy starcie
-    scan_all_logs_at_startup()
-
-    # Monitoring FTP
-    monitor_thread = threading.Thread(target=monitor_ftp)
-    monitor_thread.start()
-
-    # Flask keep-alive
-    run_flask()
+    threading.Thread(target=monitor_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=8080)
