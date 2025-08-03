@@ -1,10 +1,12 @@
 import io
 import re
 import time
+import threading
 import requests
 import pandas as pd
 from ftplib import FTP
 from tabulate import tabulate
+from flask import Flask
 
 # === KONFIGURACJA ===
 FTP_HOST = "176.57.174.10"
@@ -17,7 +19,14 @@ WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4
 last_offset = 0
 last_filename = None
 
-# === POŁĄCZENIE FTP I POBRANIE NAJNOWSZEGO PLIKU ===
+# === FLASK (utrzymanie działania) ===
+app = Flask(__name__)
+
+@app.route("/")
+def index():
+    return "", 200  # Pusty 200 OK
+
+# === FTP: NAJNOWSZY PLIK ===
 def get_latest_log_file():
     ftp = FTP()
     ftp.connect(FTP_HOST, FTP_PORT)
@@ -46,7 +55,7 @@ def get_latest_log_file():
     bio.seek(0)
     return latest, bio.read().decode("utf-16le", errors="ignore")
 
-# === POBIERANIE NOWYCH DANYCH ===
+# === FTP: NOWE DANE Z OFFSETU ===
 def get_new_log_data(filename, start_offset):
     ftp = FTP()
     ftp.connect(FTP_HOST, FTP_PORT)
@@ -56,21 +65,21 @@ def get_new_log_data(filename, start_offset):
     def handle_binary(data):
         bio.write(data)
     try:
-        ftp.sendcmd("TYPE I")  # binary mode
+        ftp.sendcmd("TYPE I")
         size = ftp.size(filename)
         if start_offset >= size:
             ftp.quit()
             return "", start_offset
         ftp.retrbinary(f"RETR {filename}", callback=handle_binary, rest=start_offset)
     except Exception as e:
-        print(f"❌ Błąd przy pobieraniu danych od offsetu: {e}")
+        print(f"❌ Błąd FTP: {e}")
         ftp.quit()
         return "", start_offset
     ftp.quit()
     bio.seek(0)
     return bio.read().decode("utf-16le", errors="ignore"), size
 
-# === PARSOWANIE LOGÓW ===
+# === PARSOWANIE ===
 def parse_log_minigame(log_text):
     pattern = re.compile(
         r"\[LogMinigame\] \[LockpickingMinigame_C\] User: (?P<user>\w+).*?Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[\d\.]+)\..*?Lock type: (?P<lock>\w+)\.",
@@ -121,17 +130,18 @@ def send_to_discord(content):
     else:
         print(f"❌ Błąd wysyłania: {response.status_code} – {response.text}")
 
-# === GŁÓWNA PĘTLA ===
-if __name__ == "__main__":
+# === PĘTLA BOTA ===
+def bot_loop():
+    global last_filename, last_offset
     print("🚀 Start bota LockpickingLogger...")
     last_filename, full_log = get_latest_log_file()
     if not last_filename:
         print("❌ Brak plików logów do analizy.")
-        exit(1)
+        return
 
     print(f"📁 Ostatni log: {last_filename}")
     parsed = parse_log_minigame(full_log)
-    offset = len(full_log.encode("utf-16le"))  # zapamiętaj długość bajtową
+    last_offset = len(full_log.encode("utf-16le"))
     analyzed = analyze_data(parsed)
     msg = format_table(analyzed)
     if msg:
@@ -140,7 +150,7 @@ if __name__ == "__main__":
     while True:
         time.sleep(60)
         print(f"🔄 Sprawdzanie nowości w {last_filename}...")
-        new_data, new_offset = get_new_log_data(last_filename, offset)
+        new_data, new_offset = get_new_log_data(last_filename, last_offset)
         if new_data:
             new_entries = parse_log_minigame(new_data)
             if new_entries:
@@ -152,6 +162,11 @@ if __name__ == "__main__":
                     print("ℹ️ Brak nowych wpisów do wysyłki.")
             else:
                 print("ℹ️ Nie znaleziono nowych prób.")
-            offset = new_offset
+            last_offset = new_offset
         else:
             print("⏳ Brak nowych danych.")
+
+# === START ===
+if __name__ == "__main__":
+    threading.Thread(target=bot_loop, daemon=True).start()
+    app.run(host="0.0.0.0", port=8080)
