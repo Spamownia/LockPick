@@ -1,89 +1,100 @@
-main.py
-
-import os import time from utils.parser import parse_lockpicking_log from utils.db import insert_entries, fetch_lockpicking_stats from utils.image_generator import generate_table_image from utils.discord_webhook import send_webhook
-
-LOG_FILE_PATH = "logs/latest_log.txt" WEBHOOK_URL = "https://discord.com/api/webhooks/XXX/YYY"  # <-- Podmień na swój webhook
-
-last_sent_hash = None
-
-while True: try: entries = parse_lockpicking_log(LOG_FILE_PATH) insert_entries(entries)
-
-stats = fetch_lockpicking_stats()
-    image_path = "output/stats.png"
-    current_hash = hash(str(stats))
-
-    if current_hash != last_sent_hash:
-        generate_table_image(stats, image_path)
-        send_webhook("Lockpicking Stats", file_path=image_path, webhook_url=WEBHOOK_URL)
-        last_sent_hash = current_hash
-
-except Exception as e:
-    print(f"[ERROR] {e}")
-
-time.sleep(15)
-
-utils/parser.py
-
-def parse_lockpicking_log(filepath): import re
-
-entries = []
-pattern = re.compile(r"LogMinigame] \[LockpickingMinigame_C (.*?) lock (.*?) result: (Success|Failure) in ([\d.]+)s")
-
-with open(filepath, "r", encoding="utf-16") as f:
-    for line in f:
-        match = pattern.search(line)
-        if match:
-            nick, lock, result, time_str = match.groups()
-            entries.append({
-                "nick": nick,
-                "lock": lock,
-                "result": result,
-                "time": float(time_str)
-            })
-return entries
-
-utils/db.py
-
-import psycopg2 import os
-
-conn = psycopg2.connect( host="ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech", dbname="neondb", user="neondb_owner", password="npg_dRU1YCtxbh6v", sslmode="require", channel_binding="require" )
-
-def insert_entries(entries): with conn.cursor() as cur: for e in entries: cur.execute(""" INSERT INTO lockpicking_logs (nick, lock, result, time) VALUES (%s, %s, %s, %s) """, (e["nick"], e["lock"], e["result"], e["time"])) conn.commit()
-
-def fetch_lockpicking_stats(): with conn.cursor() as cur: cur.execute(""" SELECT nick, lock, COUNT() AS total, SUM(CASE WHEN result = 'Success' THEN 1 ELSE 0 END) AS success, SUM(CASE WHEN result = 'Failure' THEN 1 ELSE 0 END) AS failure, ROUND(100.0 * SUM(CASE WHEN result = 'Success' THEN 1 ELSE 0 END) / COUNT(), 1) AS accuracy, ROUND(AVG(time), 2) AS avg_time FROM lockpicking_logs GROUP BY nick, lock ORDER BY total DESC """) return cur.fetchall()
-
-utils/image_generator.py
-
-from PIL import Image, ImageDraw, ImageFont
-
-def generate_table_image(rows, save_path): headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"] font = ImageFont.load_default()
-
-# Oblicz szerokości kolumn
-col_widths = [max(len(str(row[i])) for row in rows + [headers]) * 10 for i in range(len(headers))]
-row_height = 25
-img_width = sum(col_widths) + 20
-img_height = (len(rows) + 1) * row_height + 20
-
-img = Image.new("RGB", (img_width, img_height), color=(30, 30, 30))
-draw = ImageDraw.Draw(img)
-
-y = 10
-for i, header in enumerate(headers):
-    x = sum(col_widths[:i]) + 10
-    draw.text((x, y), header, fill="white", font=font)
-
-y += row_height
-for row in rows:
-    for i, cell in enumerate(row):
-        x = sum(col_widths[:i]) + 10
-        draw.text((x, y), str(cell), fill="white", font=font)
-    y += row_height
-
-img.save(save_path)
-
-utils/discord_webhook.py
-
+import os
+import re
+import time
+import ftplib
+import threading
+from flask import Flask
 import requests
 
-def send_webhook(username, file_path=None, webhook_url=None): with open(file_path, "rb") as f: files = {"file": f} data = {"username": username} response = requests.post(webhook_url, data=data, files=files) 
-response.raise_for_status()
+# === KONFIGURACJA ===
+FTP_HOST = "176.57.174.10"
+FTP_PORT = 50021
+FTP_USER = "gpftp37275281717442833"
+FTP_PASS = "TwojeHasloTutaj"  # <- Uzupełnij danymi
+FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs"
+
+DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1383407890663997450/hr2zvr2PjO20IDLIk5nZd8juZDxG9kYkOOZ0c2_sqzGtuXra8Dz-HbhtnhtF3Yb0Hsgi"
+
+CHECK_INTERVAL = 15
+ENCODING = "windows-1250"
+
+# =====================
+
+app = Flask(__name__)
+processed_lines = set()
+
+def send_to_discord(message):
+    payload = {"content": message}
+    try:
+        response = requests.post(DISCORD_WEBHOOK_URL, json=payload)
+        response.raise_for_status()
+    except Exception as e:
+        print(f"❌ Błąd wysyłania do Discorda: {e}")
+
+def extract_lockpicking_data(line):
+    if "[LogMinigame] [LockpickingMinigame_C]" not in line:
+        return None
+    return line.strip()
+
+def parse_log_file(ftp, filename):
+    lines_to_process = []
+    try:
+        ftp.cwd(FTP_LOG_DIR)
+        with open("temp.log", "wb") as f:
+            ftp.retrbinary(f"RETR {filename}", f.write)
+
+        with open("temp.log", "r", encoding=ENCODING, errors="ignore") as f:
+            for line in f:
+                if "[LogMinigame] [LockpickingMinigame_C]" in line:
+                    clean = extract_lockpicking_data(line)
+                    if clean and clean not in processed_lines:
+                        processed_lines.add(clean)
+                        lines_to_process.append(clean)
+    except Exception as e:
+        print(f"⚠️ Błąd odczytu {filename}: {e}")
+    return lines_to_process
+
+def scan_all_logs_on_startup():
+    print("🔍 Skanowanie wszystkich logów przy starcie...")
+    try:
+        with ftplib.FTP() as ftp:
+            ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+            ftp.login(FTP_USER, FTP_PASS)
+            ftp.cwd(FTP_LOG_DIR)
+            files = ftp.nlst()
+            log_files = [f for f in files if f.endswith(".log")]
+            print(f"📄 Znalezione pliki: {log_files}")
+            for log_file in log_files:
+                entries = parse_log_file(ftp, log_file)
+                for entry in entries:
+                    send_to_discord(f"🧷 Lockpicking (archiwum): {entry}")
+    except Exception as e:
+        print(f"❌ Błąd FTP (startup): {e}")
+
+def monitor_logs():
+    while True:
+        try:
+            with ftplib.FTP() as ftp:
+                ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
+                ftp.login(FTP_USER, FTP_PASS)
+                ftp.cwd(FTP_LOG_DIR)
+                files = ftp.nlst()
+                log_files = [f for f in files if f.endswith(".log")]
+                for log_file in log_files:
+                    entries = parse_log_file(ftp, log_file)
+                    for entry in entries:
+                        send_to_discord(f"🧷 Lockpicking: {entry}")
+        except Exception as e:
+            print(f"❌ Błąd monitorowania FTP: {e}")
+        time.sleep(CHECK_INTERVAL)
+
+@app.route("/")
+def index():
+    return "LockpickingLogger is running."
+
+if __name__ == "__main__":
+    print("🚀 Start bota LockpickingLogger...")
+    scan_all_logs_on_startup()  # uruchamiamy jednorazowe skanowanie
+    print("🕵️‍♂️ Start monitorowania FTP...")
+    threading.Thread(target=monitor_logs, daemon=True).start()
+    app.run(host="0.0.0.0", port=8080)
