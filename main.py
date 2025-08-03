@@ -1,5 +1,3 @@
-main.py
-
 import os import time from utils.parser import parse_lockpicking_log from utils.db import insert_entries, fetch_lockpicking_stats from utils.image_generator import generate_table_image from utils.discord_webhook import send_webhook
 
 LAST_IMAGE_HASH = ""
@@ -107,5 +105,5 @@ utils/discord_webhook.py
 
 import requests
 
-def send_webhook(username, content, file_path, webhook_url): with open(file_path, 'rb') as f: files = {'file': f} data = { 'username': username, 'content': content } requests.post(webhook_url, data=data, files=files)
-
+def send_webhook(username, content, file_path, webhook_url): with open(file_path, 'rb') as f: files = {'file': f} data = { 'username': username, 'content': content } requests.post(webho
+                                                                                                                                                                                    ok_url, data=data, files=files)
