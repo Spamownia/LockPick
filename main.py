@@ -1,133 +1,111 @@
-import os
-import re
-import time
-import ftplib
-import requests
-from flask import Flask
-from threading import Thread
-from dotenv import load_dotenv
+main.py
 
-load_dotenv()
+import os import time from utils.parser import parse_lockpicking_log from utils.db import insert_entries, fetch_lockpicking_stats from utils.image_generator import generate_table_image from utils.discord_webhook import send_webhook
 
-FTP_HOST = os.getenv("FTP_HOST")
-FTP_PORT = int(os.getenv("FTP_PORT", "21"))
-FTP_USER = os.getenv("FTP_USER")
-FTP_PASS = os.getenv("FTP_PASS")
-FTP_DIR = os.getenv("FTP_DIR", "/SCUM/Saved/SaveFiles/Logs")
-WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK")
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "15"))  # sekund
+LAST_IMAGE_HASH = ""
 
-app = Flask(__name__)
-last_seen_line = ""
+def file_hash(path): import hashlib with open(path, "rb") as f: return hashlib.md5(f.read()).hexdigest()
 
-LOG_LINE_REGEX = re.compile(
-    r'(?P<timestamp>\d{4}\.\d{2}\.\d{2}-\d{2}\.\d{2}\.\d{2}): \[LogMinigame\] \[LockpickingMinigame_C\] '
-    r'User: (?P<user>.+?) \(\d+, (?P<steamid>\d+)\)\. '
-    r'Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[\d.]+)\. '
-    r'Failed attempts: (?P<fails>\d+)\. Target object: (?P<object>.+?)\(ID: (?P<object_id>\d+)\)\. '
-    r'Lock type: (?P<lock_type>\w+)\. User owner: \d+\(\[(?P<owner_steamid>\d+)\] (?P<owner>.+?)\)\. '
-    r'Location: X=(?P<x>-?[\d.]+) Y=(?P<y>-?[\d.]+) Z=(?P<z>-?[\d.]+)'
-)
+def main_loop(): global LAST_IMAGE_HASH LOG_PATH = "logs/latest_log.txt" IMAGE_PATH = "output/lock_stats.png"
 
-def ftp_connect():
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT, timeout=10)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.encoding = "windows-1250"
-    return ftp
+if not os.path.exists("output"):
+    os.makedirs("output")
 
-def get_latest_log_file():
-    ftp = ftp_connect()
-    ftp.cwd(FTP_DIR)
-
-    files = []
-    ftp.retrlines("LIST", files.append)
-
-    log_files = [f.split()[-1] for f in files if f.split()[-1].startswith("log_")]
-    log_files.sort(reverse=True)
-
-    if not log_files:
-        ftp.quit()
-        return None, []
-
-    latest = log_files[0]
-    lines = []
-    ftp.retrlines(f"RETR {latest}", lines.append)
-    ftp.quit()
-    return latest, lines
-
-def send_to_discord(data):
-    embed = {
-        "title": f"🔐 Lockpicking Attempt - {data['user']}",
-        "color": 0x3498db if data['success'] == "Yes" else 0xe74c3c,
-        "fields": [
-            {"name": "👤 Użytkownik", "value": data['user'], "inline": True},
-            {"name": "✅ Sukces", "value": data['success'], "inline": True},
-            {"name": "⏱️ Czas", "value": f"{data['time']}s", "inline": True},
-            {"name": "🔒 Próby", "value": data['fails'], "inline": True},
-            {"name": "🎯 Obiekt", "value": data['object'], "inline": True},
-            {"name": "🔧 Typ zamka", "value": data['lock_type'], "inline": True},
-            {"name": "📦 Właściciel", "value": data['owner'], "inline": True},
-            {"name": "📍 Lokalizacja", "value": f"X={data['x']} Y={data['y']} Z={data['z']}", "inline": False},
-        ],
-        "timestamp": f"{data['timestamp'].replace('.', '-', 2).replace('.', ':', 2)}"
-    }
-
-    payload = {
-        "username": "LockpickingLogger",
-        "embeds": [embed]
-    }
+while True:
+    if not os.path.exists(LOG_PATH):
+        print("Brak logu.")
+        time.sleep(15)
+        continue
 
     try:
-        response = requests.post(WEBHOOK_URL, json=payload)
-        if response.status_code != 204:
-            print(f"❌ Błąd wysyłania webhooka: {response.status_code} - {response.text}")
+        entries = parse_lockpicking_log(LOG_PATH)
+        insert_entries(entries)
+        stats = fetch_lockpicking_stats()
+        generate_table_image(stats, IMAGE_PATH)
+
+        current_hash = file_hash(IMAGE_PATH)
+        if current_hash != LAST_IMAGE_HASH:
+            send_webhook(
+                username="SCUM LockpickBot",
+                content="\ud83d\udd10 Statystyki lockpickingu:",
+                file_path=IMAGE_PATH,
+                webhook_url="https://discord.com/api/webhooks/..."  # <--- Wstaw swój webhook
+            )
+            LAST_IMAGE_HASH = current_hash
+            print("\ud83d\udfe2 Wysłano nowy obrazek na Discord.")
+        else:
+            print("\ud83d\udd01 Brak zmian — nic nie wysyłamy.")
     except Exception as e:
-        print(f"❌ Wyjątek podczas wysyłania webhooka: {e}")
+        print("\u274c Błąd:", e)
 
-def poll_logs():
-    global last_seen_line
+    time.sleep(15)
 
-    print("🕵️‍♂️ Start monitorowania FTP...")
+if name == "main": main_loop()
 
-    while True:
-        try:
-            filename, log_lines = get_latest_log_file()
-            if not filename or not log_lines:
-                print("📄 Brak logów.")
-                time.sleep(SCAN_INTERVAL)
-                continue
+utils/parser.py
 
-            new_lines = []
-            if last_seen_line in log_lines:
-                index = log_lines.index(last_seen_line) + 1
-                new_lines = log_lines[index:]
-            else:
-                new_lines = log_lines[-50:]  # startowo tylko ostatnie 50 linii
+import re
 
-            for line in new_lines:
-                if "[LockpickingMinigame_C]" in line:
-                    match = LOG_LINE_REGEX.match(line)
-                    if match:
-                        data = match.groupdict()
-                        print(f"🔐 Log: {data}")
-                        send_to_discord(data)
-                    else:
-                        print(f"⚠️ Niedopasowana linia: {line}")
+def parse_lockpicking_log(filepath): pattern = re.compile( r'   (?P<nick>\w+) (?P<result>FAILED|SUCCESSFULLY) lockpicking (?P<lock>\w+).*?in (?P<time>\d+.\d+) seconds' )
 
-            if log_lines:
-                last_seen_line = log_lines[-1]
+entries = []
 
-        except Exception as e:
-            print(f"❌ Błąd: {e}")
+with open(filepath, "r", encoding="utf-8") as f:
+    for line in f:
+        match = pattern.search(line)
+        if match:
+            entries.append({
+                "nick": match.group("nick"),
+                "lock": match.group("lock"),
+                "result": "Success" if match.group("result") == "SUCCESSFULLY" else "Failure",
+                "time": float(match.group("time"))
+            })
+return entries
 
-        time.sleep(SCAN_INTERVAL)
+utils/db.py
 
-@app.route("/")
-def home():
-    return "LockpickingLogger działa! 🔐"
+import psycopg
 
-if __name__ == "__main__":
-    print("🚀 Start bota LockpickingLogger...")
-    Thread(target=poll_logs, daemon=True).start()
-    app.run(host="0.0.0.0", port=8080)
+DB_CONFIG = { "host": "ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech", "dbname": "neondb", "user": "neondb_owner", "password": "npg_dRU1YCtxbh6v", "sslmode": "require", "channel_binding": "require" }
+
+def insert_entries(entries): if not entries: return with psycopg.connect(**DB_CONFIG) as conn: with conn.cursor() as cur: for entry in entries: cur.execute(""" INSERT INTO lockpicking_logs (nick, lock, result, time) VALUES (%s, %s, %s, %s) """, (entry['nick'], entry['lock'], entry['result'], entry['time'])) conn.commit()
+
+def fetch_lockpicking_stats(): with psycopg.connect(**DB_CONFIG) as conn: with conn.cursor() as cur: cur.execute(""" SELECT nick, lock, COUNT() AS total_attempts, SUM(CASE WHEN result = 'Success' THEN 1 ELSE 0 END) AS successes, SUM(CASE WHEN result = 'Failure' THEN 1 ELSE 0 END) AS failures, ROUND(SUM(CASE WHEN result = 'Success' THEN 1 ELSE 0 END)::float / COUNT() * 100, 1) AS accuracy, ROUND(AVG(time), 2) AS avg_time FROM lockpicking_logs GROUP BY nick, lock ORDER BY accuracy DESC """) return cur.fetchall()
+
+utils/image_generator.py
+
+from PIL import Image, ImageDraw, ImageFont
+
+def generate_table_image(data, output_path): headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"] font = ImageFont.truetype("arial.ttf", 20)
+
+col_widths = [max(len(str(val)) for val in [h] + [row[i] for row in data]) * 14 for i, h in enumerate(headers)]
+
+total_width = sum(col_widths) + len(headers) * 10
+row_height = 40
+img_height = (len(data) + 1) * row_height + 20
+
+image = Image.new("RGB", (total_width, img_height), "black")
+draw = ImageDraw.Draw(image)
+
+y = 10
+x = 0
+for i, h in enumerate(headers):
+    draw.text((x + 5, y), h, font=font, fill="white")
+    x += col_widths[i] + 10
+
+y += row_height
+for row in data:
+    x = 0
+    for i, val in enumerate(row):
+        draw.text((x + 5, y), str(val), font=font, fill="white")
+        x += col_widths[i] + 10
+    y += row_height
+
+image.save(output_path)
+
+utils/discord_webhook.py
+
+import requests
+
+def send_webhook(username, content, file_path, webhook_url): with open(file_path, 'rb') as f: files = {'file': f} data = { 'username': username, 'content': content } requests.post(webhook_url, data=data, files=files)
+
