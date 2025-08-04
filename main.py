@@ -1,145 +1,117 @@
 import os
-import re
-import ftplib
 import time
 import threading
-from datetime import datetime
-from flask import Flask
-import pytz
 import requests
-from io import BytesIO
-import codecs
-
-FTP_HOST = "176.57.174.10"
-FTP_PORT = 50021
-FTP_USER = "gpftp37275281717442833"
-FTP_PASS = "LXNdGShY"
-FTP_LOG_PATH = "/SCUM/Saved/SaveFiles/Logs/"
-DISCORD_WEBHOOK = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-
-LOG_FILE_REGEX = re.compile(r"gameplay_.*\.log")
-
-stats = {}
-processed_entries = set()
-
-def format_table():
-    headers = ["Nick", "Zamek", "Wszystkie", "Udane", "Nieudane", "Skuteczność", "Średni_czas"]
-    rows = []
-
-    for nick in sorted(stats):
-        for lock in sorted(stats[nick]):
-            s = stats[nick][lock]
-            total = s['success'] + s['fail']
-            skutecznosc = (s['success'] / total * 100) if total > 0 else 0
-            avg_time = (s['total_time'] / total) if total > 0 else 0
-            rows.append([
-                nick,
-                lock,
-                str(total),
-                str(s['success']),
-                str(s['fail']),
-                f"{skutecznosc:.1f}%",
-                f"{avg_time:.2f}s"
-            ])
-
-    col_widths = [max(len(str(x)) for x in col) for col in zip(*([headers] + rows))]
-    line = "| " + " | ".join(f"{headers[i].center(col_widths[i])}" for i in range(len(headers))) + " |"
-    sep = "|" + "|".join("-" * (col_widths[i] + 2) for i in range(len(headers))) + "|"
-    lines = [line, sep]
-    for row in rows:
-        lines.append("| " + " | ".join(f"{row[i].center(col_widths[i])}" for i in range(len(row))) + " |")
-
-    return "```\n" + "\n".join(lines) + "\n```"
-
-def send_to_discord(content):
-    requests.post(DISCORD_WEBHOOK, json={"content": content})
-
-def parse_line(line):
-    pattern = r'\[(.*?)\].*?CharacterName: (.*?), Lock type: (.*?), Success: (.*?), Time: (.*?)s'
-    match = re.search(pattern, line)
-    if not match:
-        return None
-    timestamp, nick, lock_type, success, time_taken = match.groups()
-    uid = f"{timestamp}-{nick}-{lock_type}-{success}-{time_taken}"
-    if uid in processed_entries:
-        return None
-    processed_entries.add(uid)
-    return nick, lock_type, success.lower() == 'true', float(time_taken)
-
-def update_stats(nick, lock, success, time_taken):
-    if nick not in stats:
-        stats[nick] = {}
-    if lock not in stats[nick]:
-        stats[nick][lock] = {'success': 0, 'fail': 0, 'total_time': 0.0}
-    entry = stats[nick][lock]
-    if success:
-        entry['success'] += 1
-    else:
-        entry['fail'] += 1
-    entry['total_time'] += time_taken
-
-def fetch_logs_from_ftp():
-    logs = []
-    with ftplib.FTP() as ftp:
-        ftp.connect(FTP_HOST, FTP_PORT)
-        ftp.login(FTP_USER, FTP_PASS)
-        ftp.cwd(FTP_LOG_PATH)
-        files = []
-        ftp.retrlines('LIST', lambda x: files.append(x.split()[-1]))
-        for filename in files:
-            if LOG_FILE_REGEX.match(filename):
-                bio = BytesIO()
-                ftp.retrbinary(f"RETR {filename}", bio.write)
-                bio.seek(0)
-                content = bio.read()
-                try:
-                    text = codecs.decode(content, 'utf-16-le')
-                    logs.append(text)
-                except UnicodeDecodeError:
-                    continue
-    return logs
-
-def process_logs(log_texts):
-    new_data = False
-    for text in log_texts:
-        for line in text.splitlines():
-            result = parse_line(line)
-            if result:
-                update_stats(*result)
-                new_data = True
-    if new_data:
-        send_to_discord(format_table())
-
-def monitor():
-    last_snapshot = ""
-    while True:
-        try:
-            logs = fetch_logs_from_ftp()
-            if logs:
-                latest = logs[-1]
-                if latest != last_snapshot:
-                    process_logs([latest])
-                    last_snapshot = latest
-        except Exception as e:
-            print(f"❌ Błąd w monitorowaniu: {e}")
-        time.sleep(60)
-
-def start():
-    print("🔁 Uruchamianie skanowania logów...")
-    try:
-        logs = fetch_logs_from_ftp()
-        process_logs(logs)
-    except Exception as e:
-        print(f"❌ Błąd inicjalizacji: {e}")
-
-    threading.Thread(target=monitor, daemon=True).start()
+from flask import Flask
 
 app = Flask(__name__)
 
+LOGS_DIR = "logs"
+WEBHOOK_URL = "TWÓJ_DISCORD_WEBHOOK_URL"  # <-- tu wpisz swój webhook Discord
+PROCESS_INTERVAL = 60
+
+# Dane zbiorcze: {nick: {zamek, all, success, fail, sum_time}}
+stats = {}
+
+def parse_log_line(line):
+    # Zakładam format: "Nick;Zamek;Status;Czas"
+    # Przykład: "Anu;Advanced;fail;12.67"
+    parts = line.strip().split(";")
+    if len(parts) != 4:
+        return None
+    nick, zamek, status, czas = parts
+    try:
+        czas = float(czas)
+    except ValueError:
+        return None
+    return nick, zamek, status.lower(), czas
+
+def update_stats_from_line(line):
+    parsed = parse_log_line(line)
+    if not parsed:
+        return
+    nick, zamek, status, czas = parsed
+    if nick not in stats:
+        stats[nick] = {
+            "zamek": zamek,
+            "all": 0,
+            "success": 0,
+            "fail": 0,
+            "sum_time": 0.0,
+        }
+    user_stats = stats[nick]
+    user_stats["all"] += 1
+    if status == "success":
+        user_stats["success"] += 1
+    else:
+        user_stats["fail"] += 1
+    user_stats["sum_time"] += czas
+
+def process_all_logs():
+    global stats
+    stats = {}  # reset przy pełnym przetworzeniu
+    if not os.path.exists(LOGS_DIR):
+        return
+    for fname in sorted(os.listdir(LOGS_DIR)):
+        fpath = os.path.join(LOGS_DIR, fname)
+        if not os.path.isfile(fpath):
+            continue
+        with open(fpath, encoding="utf-8") as f:
+            for line in f:
+                update_stats_from_line(line)
+
+def generate_table_text():
+    header = (
+        "|   Nick   |  Zamek   | Wszystkie | Udane | Nieudane | Skuteczność | Średni_czas |\n"
+        "|----------|----------|-----------|-------|----------|-------------|-------------|"
+    )
+    rows = []
+    for nick, data in sorted(stats.items()):
+        all_ = data["all"]
+        success = data["success"]
+        fail = data["fail"]
+        skutecznosc = (success / all_ * 100) if all_ > 0 else 0
+        sredni_czas = (data["sum_time"] / all_) if all_ > 0 else 0
+        row = (
+            f"| {nick:<8} | {data['zamek']:<8} | "
+            f"{all_:^9} | {success:^5} | {fail:^8} | "
+            f"{skutecznosc:>9.1f}% | {sredni_czas:>11.2f}s |"
+        )
+        rows.append(row)
+    return header + "\n" + "\n".join(rows)
+
+def send_to_discord(message):
+    payload = {"content": f"```\n{message}\n```"}
+    try:
+        response = requests.post(WEBHOOK_URL, json=payload)
+        if response.status_code != 204:
+            print(f"[Discord] Błąd wysyłki: {response.status_code} {response.text}")
+    except Exception as e:
+        print(f"[Discord] Wyjątek podczas wysyłki: {e}")
+
+def periodic_worker():
+    last_processed_files = set()
+    while True:
+        try:
+            current_files = set(os.listdir(LOGS_DIR)) if os.path.exists(LOGS_DIR) else set()
+            new_files = current_files - last_processed_files
+            if new_files:
+                # Przetwórz wszystkie logi na nowo (sumowanie zbiorcze)
+                process_all_logs()
+                table_text = generate_table_text()
+                send_to_discord(table_text)
+                last_processed_files = current_files
+            time.sleep(PROCESS_INTERVAL)
+        except Exception as e:
+            print(f"[Worker] Wyjątek w pętli: {e}")
+            time.sleep(PROCESS_INTERVAL)
+
 @app.route("/")
-def index():
-    return "Lockpick stats logger active."
+def home():
+    return "Skrypt działa. Statystyki zbiorcze są aktualizowane i wysyłane na Discord."
 
 if __name__ == "__main__":
-    start()
+    print("🔁 Uruchamianie skanowania logów...")
+    process_all_logs()  # na start
+    threading.Thread(target=periodic_worker, daemon=True).start()
     app.run(host="0.0.0.0", port=10000)
