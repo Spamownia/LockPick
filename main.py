@@ -1,228 +1,254 @@
+import ftplib
+import io
 import re
 import threading
 import time
-from ftplib import FTP
-from io import BytesIO
-from flask import Flask
+from collections import defaultdict, OrderedDict
+from datetime import datetime
+from flask import Flask, Response
 import requests
 
-# --- Konfiguracja ---
-FTP_IP = "176.57.174.10"
+# FTP dane
+FTP_HOST = '176.57.174.10'
 FTP_PORT = 50021
-FTP_USER = "gpftp37275281717442833"
-FTP_PASS = "LXNdGShY"
-FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
-DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+FTP_USER = 'gpftp37275281717442833'
+FTP_PASS = 'LXNdGShY'
+FTP_LOG_PATH = '/SCUM/Saved/SaveFiles/Logs/'
 
-CHECK_INTERVAL = 60  # sekund
+# Discord webhook
+DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3'
+
+# Lockpicking zamki kolejność sortowania
+LOCK_ORDER = ['VeryEasy', 'Basic', 'Medium', 'Advanced', 'DialLock']
+
+# Regex do parsowania linii loga lockpickingu
+LOG_PATTERN = re.compile(
+    r'User: (?P<nick>.+?) \(\d+, \d+\).+?Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[0-9.]+)\. Failed attempts: (?P<fail>\d+)\. Lock type: (?P<lock>\w+)\.'
+)
 
 app = Flask(__name__)
 
-# Słownik na sumaryczne statystyki: { (nick, zamek): { 'all': int, 'success': int, 'fail': int, 'time_sum': float } }
-stats = {}
+# Dane globalne
+stats_lock = threading.Lock()
+stats = defaultdict(lambda: defaultdict(lambda: {
+    'all': 0,
+    'success': 0,
+    'fail': 0,
+    'total_time': 0.0
+}))
 
-lock = threading.Lock()
+last_processed_line = 0
+last_log_filename = None
 
-# --- Funkcja listująca pliki logów na FTP ---
-def list_log_files(ftp):
-    ftp.cwd(FTP_LOG_DIR)
+def connect_ftp():
+    ftp = ftplib.FTP()
+    ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
+    ftp.login(FTP_USER, FTP_PASS)
+    ftp.cwd(FTP_LOG_PATH)
+    return ftp
+
+def list_logs(ftp):
+    # Pobierz listę plików, filtruj gameplay_*.log
     files = []
-
-    def collect_line(line):
-        # Parsowanie formatu LIST: permissions, user, group, size, date, name
-        parts = line.split(maxsplit=8)
-        if len(parts) == 9:
-            filename = parts[8]
-            if re.match(r"gameplay_.*\.log$", filename):
-                files.append(filename)
-
-    ftp.retrlines('LIST', callback=collect_line)
-    return files
-
-# --- Pobranie pliku logu z FTP (jako bytes) ---
-def download_log_file(ftp, filename):
-    bio = BytesIO()
-    ftp.retrbinary(f"RETR {filename}", bio.write)
-    bio.seek(0)
-    return bio.read()
-
-# --- Parsowanie zawartości logu do statystyk ---
-# Załóżmy, że w logach linie z danymi mają format:
-# "[TIME] Nick=XXX Lock=YYY Result=Success/Fail Duration=ZZ.ZZ"
-# Jeśli inny format, podaj proszę, to zmodyfikuję parser.
-log_line_regex = re.compile(
-    r"Nick=(?P<nick>\S+)\s+Lock=(?P<lock>\S+)\s+Result=(?P<result>Success|Fail)\s+Duration=(?P<duration>[0-9\.]+)"
-)
-
-def parse_log_data(content_bytes):
-    text = content_bytes.decode('utf-16le')  # dekodowanie UTF-16 LE wg informacji
-    local_stats = {}
-    for line in text.splitlines():
-        m = log_line_regex.search(line)
-        if m:
-            nick = m.group("nick")
-            lock = m.group("lock")
-            result = m.group("result")
-            duration = float(m.group("duration"))
-
-            key = (nick, lock)
-            if key not in local_stats:
-                local_stats[key] = {'all': 0, 'success': 0, 'fail': 0, 'time_sum': 0.0}
-
-            local_stats[key]['all'] += 1
-            if result == "Success":
-                local_stats[key]['success'] += 1
-            else:
-                local_stats[key]['fail'] += 1
-            local_stats[key]['time_sum'] += duration
-    return local_stats
-
-# --- Aktualizacja globalnych statystyk ---
-def update_stats(new_stats):
-    with lock:
-        for key, data in new_stats.items():
-            if key not in stats:
-                stats[key] = data
-            else:
-                stats[key]['all'] += data['all']
-                stats[key]['success'] += data['success']
-                stats[key]['fail'] += data['fail']
-                stats[key]['time_sum'] += data['time_sum']
-
-# --- Generowanie tekstowej tabeli z danych ---
-def generate_table():
-    with lock:
-        if not stats:
-            return "Brak danych do wyświetlenia."
-
-        # Nagłówki
-        headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
-
-        # Zbieranie wierszy
-        rows = []
-        for (nick, lock), data in stats.items():
-            all_ = data['all']
-            success = data['success']
-            fail = data['fail']
-            success_rate = (success / all_ * 100) if all_ > 0 else 0
-            avg_time = (data['time_sum'] / all_) if all_ > 0 else 0
-            rows.append([
-                nick,
-                lock,
-                str(all_),
-                str(success),
-                str(fail),
-                f"{success_rate:.1f}%",
-                f"{avg_time:.2f}s"
-            ])
-
-        # Oblicz max szerokości kolumn
-        columns = list(zip(*([headers] + rows)))
-        col_widths = [max(len(str(cell)) for cell in col) for col in columns]
-
-        # Formatowanie linii tabeli z wyśrodkowaniem
-        def format_row(row):
-            return "| " + " | ".join(f"{cell:^{col_widths[i]}}" for i, cell in enumerate(row)) + " |"
-
-        sep = "|-" + "-|-".join('-' * w for w in col_widths) + "-|"
-
-        table_lines = []
-        table_lines.append(format_row(headers))
-        table_lines.append(sep)
-        for row in rows:
-            table_lines.append(format_row(row))
-
-        return "\n".join(table_lines)
-
-# --- Wysyłka tabeli na Discord webhook ---
-def send_to_discord(content):
-    data = {"content": f"```\n{content}\n```"}
-    response = requests.post(DISCORD_WEBHOOK_URL, json=data)
-    if response.status_code != 204:
-        print(f"[ERROR] Nie udało się wysłać na Discord webhook, status: {response.status_code}, odpowiedź: {response.text}")
-
-# --- Przetwarzanie wszystkich logów z FTP ---
-def process_all_logs():
     try:
-        with FTP() as ftp:
-            ftp.connect(FTP_IP, FTP_PORT, timeout=10)
-            ftp.login(FTP_USER, FTP_PASS)
+        files = ftp.nlst()
+    except ftplib.error_perm as e:
+        # niektóre serwery nie wspierają nlst, wtedy możemy spróbować innych metod
+        raise RuntimeError(f"FTP nlst error: {e}")
+    logs = [f for f in files if f.startswith('gameplay_') and f.endswith('.log')]
+    return logs
 
-            files = list_log_files(ftp)
-            if not files:
-                print("[INFO] Nie znaleziono plików logów na FTP.")
-                return
+def parse_line(line):
+    match = LOG_PATTERN.search(line)
+    if not match:
+        return None
+    nick = match.group('nick')
+    success = match.group('success') == 'Yes'
+    elapsed = float(match.group('time'))
+    fail = int(match.group('fail'))
+    lock = match.group('lock')
+    return nick, lock, success, elapsed, fail
 
-            for filename in files:
-                content = download_log_file(ftp, filename)
-                new_stats = parse_log_data(content)
-                update_stats(new_stats)
+def update_stats(nick, lock, success, elapsed, fail):
+    with stats_lock:
+        entry = stats[nick][lock]
+        entry['all'] += 1
+        if success:
+            entry['success'] += 1
+        else:
+            entry['fail'] += 1
+        entry['total_time'] += elapsed
 
-            print("[INFO] Przetworzono wszystkie dostępne logi.")
+def fetch_and_parse_log(ftp, filename):
+    global last_processed_line
+    try:
+        bio = io.BytesIO()
+        ftp.retrbinary(f'RETR {filename}', bio.write)
+        bio.seek(0)
+        content = bio.read().decode('utf-16le', errors='ignore')
+    except Exception as e:
+        print(f"[ERROR] Pobieranie lub dekodowanie loga {filename} nie powiodło się: {e}")
+        return 0
+
+    lines = content.splitlines()
+    processed = 0
+    for i, line in enumerate(lines):
+        # Parsuj wszystkie linie loga
+        res = parse_line(line)
+        if res:
+            nick, lock, success, elapsed, fail = res
+            update_stats(nick, lock, success, elapsed, fail)
+            processed += 1
+    return processed
+
+def fetch_and_parse_log_incremental(ftp, filename, from_line):
+    # Pobiera log, przetwarza od linii from_line
+    try:
+        bio = io.BytesIO()
+        ftp.retrbinary(f'RETR {filename}', bio.write)
+        bio.seek(0)
+        content = bio.read().decode('utf-16le', errors='ignore')
+    except Exception as e:
+        print(f"[ERROR] Pobieranie lub dekodowanie loga {filename} nie powiodło się: {e}")
+        return 0
+
+    lines = content.splitlines()
+    new_lines = lines[from_line:]
+    processed = 0
+    for line in new_lines:
+        res = parse_line(line)
+        if res:
+            nick, lock, success, elapsed, fail = res
+            update_stats(nick, lock, success, elapsed, fail)
+            processed += 1
+    return processed, len(lines)
+
+def generate_table():
+    with stats_lock:
+        # Agregacja do listy w formacie [(nick, lock, all, success, fail, accuracy%, avg_time), ...]
+        rows = []
+        for nick in sorted(stats.keys()):
+            for lock in LOCK_ORDER:
+                if lock in stats[nick]:
+                    entry = stats[nick][lock]
+                    all_ = entry['all']
+                    success = entry['success']
+                    fail = entry['fail']
+                    if all_ == 0:
+                        accuracy = 0.0
+                        avg_time = 0.0
+                    else:
+                        accuracy = (success / all_) * 100
+                        avg_time = entry['total_time'] / all_
+                    rows.append((
+                        nick,
+                        lock,
+                        all_,
+                        success,
+                        fail,
+                        f"{accuracy:.1f}%",
+                        f"{avg_time:.2f}s"
+                    ))
+
+        # Wyliczenie szerokości kolumn, z uwzględnieniem nagłówków
+        headers = ['Nick', 'Zamek', 'Wszystkie', 'Udane', 'Nieudane', 'Skuteczność', 'Średni czas']
+        columns = list(zip(*([headers] + rows)))
+        col_widths = [max(len(str(item)) for item in col) for col in columns]
+
+        # Funkcja wyśrodkowania tekstu w polu
+        def center(text, width):
+            text = str(text)
+            space = width - len(text)
+            left = space // 2
+            right = space - left
+            return ' ' * left + text + ' ' * right
+
+        # Generowanie tabeli jako tekst (markdown styl)
+        sep_line = '|' + '|'.join(['-' * w for w in col_widths]) + '|'
+        header_line = '|' + '|'.join(center(h, w) for h, w in zip(headers, col_widths)) + '|'
+        row_lines = []
+        for row in rows:
+            row_lines.append('|' + '|'.join(center(c, w) for c, w in zip(row, col_widths)) + '|')
+
+        table_text = '\n'.join([header_line, sep_line] + row_lines)
+        return table_text
+
+def send_to_discord(table_text):
+    data = {
+        "content": "```\n" + table_text + "\n```"
+    }
+    try:
+        r = requests.post(DISCORD_WEBHOOK_URL, json=data, timeout=10)
+        if r.status_code != 204:
+            print(f"[ERROR] Wysyłanie do Discorda nie powiodło się, status: {r.status_code}, treść: {r.text}")
+    except Exception as e:
+        print(f"[ERROR] Błąd podczas wysyłania do Discorda: {e}")
+
+def initial_load_and_process():
+    global last_log_filename, last_processed_line
+    try:
+        ftp = connect_ftp()
+        logs = list_logs(ftp)
+        if not logs:
+            print("[INFO] Brak logów na FTP.")
+            ftp.quit()
+            return
+
+        logs.sort()  # alfabetycznie (domyślnie daty w nazwie)
+        last_log_filename = logs[-1]
+
+        print(f"[INFO] Pobieram i przetwarzam wszystkie logi z FTP ({len(logs)} plików)...")
+        for log in logs:
+            fetch_and_parse_log(ftp, log)
+        ftp.quit()
+        last_processed_line = 0  # bo parsowaliśmy wszystko od nowa
+
+        print("[INFO] Przetworzono wszystkie dostępne logi.")
+        table = generate_table()
+        print(table)
+        send_to_discord(table)
+
     except Exception as e:
         print(f"[ERROR] Błąd podczas pobierania listy lub przetwarzania: {e}")
 
-# --- Monitorowanie najnowszego pliku i aktualizacja co 60s ---
-def monitor_latest_log():
-    last_processed_size = 0
-    last_file = None
-
+def monitor_new_lines_loop():
+    global last_log_filename, last_processed_line
     while True:
+        time.sleep(60)
         try:
-            with FTP() as ftp:
-                ftp.connect(FTP_IP, FTP_PORT, timeout=10)
-                ftp.login(FTP_USER, FTP_PASS)
-                ftp.cwd(FTP_LOG_DIR)
+            ftp = connect_ftp()
+            logs = list_logs(ftp)
+            if not logs:
+                ftp.quit()
+                continue
 
-                files = list_log_files(ftp)
-                if not files:
-                    print("[INFO] Brak plików logów do monitorowania.")
-                    time.sleep(CHECK_INTERVAL)
-                    continue
+            logs.sort()
+            current_log = logs[-1]
 
-                # wybierz najnowszy plik (alfabetycznie, przy założeniu, że najnowszy ma największą nazwę)
-                newest_file = sorted(files)[-1]
+            if current_log != last_log_filename:
+                # zmiana pliku loga - resetujemy pozycję i zmieniamy plik
+                last_log_filename = current_log
+                last_processed_line = 0
+                print(f"[INFO] Zmiana loga na {current_log}, resetuję pozycję czytania.")
 
-                if newest_file != last_file:
-                    last_file = newest_file
-                    last_processed_size = 0
-
-                # pobierz plik
-                bio = BytesIO()
-                ftp.retrbinary(f"RETR {newest_file}", bio.write)
-                bio.seek(0)
-                content_bytes = bio.read()
-
-                if len(content_bytes) > last_processed_size:
-                    new_content = content_bytes[last_processed_size:]
-                    new_stats = parse_log_data(new_content)
-                    update_stats(new_stats)
-                    last_processed_size = len(content_bytes)
-
-                    # Wyślij tabelę na Discorda
-                    table_text = generate_table()
-                    send_to_discord(table_text)
-
-            time.sleep(CHECK_INTERVAL)
-
+            processed, total_lines = fetch_and_parse_log_incremental(ftp, last_log_filename, last_processed_line)
+            if processed > 0:
+                last_processed_line = total_lines
+                table = generate_table()
+                print(table)
+                send_to_discord(table)
+            ftp.quit()
         except Exception as e:
-            print(f"[ERROR] Błąd podczas monitorowania logów: {e}")
-            time.sleep(CHECK_INTERVAL)
+            print(f"[ERROR] Błąd podczas monitoringu nowych linii: {e}")
 
-# --- Uruchomienie monitorowania w osobnym wątku ---
-def start_monitor_thread():
-    thread = threading.Thread(target=monitor_latest_log, daemon=True)
-    thread.start()
-
-# --- Endpoint testowy ---
-@app.route("/")
+@app.route('/')
 def index():
-    return "Lockpick logs service is running."
+    return Response("Lockpicking service is running.", mimetype='text/plain')
 
-# --- Główna część ---
-if __name__ == "__main__":
+if __name__ == '__main__':
     print("🔁 Uruchamianie pełnego przetwarzania logów...")
-    process_all_logs()
-    start_monitor_thread()
-    print("     ==> Your service is live 🎉")
-    app.run(host="0.0.0.0", port=10000)
+    initial_load_and_process()
+    print("🔁 Start wątku do monitorowania nowych linii w najnowszym pliku...")
+    t = threading.Thread(target=monitor_new_lines_loop, daemon=True)
+    t.start()
+    app.run(host='0.0.0.0', port=10000)
