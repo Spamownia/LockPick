@@ -265,7 +265,7 @@ def initial_load_and_process():
         print(f"[ERROR] Błąd podczas pobierania listy lub przetwarzania: {e}")
 
 def monitor_new_lines_loop():
-    global last_log_filename, last_processed_line, last_sent_stats_hash
+    global last_log_filename, last_processed_line, last_sent_stats_hash, processed_entries
     while True:
         time.sleep(60)
         try:
@@ -281,7 +281,8 @@ def monitor_new_lines_loop():
             if current_log != last_log_filename:
                 last_log_filename = current_log
                 last_processed_line = 0
-                print(f"[INFO] Zmiana loga na {current_log}, resetuję pozycję czytania.")
+                processed_entries = set()  # RESET zbioru przetworzonych linii przy nowym pliku
+                print(f"[INFO] Zmiana loga na {current_log}, resetuję pozycję czytania i historię przetworzonych linii.")
 
             processed, total_lines = fetch_and_parse_log_incremental(ftp, last_log_filename, last_processed_line)
             if processed > 0:
