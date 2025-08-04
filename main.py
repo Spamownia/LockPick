@@ -195,8 +195,8 @@ def generate_podium_table():
         rows = []
         for idx, (nick, success, all_, acc) in enumerate(ranked, start=1):
             place = medals[idx - 1] if idx <= 3 else f"{idx}."
-            rows.append((place, nick, all_, success, f"{acc:.1f}%"))
-        return format_table(['Miejsce', 'Nick', 'Wszystkie', 'Udane', 'Skuteczność'], rows)
+            rows.append((place, nick, f"{acc:.1f}%"))
+        return format_table(['Miejsce', 'Nick', 'Skuteczność'], rows)
 
 def stats_hash():
     with stats_lock:
