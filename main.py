@@ -3,8 +3,7 @@ import io
 import re
 import threading
 import time
-from collections import defaultdict, OrderedDict
-from datetime import datetime
+from collections import defaultdict
 from flask import Flask, Response
 import requests
 
@@ -48,15 +47,20 @@ def connect_ftp():
     return ftp
 
 def list_logs(ftp):
-    # Pobierz listę plików, filtruj gameplay_*.log
-    files = []
+    lines = []
     try:
-        files = ftp.nlst()
-    except ftplib.error_perm as e:
-        # niektóre serwery nie wspierają nlst, wtedy możemy spróbować innych metod
-        raise RuntimeError(f"FTP nlst error: {e}")
-    logs = [f for f in files if f.startswith('gameplay_') and f.endswith('.log')]
-    return logs
+        ftp.retrlines('LIST', lines.append)
+    except Exception as e:
+        raise RuntimeError(f"FTP LIST error: {e}")
+
+    files = []
+    for line in lines:
+        parts = line.split(maxsplit=8)
+        if len(parts) == 9:
+            filename = parts[8]
+            if filename.startswith('gameplay_') and filename.endswith('.log'):
+                files.append(filename)
+    return files
 
 def parse_line(line):
     match = LOG_PATTERN.search(line)
@@ -92,8 +96,7 @@ def fetch_and_parse_log(ftp, filename):
 
     lines = content.splitlines()
     processed = 0
-    for i, line in enumerate(lines):
-        # Parsuj wszystkie linie loga
+    for line in lines:
         res = parse_line(line)
         if res:
             nick, lock, success, elapsed, fail = res
@@ -102,7 +105,6 @@ def fetch_and_parse_log(ftp, filename):
     return processed
 
 def fetch_and_parse_log_incremental(ftp, filename, from_line):
-    # Pobiera log, przetwarza od linii from_line
     try:
         bio = io.BytesIO()
         ftp.retrbinary(f'RETR {filename}', bio.write)
@@ -110,7 +112,7 @@ def fetch_and_parse_log_incremental(ftp, filename, from_line):
         content = bio.read().decode('utf-16le', errors='ignore')
     except Exception as e:
         print(f"[ERROR] Pobieranie lub dekodowanie loga {filename} nie powiodło się: {e}")
-        return 0
+        return 0, from_line
 
     lines = content.splitlines()
     new_lines = lines[from_line:]
@@ -125,7 +127,6 @@ def fetch_and_parse_log_incremental(ftp, filename, from_line):
 
 def generate_table():
     with stats_lock:
-        # Agregacja do listy w formacie [(nick, lock, all, success, fail, accuracy%, avg_time), ...]
         rows = []
         for nick in sorted(stats.keys()):
             for lock in LOCK_ORDER:
@@ -134,12 +135,8 @@ def generate_table():
                     all_ = entry['all']
                     success = entry['success']
                     fail = entry['fail']
-                    if all_ == 0:
-                        accuracy = 0.0
-                        avg_time = 0.0
-                    else:
-                        accuracy = (success / all_) * 100
-                        avg_time = entry['total_time'] / all_
+                    accuracy = (success / all_ * 100) if all_ > 0 else 0.0
+                    avg_time = (entry['total_time'] / all_) if all_ > 0 else 0.0
                     rows.append((
                         nick,
                         lock,
@@ -150,12 +147,11 @@ def generate_table():
                         f"{avg_time:.2f}s"
                     ))
 
-        # Wyliczenie szerokości kolumn, z uwzględnieniem nagłówków
         headers = ['Nick', 'Zamek', 'Wszystkie', 'Udane', 'Nieudane', 'Skuteczność', 'Średni czas']
-        columns = list(zip(*([headers] + rows)))
+        columns = list(zip(*([headers] + rows))) if rows else [headers]
+
         col_widths = [max(len(str(item)) for item in col) for col in columns]
 
-        # Funkcja wyśrodkowania tekstu w polu
         def center(text, width):
             text = str(text)
             space = width - len(text)
@@ -163,12 +159,9 @@ def generate_table():
             right = space - left
             return ' ' * left + text + ' ' * right
 
-        # Generowanie tabeli jako tekst (markdown styl)
         sep_line = '|' + '|'.join(['-' * w for w in col_widths]) + '|'
         header_line = '|' + '|'.join(center(h, w) for h, w in zip(headers, col_widths)) + '|'
-        row_lines = []
-        for row in rows:
-            row_lines.append('|' + '|'.join(center(c, w) for c, w in zip(row, col_widths)) + '|')
+        row_lines = ['|' + '|'.join(center(c, w) for c, w in zip(row, col_widths)) + '|' for row in rows]
 
         table_text = '\n'.join([header_line, sep_line] + row_lines)
         return table_text
@@ -194,14 +187,14 @@ def initial_load_and_process():
             ftp.quit()
             return
 
-        logs.sort()  # alfabetycznie (domyślnie daty w nazwie)
+        logs.sort()
         last_log_filename = logs[-1]
 
         print(f"[INFO] Pobieram i przetwarzam wszystkie logi z FTP ({len(logs)} plików)...")
         for log in logs:
             fetch_and_parse_log(ftp, log)
         ftp.quit()
-        last_processed_line = 0  # bo parsowaliśmy wszystko od nowa
+        last_processed_line = 0
 
         print("[INFO] Przetworzono wszystkie dostępne logi.")
         table = generate_table()
@@ -226,7 +219,6 @@ def monitor_new_lines_loop():
             current_log = logs[-1]
 
             if current_log != last_log_filename:
-                # zmiana pliku loga - resetujemy pozycję i zmieniamy plik
                 last_log_filename = current_log
                 last_processed_line = 0
                 print(f"[INFO] Zmiana loga na {current_log}, resetuję pozycję czytania.")
