@@ -36,8 +36,10 @@ stats = defaultdict(lambda: defaultdict(lambda: {
     'total_time': 0.0
 }))
 
+processed_entries = set()  # Zbiór unikalnych wpisów (hash linii) do eliminacji duplikatów
 last_processed_line = 0
 last_log_filename = None
+last_sent_stats_hash = None  # Do wykrywania zmian w statystykach
 
 def connect_ftp():
     ftp = ftplib.FTP()
@@ -69,6 +71,10 @@ def parse_line(line):
     lock = match.group('lock')
     return nick, lock, success, elapsed, fail
 
+def line_hash(line):
+    # Prostą metodą generujemy hash linii do wykrywania unikatowości
+    return hash(line)
+
 def update_stats(nick, lock, success, elapsed, fail):
     with stats_lock:
         entry = stats[nick][lock]
@@ -80,7 +86,7 @@ def update_stats(nick, lock, success, elapsed, fail):
         entry['total_time'] += elapsed
 
 def fetch_and_parse_log(ftp, filename):
-    global last_processed_line
+    global processed_entries
     try:
         bio = io.BytesIO()
         ftp.retrbinary(f'RETR {filename}', bio.write)
@@ -93,14 +99,19 @@ def fetch_and_parse_log(ftp, filename):
     lines = content.splitlines()
     processed = 0
     for line in lines:
+        h = line_hash(line)
+        if h in processed_entries:
+            continue
         res = parse_line(line)
         if res:
             nick, lock, success, elapsed, fail = res
             update_stats(nick, lock, success, elapsed, fail)
+            processed_entries.add(h)
             processed += 1
     return processed
 
 def fetch_and_parse_log_incremental(ftp, filename, from_line):
+    global processed_entries
     try:
         bio = io.BytesIO()
         ftp.retrbinary(f'RETR {filename}', bio.write)
@@ -114,10 +125,14 @@ def fetch_and_parse_log_incremental(ftp, filename, from_line):
     new_lines = lines[from_line:]
     processed = 0
     for line in new_lines:
+        h = line_hash(line)
+        if h in processed_entries:
+            continue
         res = parse_line(line)
         if res:
             nick, lock, success, elapsed, fail = res
             update_stats(nick, lock, success, elapsed, fail)
+            processed_entries.add(h)
             processed += 1
     return processed, len(lines)
 
@@ -196,6 +211,17 @@ def generate_short_table():
 
         return '\n'.join([header_line, sep_line] + row_lines)
 
+def stats_hash():
+    # Generujemy hash zawartości statystyk, aby porównać, czy coś się zmieniło
+    with stats_lock:
+        items = []
+        for nick in sorted(stats.keys()):
+            for lock in LOCK_ORDER:
+                if lock in stats[nick]:
+                    e = stats[nick][lock]
+                    items.append((nick, lock, e['all'], e['success'], e['fail'], round(e['total_time'], 2)))
+        return hash(tuple(items))
+
 def send_to_discord(*table_texts):
     for table_text in table_texts:
         data = {
@@ -209,7 +235,7 @@ def send_to_discord(*table_texts):
             print(f"[ERROR] Błąd podczas wysyłania do Discorda: {e}")
 
 def initial_load_and_process():
-    global last_log_filename, last_processed_line
+    global last_log_filename, last_processed_line, last_sent_stats_hash
     try:
         ftp = connect_ftp()
         logs = list_logs(ftp)
@@ -233,12 +259,13 @@ def initial_load_and_process():
         print(table)
         print(short_table)
         send_to_discord(table, short_table)
+        last_sent_stats_hash = stats_hash()
 
     except Exception as e:
         print(f"[ERROR] Błąd podczas pobierania listy lub przetwarzania: {e}")
 
 def monitor_new_lines_loop():
-    global last_log_filename, last_processed_line
+    global last_log_filename, last_processed_line, last_sent_stats_hash
     while True:
         time.sleep(60)
         try:
@@ -261,9 +288,12 @@ def monitor_new_lines_loop():
                 last_processed_line = total_lines
                 table = generate_table()
                 short_table = generate_short_table()
-                print(table)
-                print(short_table)
-                send_to_discord(table, short_table)
+                current_hash = stats_hash()
+                if current_hash != last_sent_stats_hash:
+                    print(table)
+                    print(short_table)
+                    send_to_discord(table, short_table)
+                    last_sent_stats_hash = current_hash
             ftp.quit()
         except Exception as e:
             print(f"[ERROR] Błąd podczas monitoringu nowych linii: {e}")
