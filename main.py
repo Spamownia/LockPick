@@ -20,9 +20,9 @@ DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1396229686475886704/Mp3C
 # Lockpicking zamki kolejność sortowania
 LOCK_ORDER = ['VeryEasy', 'Basic', 'Medium', 'Advanced', 'DialLock']
 
-# Regex do parsowania linii loga lockpickingu
+# Regex do parsowania linii loga lockpickingu - poprawiony
 LOG_PATTERN = re.compile(
-    r'User: (?P<nick>.+?) \(\d+, \d+\).+?Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[0-9.]+)\. Failed attempts: (?P<fail>\d+)\. Lock type: (?P<lock>\w+)\.'
+    r'User: (?P<nick>.+?) \(\d+, \d+\)\. Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[0-9.]+)\. Failed attempts: (?P<fail>\d+)\. Lock type: (?P<lock>\w+)\.'
 )
 
 app = Flask(__name__)
