@@ -27,7 +27,6 @@ LOG_PATTERN = re.compile(
 
 app = Flask(__name__)
 
-# Dane globalne
 stats_lock = threading.Lock()
 stats = defaultdict(lambda: defaultdict(lambda: {
     'all': 0,
@@ -36,10 +35,10 @@ stats = defaultdict(lambda: defaultdict(lambda: {
     'total_time': 0.0
 }))
 
-processed_entries = set()  # Zbiór unikalnych wpisów (hash linii) do eliminacji duplikatów
+processed_entries = set()
 last_processed_line = 0
 last_log_filename = None
-last_sent_stats_hash = None  # Do wykrywania zmian w statystykach
+last_sent_stats_hash = None
 
 def connect_ftp():
     ftp = ftplib.FTP()
@@ -72,17 +71,18 @@ def parse_line(line):
     return nick, lock, success, elapsed, fail
 
 def line_hash(line):
-    # Prostą metodą generujemy hash linii do wykrywania unikatowości
     return hash(line)
 
 def update_stats(nick, lock, success, elapsed, fail):
     with stats_lock:
         entry = stats[nick][lock]
-        entry['all'] += 1 + fail          # uwzględniamy wszystkie próby (1 obecna + fail nieudanych)
         if success:
+            entry['all'] += 1 + fail
             entry['success'] += 1
+            entry['fail'] += fail
         else:
-            entry['fail'] += 1 + fail     # wszystkie nieudane próby razem
+            entry['all'] += fail
+            entry['fail'] += fail
         entry['total_time'] += elapsed
 
 def fetch_and_parse_log(ftp, filename):
@@ -212,7 +212,6 @@ def generate_short_table():
         return '\n'.join([header_line, sep_line] + row_lines)
 
 def stats_hash():
-    # Generujemy hash zawartości statystyk, aby porównać, czy coś się zmieniło
     with stats_lock:
         items = []
         for nick in sorted(stats.keys()):
@@ -281,7 +280,7 @@ def monitor_new_lines_loop():
             if current_log != last_log_filename:
                 last_log_filename = current_log
                 last_processed_line = 0
-                processed_entries = set()  # RESET zbioru przetworzonych linii przy nowym pliku
+                processed_entries = set()
                 print(f"[INFO] Zmiana loga na {current_log}, resetuję pozycję czytania i historię przetworzonych linii.")
 
             processed, total_lines = fetch_and_parse_log_incremental(ftp, last_log_filename, last_processed_line)
