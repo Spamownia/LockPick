@@ -1,4 +1,3 @@
-import os
 import re
 import threading
 import time
@@ -7,243 +6,223 @@ from io import BytesIO
 from flask import Flask
 import requests
 
-# --- Konfiguracja FTP i webhooka ---
-FTP_HOST = "176.57.174.10"
+# --- Konfiguracja ---
+FTP_IP = "176.57.174.10"
 FTP_PORT = 50021
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
 FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
-
 DISCORD_WEBHOOK_URL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
 
-# --- Flask app ---
+CHECK_INTERVAL = 60  # sekund
+
 app = Flask(__name__)
 
-# --- Globalna zmienna na statystyki ---
+# Słownik na sumaryczne statystyki: { (nick, zamek): { 'all': int, 'success': int, 'fail': int, 'time_sum': float } }
 stats = {}
 
-stats_lock = threading.Lock()
+lock = threading.Lock()
 
-# --- Funkcje pomocnicze ---
-
-def ftp_connect():
-    ftp = FTP()
-    ftp.connect(FTP_HOST, FTP_PORT, timeout=20)
-    ftp.login(FTP_USER, FTP_PASS)
-    return ftp
-
+# --- Funkcja listująca pliki logów na FTP ---
 def list_log_files(ftp):
     ftp.cwd(FTP_LOG_DIR)
-    files = ftp.nlst()
-    # Filtrujemy nazwy gameplay_*.log
-    log_files = [f for f in files if re.match(r"gameplay_.*\.log$", f)]
-    return log_files
+    files = []
 
-def download_log(ftp, filename):
+    def collect_line(line):
+        # Parsowanie formatu LIST: permissions, user, group, size, date, name
+        parts = line.split(maxsplit=8)
+        if len(parts) == 9:
+            filename = parts[8]
+            if re.match(r"gameplay_.*\.log$", filename):
+                files.append(filename)
+
+    ftp.retrlines('LIST', callback=collect_line)
+    return files
+
+# --- Pobranie pliku logu z FTP (jako bytes) ---
+def download_log_file(ftp, filename):
     bio = BytesIO()
     ftp.retrbinary(f"RETR {filename}", bio.write)
     bio.seek(0)
-    content = bio.read()
-    # Dekodujemy UTF-16 LE
-    text = content.decode("utf-16le", errors="ignore")
-    return text
+    return bio.read()
 
-def parse_log_content(text):
-    """
-    Parsuje log do statystyk.
-    Założenie: Każdy wpis w logu zawiera: Nick, Zamek, sukces (True/False), czas (sekundy)
-    Przykład linii loga (należy dostosować do rzeczywistego formatu!):
+# --- Parsowanie zawartości logu do statystyk ---
+# Załóżmy, że w logach linie z danymi mają format:
+# "[TIME] Nick=XXX Lock=YYY Result=Success/Fail Duration=ZZ.ZZ"
+# Jeśli inny format, podaj proszę, to zmodyfikuję parser.
+log_line_regex = re.compile(
+    r"Nick=(?P<nick>\S+)\s+Lock=(?P<lock>\S+)\s+Result=(?P<result>Success|Fail)\s+Duration=(?P<duration>[0-9\.]+)"
+)
 
-    [timestamp] Nick=Anu; Zamek=Advanced; Result=False; Time=12.67
-    [timestamp] Nick=Szturman; Zamek=VeryEasy; Result=True; Time=5.78
-
-    Funkcja zwraca słownik:
-    {
-        (Nick, Zamek): {"all": int, "success": int, "fail": int, "total_time": float}
-    }
-    """
-
-    pattern = re.compile(
-        r"Nick=(?P<nick>[^;]+);\s*Zamek=(?P<zamek>[^;]+);\s*Result=(?P<result>True|False);\s*Time=(?P<time>[0-9.]+)",
-        re.IGNORECASE,
-    )
+def parse_log_data(content_bytes):
+    text = content_bytes.decode('utf-16le')  # dekodowanie UTF-16 LE wg informacji
     local_stats = {}
-
     for line in text.splitlines():
-        m = pattern.search(line)
-        if not m:
-            continue
-        nick = m.group("nick").strip()
-        zamek = m.group("zamek").strip()
-        result = m.group("result").strip().lower() == "true"
-        czas = float(m.group("time"))
+        m = log_line_regex.search(line)
+        if m:
+            nick = m.group("nick")
+            lock = m.group("lock")
+            result = m.group("result")
+            duration = float(m.group("duration"))
 
-        key = (nick, zamek)
-        if key not in local_stats:
-            local_stats[key] = {"all": 0, "success": 0, "fail": 0, "total_time": 0.0}
-        local_stats[key]["all"] += 1
-        if result:
-            local_stats[key]["success"] += 1
-        else:
-            local_stats[key]["fail"] += 1
-        local_stats[key]["total_time"] += czas
+            key = (nick, lock)
+            if key not in local_stats:
+                local_stats[key] = {'all': 0, 'success': 0, 'fail': 0, 'time_sum': 0.0}
 
+            local_stats[key]['all'] += 1
+            if result == "Success":
+                local_stats[key]['success'] += 1
+            else:
+                local_stats[key]['fail'] += 1
+            local_stats[key]['time_sum'] += duration
     return local_stats
 
-def merge_stats(base, new):
-    for key, vals in new.items():
-        if key not in base:
-            base[key] = vals.copy()
-        else:
-            base[key]["all"] += vals["all"]
-            base[key]["success"] += vals["success"]
-            base[key]["fail"] += vals["fail"]
-            base[key]["total_time"] += vals["total_time"]
+# --- Aktualizacja globalnych statystyk ---
+def update_stats(new_stats):
+    with lock:
+        for key, data in new_stats.items():
+            if key not in stats:
+                stats[key] = data
+            else:
+                stats[key]['all'] += data['all']
+                stats[key]['success'] += data['success']
+                stats[key]['fail'] += data['fail']
+                stats[key]['time_sum'] += data['time_sum']
 
-def format_table(stats_dict):
-    # Nagłówki
-    headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
+# --- Generowanie tekstowej tabeli z danych ---
+def generate_table():
+    with lock:
+        if not stats:
+            return "Brak danych do wyświetlenia."
 
-    # Budujemy wiersze z danymi
-    rows = []
-    for (nick, zamek), v in sorted(stats_dict.items(), key=lambda x: (x[0][0].lower(), x[0][1].lower())):
-        all_ = v["all"]
-        success = v["success"]
-        fail = v["fail"]
-        skut = (success / all_ * 100) if all_ > 0 else 0.0
-        sr_czas = (v["total_time"] / all_) if all_ > 0 else 0.0
+        # Nagłówki
+        headers = ["Nick", "Zamek", "Ilość wszystkich prób", "Udane", "Nieudane", "Skuteczność", "Średni czas"]
 
-        rows.append([
-            nick,
-            zamek,
-            str(all_),
-            str(success),
-            str(fail),
-            f"{skut:.1f}%",
-            f"{sr_czas:.2f}s"
-        ])
+        # Zbieranie wierszy
+        rows = []
+        for (nick, lock), data in stats.items():
+            all_ = data['all']
+            success = data['success']
+            fail = data['fail']
+            success_rate = (success / all_ * 100) if all_ > 0 else 0
+            avg_time = (data['time_sum'] / all_) if all_ > 0 else 0
+            rows.append([
+                nick,
+                lock,
+                str(all_),
+                str(success),
+                str(fail),
+                f"{success_rate:.1f}%",
+                f"{avg_time:.2f}s"
+            ])
 
-    # Obliczamy szerokości kolumn (max długość pola)
-    col_widths = []
-    for col_i in range(len(headers)):
-        max_len = len(headers[col_i])
+        # Oblicz max szerokości kolumn
+        columns = list(zip(*([headers] + rows)))
+        col_widths = [max(len(str(cell)) for cell in col) for col in columns]
+
+        # Formatowanie linii tabeli z wyśrodkowaniem
+        def format_row(row):
+            return "| " + " | ".join(f"{cell:^{col_widths[i]}}" for i, cell in enumerate(row)) + " |"
+
+        sep = "|-" + "-|-".join('-' * w for w in col_widths) + "-|"
+
+        table_lines = []
+        table_lines.append(format_row(headers))
+        table_lines.append(sep)
         for row in rows:
-            max_len = max(max_len, len(row[col_i]))
-        col_widths.append(max_len)
+            table_lines.append(format_row(row))
 
-    # Funkcja do wyśrodkowania tekstu
-    def center(text, width):
-        return text.center(width)
+        return "\n".join(table_lines)
 
-    # Budujemy tabelę jako string z separatorami pipe "|"
-    sep = "|"
-    sep_line = "+" + "+".join(["-" * (w + 2) for w in col_widths]) + "+"
+# --- Wysyłka tabeli na Discord webhook ---
+def send_to_discord(content):
+    data = {"content": f"```\n{content}\n```"}
+    response = requests.post(DISCORD_WEBHOOK_URL, json=data)
+    if response.status_code != 204:
+        print(f"[ERROR] Nie udało się wysłać na Discord webhook, status: {response.status_code}, odpowiedź: {response.text}")
 
-    lines = []
-    lines.append(sep_line)
-    # Nagłówek
-    header_line = sep + sep.join(" " + center(headers[i], col_widths[i]) + " " for i in range(len(headers))) + sep
-    lines.append(header_line)
-    lines.append(sep_line.replace("-", "="))  # oddzielnik po nagłówku
-
-    # Wiersze danych
-    for row in rows:
-        line = sep + sep.join(" " + center(row[i], col_widths[i]) + " " for i in range(len(row))) + sep
-        lines.append(line)
-    lines.append(sep_line)
-
-    # Zwracamy całość jako pojedynczy string w bloku kodu do Discorda
-    table_text = "\n".join(lines)
-    return f"```\n{table_text}\n```"
-
-def send_to_discord(text):
-    payload = {"content": text}
-    try:
-        resp = requests.post(DISCORD_WEBHOOK_URL, json=payload, timeout=10)
-        if resp.status_code >= 300:
-            print(f"[WARN] Discord webhook zwrócił status {resp.status_code}: {resp.text}")
-    except Exception as e:
-        print(f"[ERROR] Błąd wysyłki do Discord webhook: {e}")
-
-# --- Główna funkcja przetwarzania wszystkich logów ---
+# --- Przetwarzanie wszystkich logów z FTP ---
 def process_all_logs():
-    global stats
-    print("🔁 Uruchamianie pełnego przetwarzania logów...")
-
     try:
-        ftp = ftp_connect()
-    except Exception as e:
-        print(f"[ERROR] Nie udało się połączyć z FTP: {e}")
-        return
+        with FTP() as ftp:
+            ftp.connect(FTP_IP, FTP_PORT, timeout=10)
+            ftp.login(FTP_USER, FTP_PASS)
 
-    try:
-        log_files = list_log_files(ftp)
-        if not log_files:
-            print("[INFO] Brak logów do przetworzenia na FTP.")
-            ftp.quit()
-            return
+            files = list_log_files(ftp)
+            if not files:
+                print("[INFO] Nie znaleziono plików logów na FTP.")
+                return
 
-        new_stats = {}
+            for filename in files:
+                content = download_log_file(ftp, filename)
+                new_stats = parse_log_data(content)
+                update_stats(new_stats)
 
-        for filename in log_files:
-            try:
-                content = download_log(ftp, filename)
-                parsed = parse_log_content(content)
-                merge_stats(new_stats, parsed)
-            except Exception as e:
-                print(f"[WARN] Błąd przy przetwarzaniu {filename}: {e}")
-
-        with stats_lock:
-            stats = new_stats
-
-        print("[INFO] Przetwarzanie logów zakończone.")
-        ftp.quit()
+            print("[INFO] Przetworzono wszystkie dostępne logi.")
     except Exception as e:
         print(f"[ERROR] Błąd podczas pobierania listy lub przetwarzania: {e}")
 
-def process_latest_log():
-    global stats
+# --- Monitorowanie najnowszego pliku i aktualizacja co 60s ---
+def monitor_latest_log():
+    last_processed_size = 0
+    last_file = None
 
-    try:
-        ftp = ftp_connect()
-        log_files = list_log_files(ftp)
-        if not log_files:
-            ftp.quit()
-            print("[INFO] Brak logów do przetworzenia w monitoringu.")
-            return
-        # Najnowszy plik wg nazwy (zakładamy nazwy rosnące)
-        latest_log = sorted(log_files)[-1]
-        content = download_log(ftp, latest_log)
-        parsed = parse_log_content(content)
-
-        with stats_lock:
-            merge_stats(stats, parsed)
-            table_text = format_table(stats)
-
-        send_to_discord(table_text)
-        ftp.quit()
-        print(f"[INFO] Wysłano aktualizację tabeli dla pliku {latest_log}.")
-    except Exception as e:
-        print(f"[ERROR] Błąd podczas przetwarzania najnowszego loga: {e}")
-
-def monitor_new_logs():
     while True:
         try:
-            process_latest_log()
-        except Exception as e:
-            print(f"[ERROR] Błąd w monitoringu logów: {e}")
-        time.sleep(60)
+            with FTP() as ftp:
+                ftp.connect(FTP_IP, FTP_PORT, timeout=10)
+                ftp.login(FTP_USER, FTP_PASS)
+                ftp.cwd(FTP_LOG_DIR)
 
-# --- Uruchomienie wątku monitorującego po starcie ---
+                files = list_log_files(ftp)
+                if not files:
+                    print("[INFO] Brak plików logów do monitorowania.")
+                    time.sleep(CHECK_INTERVAL)
+                    continue
+
+                # wybierz najnowszy plik (alfabetycznie, przy założeniu, że najnowszy ma największą nazwę)
+                newest_file = sorted(files)[-1]
+
+                if newest_file != last_file:
+                    last_file = newest_file
+                    last_processed_size = 0
+
+                # pobierz plik
+                bio = BytesIO()
+                ftp.retrbinary(f"RETR {newest_file}", bio.write)
+                bio.seek(0)
+                content_bytes = bio.read()
+
+                if len(content_bytes) > last_processed_size:
+                    new_content = content_bytes[last_processed_size:]
+                    new_stats = parse_log_data(new_content)
+                    update_stats(new_stats)
+                    last_processed_size = len(content_bytes)
+
+                    # Wyślij tabelę na Discorda
+                    table_text = generate_table()
+                    send_to_discord(table_text)
+
+            time.sleep(CHECK_INTERVAL)
+
+        except Exception as e:
+            print(f"[ERROR] Błąd podczas monitorowania logów: {e}")
+            time.sleep(CHECK_INTERVAL)
+
+# --- Uruchomienie monitorowania w osobnym wątku ---
 def start_monitor_thread():
-    thread = threading.Thread(target=monitor_new_logs, daemon=True)
+    thread = threading.Thread(target=monitor_latest_log, daemon=True)
     thread.start()
 
+# --- Endpoint testowy ---
 @app.route("/")
 def index():
-    return "Serwis działa."
+    return "Lockpick logs service is running."
 
+# --- Główna część ---
 if __name__ == "__main__":
+    print("🔁 Uruchamianie pełnego przetwarzania logów...")
     process_all_logs()
     start_monitor_thread()
+    print("     ==> Your service is live 🎉")
     app.run(host="0.0.0.0", port=10000)
