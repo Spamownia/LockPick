@@ -78,11 +78,11 @@ def line_hash(line):
 def update_stats(nick, lock, success, elapsed, fail):
     with stats_lock:
         entry = stats[nick][lock]
-        entry['all'] += 1
+        entry['all'] += 1 + fail          # uwzględniamy wszystkie próby (1 obecna + fail nieudanych)
         if success:
             entry['success'] += 1
         else:
-            entry['fail'] += 1
+            entry['fail'] += 1 + fail     # wszystkie nieudane próby razem
         entry['total_time'] += elapsed
 
 def fetch_and_parse_log(ftp, filename):
