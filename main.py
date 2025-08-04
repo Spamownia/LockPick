@@ -20,7 +20,7 @@ DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1396229686475886704/Mp3C
 # Lockpicking zamki kolejność sortowania
 LOCK_ORDER = ['VeryEasy', 'Basic', 'Medium', 'Advanced', 'DialLock']
 
-# Regex do parsowania linii loga lockpickingu - poprawiony regex
+# Regex do parsowania linii loga lockpickingu
 LOG_PATTERN = re.compile(
     r'User: (?P<nick>.+?) \(\d+, \d+\)\. Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[0-9.]+)\. Failed attempts: (?P<fail>\d+)\. .*?Lock type: (?P<lock>\w+)\.'
 )
@@ -48,11 +48,7 @@ def connect_ftp():
 
 def list_logs(ftp):
     lines = []
-    try:
-        ftp.retrlines('LIST', lines.append)
-    except Exception as e:
-        raise RuntimeError(f"FTP LIST error: {e}")
-
+    ftp.retrlines('LIST', lines.append)
     files = []
     for line in lines:
         parts = line.split(maxsplit=8)
@@ -163,19 +159,54 @@ def generate_table():
         header_line = '|' + '|'.join(center(h, w) for h, w in zip(headers, col_widths)) + '|'
         row_lines = ['|' + '|'.join(center(c, w) for c, w in zip(row, col_widths)) + '|' for row in rows]
 
-        table_text = '\n'.join([header_line, sep_line] + row_lines)
-        return table_text
+        return '\n'.join([header_line, sep_line] + row_lines)
 
-def send_to_discord(table_text):
-    data = {
-        "content": "```\n" + table_text + "\n```"
-    }
-    try:
-        r = requests.post(DISCORD_WEBHOOK_URL, json=data, timeout=10)
-        if r.status_code != 204:
-            print(f"[ERROR] Wysyłanie do Discorda nie powiodło się, status: {r.status_code}, treść: {r.text}")
-    except Exception as e:
-        print(f"[ERROR] Błąd podczas wysyłania do Discorda: {e}")
+def generate_short_table():
+    with stats_lock:
+        rows = []
+        for nick in sorted(stats.keys()):
+            for lock in LOCK_ORDER:
+                if lock in stats[nick]:
+                    entry = stats[nick][lock]
+                    all_ = entry['all']
+                    success = entry['success']
+                    accuracy = (success / all_ * 100) if all_ > 0 else 0.0
+                    avg_time = (entry['total_time'] / all_) if all_ > 0 else 0.0
+                    rows.append((
+                        nick,
+                        lock,
+                        f"{accuracy:.1f}%",
+                        f"{avg_time:.2f}s"
+                    ))
+
+        headers = ['Nick', 'Zamek', 'Skuteczność', 'Średni czas']
+        columns = list(zip(*([headers] + rows))) if rows else [headers]
+        col_widths = [max(len(str(item)) for item in col) for col in columns]
+
+        def center(text, width):
+            text = str(text)
+            space = width - len(text)
+            left = space // 2
+            right = space - left
+            return ' ' * left + text + ' ' * right
+
+        sep_line = '|' + '|'.join(['-' * w for w in col_widths]) + '|'
+        header_line = '|' + '|'.join(center(h, w) for h, w in zip(headers, col_widths)) + '|'
+        row_lines = ['|' + '|'.join(center(c, w) for c, w in zip(row, col_widths)) + '|' for row in rows]
+
+        return '\n'.join([header_line, sep_line] + row_lines)
+
+def send_to_discord(*table_texts):
+    for table_text in table_texts:
+        data = {
+            "content": "```\n" + table_text + "\n```"
+        }
+        try:
+            r = requests.post(DISCORD_WEBHOOK_URL, json=data, timeout=10)
+            if r.status_code != 204:
+                print(f"[ERROR] Wysyłanie do Discorda nie powiodło się, status: {r.status_code}, treść: {r.text}")
+        except Exception as e:
+            print(f"[ERROR] Błąd podczas wysyłania do Discorda: {e}")
 
 def initial_load_and_process():
     global last_log_filename, last_processed_line
@@ -198,8 +229,10 @@ def initial_load_and_process():
 
         print("[INFO] Przetworzono wszystkie dostępne logi.")
         table = generate_table()
+        short_table = generate_short_table()
         print(table)
-        send_to_discord(table)
+        print(short_table)
+        send_to_discord(table, short_table)
 
     except Exception as e:
         print(f"[ERROR] Błąd podczas pobierania listy lub przetwarzania: {e}")
@@ -227,8 +260,10 @@ def monitor_new_lines_loop():
             if processed > 0:
                 last_processed_line = total_lines
                 table = generate_table()
+                short_table = generate_short_table()
                 print(table)
-                send_to_discord(table)
+                print(short_table)
+                send_to_discord(table, short_table)
             ftp.quit()
         except Exception as e:
             print(f"[ERROR] Błąd podczas monitoringu nowych linii: {e}")
