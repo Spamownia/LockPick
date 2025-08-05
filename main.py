@@ -131,7 +131,7 @@ def fetch_and_parse_log_incremental(ftp, filename, from_line):
 
 def format_table(headers, rows):
     columns = list(zip(*([headers] + rows))) if rows else [headers]
-    col_widths = [max(len(str(item)) for item in col) for col in columns]
+    col_widths = [max(len(str(item)) for item in col) + 2 for col in columns]  # Zwiększona szerokość
 
     def center(text, width):
         text = str(text)
