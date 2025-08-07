@@ -121,9 +121,9 @@ def generate_full_table():
             for i, cell in enumerate(row):
                 col_widths[i] = max(col_widths[i], len(cell))
 
-    header = "| " + " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers)) + " |"
+    header = "| " + " | ".join(h.center(col_widths[i]) for i, h in enumerate(headers)) + " |"
     separator = "|-" + "-|-".join("-" * col_widths[i] for i in range(len(headers))) + "-|"
-    table_rows = ["| " + " | ".join(row[i].ljust(col_widths[i]) for i in range(len(row))) + " |" for row in rows]
+    table_rows = ["| " + " | ".join(row[i].center(col_widths[i]) for i in range(len(row))) + " |" for row in rows]
     return "\n".join([header, separator] + table_rows) if rows else "| Brak danych |"
 
 # === Generowanie tabeli skróconej ===
@@ -144,9 +144,9 @@ def generate_short_table():
             for i, cell in enumerate(row):
                 col_widths[i] = max(col_widths[i], len(cell))
 
-    header = "| " + " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers)) + " |"
+    header = "| " + " | ".join(h.center(col_widths[i]) for i, h in enumerate(headers)) + " |"
     separator = "|-" + "-|-".join("-" * col_widths[i] for i in range(len(headers))) + "-|"
-    table_rows = ["| " + " | ".join(row[i].ljust(col_widths[i]) for i in range(len(row))) + " |" for row in rows]
+    table_rows = ["| " + " | ".join(row[i].center(col_widths[i]) for i in range(len(row))) + " |" for row in rows]
     return "\n".join([header, separator] + table_rows) if rows else "| Brak danych |"
 
 # === Generowanie podium ===
@@ -173,9 +173,9 @@ def generate_podium_table():
             col_widths[i] = max(col_widths[i], len(cell))
         rows.append(row)
 
-    header = "| " + " | ".join(headers[i].ljust(col_widths[i]) for i in range(3)) + " |"
+    header = "| " + " | ".join(headers[i].center(col_widths[i]) for i in range(3)) + " |"
     separator = "|-" + "-|-".join("-" * col_widths[i] for i in range(3)) + "-|"
-    table_rows = ["| " + " | ".join(row[i].ljust(col_widths[i]) for i in range(3)) + " |" for row in rows]
+    table_rows = ["| " + " | ".join(row[i].center(col_widths[i]) for i in range(3)) + " |" for row in rows]
     return "\n".join([header, separator] + table_rows) if rows else "| Brak danych |"
 
 # === Wysyłanie danych do Discorda ===
