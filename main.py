@@ -1,295 +1,248 @@
+import os
+import time
 import ftplib
-import io
 import re
 import threading
-import time
+from io import BytesIO
+from datetime import datetime
 from collections import defaultdict
-from flask import Flask, Response
+from flask import Flask
 import requests
 
 # === Dane FTP ===
-FTP_HOST = '195.179.226.218'
+FTP_HOST = "195.179.226.218"
 FTP_PORT = 56421
-FTP_USER = 'gpftp37275281717442833'
-FTP_PASS = 'LXNdGShY'
-FTP_LOG_PATH = '/SCUM/Saved/SaveFiles/Logs/'
+FTP_USER = "gpftp37275281717442833"
+FTP_PASS = "LXNdGShY"
+FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 
-# === Discord Webhook ===
-DISCORD_WEBHOOK_URL = 'https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3'
+# === Discord Webhooki ===
+DISCORD_WEBHOOK_FULL = 'https://discord.com/api/webhooks/1396227086527762632/HDWBcc5rVBDbimFdh-fuE43iL8inA6YXpLuYG2a4cUmbF8RQyLqtohx-1pWaQMzBzXlf'
+DISCORD_WEBHOOK_SHORT = 'https://discord.com/api/webhooks/1403070347280126132/hcMfNpXKmnnHhdylhvqvqVMnRkqzdztLf0lSQ_Lo9gs2joaqUaU0KQGBmSN8Qp88ZYaH'
+DISCORD_WEBHOOK_PODIUM = 'https://discord.com/api/webhooks/1396229119456448573/PG0jkv4VBlihDwkibrn3jGZ0k516O47iTWb1dziuvoGVKVoqffLqm8GmPLbVHvpJtYhv'
 
 # === Kolejność zamków ===
 LOCK_ORDER = ['VeryEasy', 'Basic', 'Medium', 'Advanced', 'DialLock']
 
-# === Wzorzec loga ===
-LOG_PATTERN = re.compile(
-    r'User: (?P<nick>.+?) \(\d+, \d+\)\. Success: (?P<success>Yes|No)\. Elapsed time: (?P<time>[0-9.]+)\. Failed attempts: (?P<fail>\d+)\. .*?Lock type: (?P<lock>\w+)\.'
-)
-
-# === Inicjalizacja Flask ===
-app = Flask(__name__)
-
-stats_lock = threading.Lock()
+# === Statystyki globalne ===
 stats = defaultdict(lambda: defaultdict(lambda: {
     'all': 0,
     'success': 0,
     'fail': 0,
     'total_time': 0.0
 }))
-processed_entries = set()
-last_processed_line = 0
-last_log_filename = None
-last_sent_stats_hash = None
+known_lines = set()
+last_log = None
 
-# === Połączenie FTP ===
-def connect_ftp():
-    ftp = ftplib.FTP()
-    ftp.connect(FTP_HOST, FTP_PORT, timeout=30)
-    ftp.login(FTP_USER, FTP_PASS)
-    ftp.cwd(FTP_LOG_PATH)
-    return ftp
+# === Parsowanie pojedynczej linii loga ===
+def parse_log_line(line):
+    match = re.search(r'User: (.+?) \([0-9, ]+\).*?Success: (Yes|No).*?Elapsed time: ([\d.]+).*?Failed attempts: (\d+).*?Lock type: (\w+)', line)
+    if match:
+        user = match.group(1).strip()
+        success = match.group(2) == "Yes"
+        elapsed = float(match.group(3))
+        failed_attempts = int(match.group(4))
+        lock_type = match.group(5)
+        return user, lock_type, success, elapsed, failed_attempts
+    return None
 
-def list_logs(ftp):
-    lines = []
-    ftp.retrlines('LIST', lines.append)
-    return [line.split(maxsplit=8)[-1] for line in lines if line.endswith('.log') and 'gameplay_' in line]
+# === Przetwarzanie linii loga ===
+def process_line(line):
+    parsed = parse_log_line(line)
+    if not parsed:
+        return
 
-def parse_line(line):
-    match = LOG_PATTERN.search(line)
-    if not match:
-        return None
-    nick = match.group('nick')
-    success = match.group('success') == 'Yes'
-    elapsed = float(match.group('time'))
-    fail = int(match.group('fail'))
-    lock = match.group('lock')
-    return nick, lock, success, elapsed, fail
+    user, lock, success, elapsed, fail_count = parsed
+    stat = stats[user][lock]
 
-def line_hash(line):
-    return hash(line)
+    if success:
+        stat['all'] += 1 + fail_count
+        stat['success'] += 1
+        stat['fail'] += fail_count
+        stat['total_time'] += elapsed
+    else:
+        stat['all'] += fail_count
+        stat['fail'] += fail_count
 
-def update_stats(nick, lock, success, elapsed, fail):
-    with stats_lock:
-        entry = stats[nick][lock]
-        if success:
-            entry['all'] += 1 + fail
-            entry['success'] += 1
-            entry['fail'] += fail
-        else:
-            entry['all'] += fail
-            entry['fail'] += fail
-        entry['total_time'] += elapsed
+# === Pobieranie i filtrowanie logów z FTP ===
+def fetch_logs():
+    global last_log
+    logs = []
 
-def fetch_and_parse_log(ftp, filename):
-    global processed_entries
-    try:
-        bio = io.BytesIO()
-        ftp.retrbinary(f'RETR {filename}', bio.write)
-        bio.seek(0)
-        content = bio.read().decode('utf-16le', errors='ignore')
-    except Exception as e:
-        print(f"[ERROR] {filename}: {e}")
-        return 0
+    with ftplib.FTP() as ftp:
+        ftp.connect(FTP_HOST, FTP_PORT)
+        ftp.login(FTP_USER, FTP_PASS)
+        ftp.cwd(FTP_LOG_DIR)
+        files = ftp.nlst()
+        log_files = sorted([f for f in files if f.startswith('gameplay_') and f.endswith('.log')])
 
-    lines = content.splitlines()
-    processed = 0
-    for line in lines:
-        h = line_hash(line)
-        if h in processed_entries:
-            continue
-        res = parse_line(line)
-        if res:
-            nick, lock, success, elapsed, fail = res
-            update_stats(nick, lock, success, elapsed, fail)
-            processed_entries.add(h)
-            processed += 1
-    return processed
+        for filename in log_files:
+            bio = BytesIO()
+            ftp.retrbinary(f"RETR {filename}", bio.write)
+            content = bio.getvalue().decode('utf-16le', errors='ignore')
+            logs.append((filename, content))
 
-def fetch_and_parse_log_incremental(ftp, filename, from_line):
-    global processed_entries
-    try:
-        bio = io.BytesIO()
-        ftp.retrbinary(f'RETR {filename}', bio.write)
-        bio.seek(0)
-        content = bio.read().decode('utf-16le', errors='ignore')
-    except Exception as e:
-        print(f"[ERROR] {filename}: {e}")
-        return 0, from_line
+        if log_files:
+            last_log = log_files[-1]
 
-    lines = content.splitlines()
-    new_lines = lines[from_line:]
-    processed = 0
-    for line in new_lines:
-        h = line_hash(line)
-        if h in processed_entries:
-            continue
-        res = parse_line(line)
-        if res:
-            nick, lock, success, elapsed, fail = res
-            update_stats(nick, lock, success, elapsed, fail)
-            processed_entries.add(h)
-            processed += 1
-    return processed, len(lines)
+    return logs
 
-def format_table(headers, rows):
-    columns = list(zip(*([headers] + rows))) if rows else [headers]
-    col_widths = [max(len(str(item)) for item in col) + 2 for col in columns]
+# === Generowanie tabeli pełnej ===
+def generate_full_table():
+    headers = ['Nick', 'Zamek', 'Wszystkie', 'Udane', 'Nieudane', 'Skuteczność', 'Średni czas']
+    col_widths = [max(len(h), 10) for h in headers]
+    rows = []
 
-    def center(text, width):
-        text = str(text)
-        space = width - len(text)
-        return ' ' * (space // 2) + text + ' ' * (space - space // 2)
+    for user in sorted(stats.keys()):
+        for lock in LOCK_ORDER:
+            data = stats[user].get(lock)
+            if not data or data['all'] == 0:
+                continue
+            skutecznosc = f"{(data['success'] / data['all']) * 100:.2f}%"
+            avg_time = f"{(data['total_time'] / data['success']):.2f}s" if data['success'] else "-"
+            row = [user, lock, str(data['all']), str(data['success']), str(data['fail']), skutecznosc, avg_time]
+            rows.append(row)
+            for i, cell in enumerate(row):
+                col_widths[i] = max(col_widths[i], len(cell))
 
-    sep_line = '|' + '|'.join(['-' * w for w in col_widths]) + '|'
-    header_line = '|' + '|'.join(center(h, w) for h, w in zip(headers, col_widths)) + '|'
-    row_lines = ['|' + '|'.join(center(c, w) for c, w in zip(row, col_widths)) + '|' for row in rows]
+    header = "| " + " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers)) + " |"
+    separator = "|-" + "-|-".join("-" * col_widths[i] for i in range(len(headers))) + "-|"
+    table_rows = ["| " + " | ".join(row[i].ljust(col_widths[i]) for i in range(len(row))) + " |" for row in rows]
+    return "\n".join([header, separator] + table_rows) if rows else "| Brak danych |"
 
-    return '\n'.join([header_line, sep_line] + row_lines)
-
-def generate_table():
-    with stats_lock:
-        rows = []
-        for nick in sorted(stats.keys()):
-            for lock in LOCK_ORDER:
-                if lock in stats[nick]:
-                    e = stats[nick][lock]
-                    all_ = e['all']
-                    success = e['success']
-                    fail = e['fail']
-                    accuracy = (success / all_ * 100) if all_ > 0 else 0.0
-                    avg_time = (e['total_time'] / all_) if all_ > 0 else 0.0
-                    rows.append((nick, lock, all_, success, fail, f"{accuracy:.1f}%", f"{avg_time:.2f}s"))
-        return format_table(
-            ['Nick', 'Zamek', 'Wszystkie', 'Udane', 'Nieudane', 'Skuteczność', 'Średni czas'],
-            rows
-        )
-
+# === Generowanie tabeli skróconej ===
 def generate_short_table():
-    with stats_lock:
-        rows = []
-        for nick in sorted(stats.keys()):
-            for lock in LOCK_ORDER:
-                if lock in stats[nick]:
-                    e = stats[nick][lock]
-                    all_ = e['all']
-                    success = e['success']
-                    accuracy = (success / all_ * 100) if all_ > 0 else 0.0
-                    avg_time = (e['total_time'] / all_) if all_ > 0 else 0.0
-                    rows.append((nick, lock, f"{accuracy:.1f}%", f"{avg_time:.2f}s"))
-        return format_table(['Nick', 'Zamek', 'Skuteczność', 'Średni czas'], rows)
+    headers = ['Nick', 'Zamek', 'Skuteczność', 'Średni czas']
+    col_widths = [max(len(h), 10) for h in headers]
+    rows = []
 
+    for user in sorted(stats.keys()):
+        for lock in LOCK_ORDER:
+            data = stats[user].get(lock)
+            if not data or data['all'] == 0:
+                continue
+            skutecznosc = f"{(data['success'] / data['all']) * 100:.2f}%"
+            avg_time = f"{(data['total_time'] / data['success']):.2f}s" if data['success'] else "-"
+            row = [user, lock, skutecznosc, avg_time]
+            rows.append(row)
+            for i, cell in enumerate(row):
+                col_widths[i] = max(col_widths[i], len(cell))
+
+    header = "| " + " | ".join(h.ljust(col_widths[i]) for i, h in enumerate(headers)) + " |"
+    separator = "|-" + "-|-".join("-" * col_widths[i] for i in range(len(headers))) + "-|"
+    table_rows = ["| " + " | ".join(row[i].ljust(col_widths[i]) for i in range(len(row))) + " |" for row in rows]
+    return "\n".join([header, separator] + table_rows) if rows else "| Brak danych |"
+
+# === Generowanie podium ===
 def generate_podium_table():
-    with stats_lock:
-        summary = defaultdict(lambda: [0, 0])
-        for nick, locks in stats.items():
-            for data in locks.values():
-                summary[nick][0] += data['success']
-                summary[nick][1] += data['all']
+    ranking = []
+    for user in stats:
+        total_success = sum(stats[user][lock]['success'] for lock in LOCK_ORDER)
+        total_all = sum(stats[user][lock]['all'] for lock in LOCK_ORDER)
+        if total_all == 0:
+            continue
+        skutecznosc = (total_success / total_all) * 100
+        ranking.append((user, skutecznosc))
 
-        ranked = [
-            (nick, s, a, (s / a * 100) if a > 0 else 0.0)
-            for nick, (s, a) in summary.items()
-            if a > 0
-        ]
-        ranked.sort(key=lambda x: x[3], reverse=True)
+    ranking.sort(key=lambda x: x[1], reverse=True)
 
-        medals = ['🥇', '🥈', '🥉']
-        rows = []
-        for idx, (nick, success, all_, acc) in enumerate(ranked, start=1):
-            place = medals[idx - 1] if idx <= 3 else f"{idx}."
-            rows.append((place, nick, f"{acc:.1f}%"))
-        return format_table(['Miejsce', 'Nick', 'Skuteczność'], rows)
+    headers = ['🏅', 'Nick', 'Skuteczność']
+    col_widths = [2, 10, 12]
+    rows = []
 
-def stats_hash():
-    with stats_lock:
-        items = []
-        for nick in sorted(stats.keys()):
-            for lock in LOCK_ORDER:
-                if lock in stats[nick]:
-                    e = stats[nick][lock]
-                    items.append((nick, lock, e['all'], e['success'], e['fail'], round(e['total_time'], 2)))
-        return hash(tuple(items))
+    for idx, (user, skutecznosc) in enumerate(ranking):
+        emoji = "🥇" if idx == 0 else "🥈" if idx == 1 else "🥉" if idx == 2 else str(idx + 1)
+        row = [emoji, user, f"{skutecznosc:.2f}%"]
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(cell))
+        rows.append(row)
 
-def send_to_discord(*table_texts):
-    for table_text in table_texts:
+    header = "| " + " | ".join(headers[i].ljust(col_widths[i]) for i in range(3)) + " |"
+    separator = "|-" + "-|-".join("-" * col_widths[i] for i in range(3)) + "-|"
+    table_rows = ["| " + " | ".join(row[i].ljust(col_widths[i]) for i in range(3)) + " |" for row in rows]
+    return "\n".join([header, separator] + table_rows) if rows else "| Brak danych |"
+
+# === Wysyłanie danych do Discorda ===
+def send_to_discord(table_full, table_short, table_podium):
+    webhooks = [
+        (DISCORD_WEBHOOK_FULL, table_full),
+        (DISCORD_WEBHOOK_SHORT, table_short),
+        (DISCORD_WEBHOOK_PODIUM, table_podium),
+    ]
+    for url, content in webhooks:
         data = {
-            "content": "```\n" + table_text + "\n```"
+            "content": "```\n" + content + "\n```"
         }
         try:
-            r = requests.post(DISCORD_WEBHOOK_URL, json=data, timeout=10)
+            r = requests.post(url, json=data, timeout=10)
             if r.status_code != 204:
                 print(f"[ERROR] Discord HTTP {r.status_code}: {r.text}")
         except Exception as e:
             print(f"[ERROR] Discord post failed: {e}")
 
-def initial_load_and_process():
-    global last_log_filename, last_processed_line, last_sent_stats_hash
-    try:
-        ftp = connect_ftp()
-        logs = list_logs(ftp)
-        if not logs:
-            print("[INFO] Brak logów.")
-            ftp.quit()
-            return
-        logs.sort()
-        last_log_filename = logs[-1]
-        for log in logs:
-            fetch_and_parse_log(ftp, log)
-        ftp.quit()
-        last_processed_line = 0
+# === Przetwarzanie logów przy starcie ===
+def process_all_logs():
+    print("🔁 Uruchamianie pełnego przetwarzania logów...")
+    logs = fetch_logs()
+    for _, content in logs:
+        for line in content.splitlines():
+            if line not in known_lines:
+                process_line(line)
+                known_lines.add(line)
+    print("[INFO] Przetworzono wszystkie dostępne logi.")
 
-        table = generate_table()
-        short = generate_short_table()
-        podium = generate_podium_table()
-        print(table)
-        print(short)
-        print(podium)
-        send_to_discord(table, short, podium)
-        last_sent_stats_hash = stats_hash()
+    # Generuj i wyślij wszystkie tabele
+    table_full = generate_full_table()
+    table_short = generate_short_table()
+    table_podium = generate_podium_table()
+    print(table_full)
+    print(table_short)
+    print(table_podium)
+    send_to_discord(table_full, table_short, table_podium)
 
-    except Exception as e:
-        print(f"[ERROR] Init: {e}")
-
-def monitor_new_lines_loop():
-    global last_log_filename, last_processed_line, last_sent_stats_hash, processed_entries
+# === Monitoring nowych wpisów ===
+def background_worker():
+    global last_log
+    print("🔁 Start wątku do monitorowania nowych linii w najnowszym pliku...")
     while True:
-        time.sleep(60)
         try:
-            ftp = connect_ftp()
-            logs = list_logs(ftp)
-            if not logs:
-                ftp.quit()
-                continue
-            logs.sort()
-            current_log = logs[-1]
-            if current_log != last_log_filename:
-                last_log_filename = current_log
-                last_processed_line = 0
-                processed_entries.clear()
-                print(f"[INFO] Nowy log: {current_log}")
+            logs = fetch_logs()
+            current_log = None
+            for fname, content in logs:
+                if fname == last_log:
+                    current_log = content
+                    break
+            if current_log:
+                new_lines = []
+                for line in current_log.splitlines():
+                    if line not in known_lines:
+                        known_lines.add(line)
+                        process_line(line)
+                        new_lines.append(line)
 
-            processed, total_lines = fetch_and_parse_log_incremental(ftp, current_log, last_processed_line)
-            if processed > 0:
-                last_processed_line = total_lines
-                current_hash = stats_hash()
-                if current_hash != last_sent_stats_hash:
-                    table = generate_table()
-                    short = generate_short_table()
-                    podium = generate_podium_table()
-                    print(table)
-                    print(short)
-                    print(podium)
-                    send_to_discord(table, short, podium)
-                    last_sent_stats_hash = current_hash
-            ftp.quit()
+                if new_lines:
+                    print(f"[INFO] Wykryto {len(new_lines)} nowych wpisów.")
+                    table_full = generate_full_table()
+                    table_short = generate_short_table()
+                    table_podium = generate_podium_table()
+                    print(table_full)
+                    print(table_short)
+                    print(table_podium)
+                    send_to_discord(table_full, table_short, table_podium)
         except Exception as e:
-            print(f"[ERROR] Monitor: {e}")
+            print(f"[ERROR] Błąd w tle: {e}")
 
-@app.route('/')
+        time.sleep(60)
+
+# === Flask endpoint ===
+app = Flask(__name__)
+
+@app.route("/", methods=["GET"])
 def index():
-    return Response("Lockpicking service is running.", mimetype='text/plain')
+    return "Lockpicking stat collector is running."
 
-if __name__ == '__main__':
-    print("🔁 Start – przetwarzanie logów...")
-    initial_load_and_process()
-    threading.Thread(target=monitor_new_lines_loop, daemon=True).start()
-    app.run(host='0.0.0.0', port=10000)
+# === Start aplikacji ===
+if __name__ == "__main__":
+    process_all_logs()
+    threading.Thread(target=background_worker, daemon=True).start()
+    app.run(host="0.0.0.0", port=10000)
