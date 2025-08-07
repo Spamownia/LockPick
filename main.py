@@ -68,23 +68,35 @@ def process_line(line):
 def fetch_logs():
     global last_log
     logs = []
+    try:
+        with ftplib.FTP() as ftp:
+            ftp.connect(FTP_HOST, FTP_PORT)
+            ftp.login(FTP_USER, FTP_PASS)
+            ftp.cwd(FTP_LOG_DIR)
 
-    with ftplib.FTP() as ftp:
-        ftp.connect(FTP_HOST, FTP_PORT)
-        ftp.login(FTP_USER, FTP_PASS)
-        ftp.cwd(FTP_LOG_DIR)
-        files = ftp.nlst()
-        log_files = sorted([f for f in files if f.startswith('gameplay_') and f.endswith('.log')])
+            files = []
 
-        for filename in log_files:
-            bio = BytesIO()
-            ftp.retrbinary(f"RETR {filename}", bio.write)
-            content = bio.getvalue().decode('utf-16le', errors='ignore')
-            logs.append((filename, content))
+            def parse_list_line(line):
+                # Przykładowa linia LIST: -rw-r--r-- 1 user group 1234 Jan 01 12:34 gameplay_20250807.log
+                parts = line.split()
+                if len(parts) >= 9:
+                    filename = parts[-1]
+                    files.append(filename)
 
-        if log_files:
-            last_log = log_files[-1]
+            ftp.retrlines('LIST', parse_list_line)
 
+            log_files = sorted([f for f in files if f.startswith('gameplay_') and f.endswith('.log')])
+
+            for filename in log_files:
+                bio = BytesIO()
+                ftp.retrbinary(f"RETR {filename}", bio.write)
+                content = bio.getvalue().decode('utf-16le', errors='ignore')
+                logs.append((filename, content))
+
+            if log_files:
+                last_log = log_files[-1]
+    except Exception as e:
+        print(f"[ERROR] Błąd FTP podczas pobierania listy plików: {e}")
     return logs
 
 # === Generowanie tabeli pełnej ===
