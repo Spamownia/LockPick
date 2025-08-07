@@ -40,7 +40,11 @@ def parse_log_line(line):
     if match:
         user = match.group(1).strip()
         success = match.group(2) == "Yes"
-        elapsed = float(match.group(3))
+        elapsed_str = match.group(3).rstrip('.')  # usunięcie końcowej kropki, jeśli jest
+        try:
+            elapsed = float(elapsed_str)
+        except ValueError:
+            return None
         failed_attempts = int(match.group(4))
         lock_type = match.group(5)
         return user, lock_type, success, elapsed, failed_attempts
