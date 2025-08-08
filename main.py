@@ -1,214 +1,264 @@
 import os
-import re
 import time
 import ftplib
+import re
 import threading
 from io import BytesIO
 from datetime import datetime
 from collections import defaultdict
-
-import requests
 from flask import Flask
-from PIL import Image, ImageDraw, ImageFont
+import requests
 
-# Automatyczna instalacja Pillow, jeśli nie jest zainstalowany
-try:
-    from PIL import Image, ImageDraw, ImageFont
-except ImportError:
-    import subprocess
-    subprocess.check_call(["pip", "install", "Pillow"])
-    from PIL import Image, ImageDraw, ImageFont
-
+# === Dane FTP ===
 FTP_HOST = "195.179.226.218"
 FTP_PORT = 56421
 FTP_USER = "gpftp37275281717442833"
 FTP_PASS = "LXNdGShY"
-FTP_DIR = "/SCUM/Saved/SaveFiles/Logs/"
+FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 
-DISCORD_WEBHOOK_FULL = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-DISCORD_WEBHOOK_SHORT = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
-DISCORD_WEBHOOK_PODIUM = "https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3"
+# === Discord Webhooki ===
+DISCORD_WEBHOOK_FULL = 'https://discord.com/api/webhooks/1396227086527762632/HDWBcc5rVBDbimFdh-fuE43iL8inA6YXpLuYG2a4cUmbF8RQyLqtohx-1pWaQMzBzXlf'
+DISCORD_WEBHOOK_SHORT = 'https://discord.com/api/webhooks/1403070347280126132/hcMfNpXKmnnHhdylhvqvqVMnRkqzdztLf0lSQ_Lo9gs2joaqUaU0KQGBmSN8Qp88ZYaH'
+DISCORD_WEBHOOK_PODIUM = 'https://discord.com/api/webhooks/1396229119456448573/PG0jkv4VBlihDwkibrn3jGZ0k516O47iTWb1dziuvoGVKVoqffLqm8GmPLbVHvpJtYhv'
 
-CHECK_INTERVAL = 60
-LOG_ENCODING = "utf-8"
+# === Kolejność zamków ===
+LOCK_ORDER = ['VeryEasy', 'Basic', 'Medium', 'Advanced', 'DialLock']
 
-castle_order = ["VeryEasy", "Basic", "Medium", "Advanced", "DialLock"]
-stats = defaultdict(lambda: defaultdict(lambda: {"success": 0, "fail": 0, "all": 0, "times": []}))
-last_positions = defaultdict(int)
+# === Statystyki globalne ===
+stats = defaultdict(lambda: defaultdict(lambda: {
+    'all': 0,
+    'success': 0,
+    'fail': 0,
+    'total_time': 0.0
+}))
+known_lines = set()
+last_log = None
 
+# === Parsowanie pojedynczej linii loga ===
 def parse_log_line(line):
-    match = re.search(r'\[(.*?)\].*?(.+?) tried to pick (\w+) lock - Success: (\w+) \(([\d.]+)\)', line)
+    match = re.search(r'User: (.+?) \([0-9, ]+\).*?Success: (Yes|No).*?Elapsed time: ([\d.]+).*?Failed attempts: (\d+).*?Lock type: (\w+)', line)
     if match:
-        timestamp = match.group(1)
-        nick = match.group(2)
-        lock_type = match.group(3)
-        success = match.group(4) == "True"
-        elapsed = float(match.group(5).replace(",", ".").replace(" ", "").replace("..", ".").replace("’", "").strip("."))
-        return {"timestamp": timestamp, "nick": nick, "lock": lock_type, "success": success, "elapsed": elapsed}
+        user = match.group(1).strip()
+        success = match.group(2) == "Yes"
+        elapsed_str = match.group(3).rstrip('.')  # usunięcie końcowej kropki, jeśli jest
+        try:
+            elapsed = float(elapsed_str)
+        except ValueError:
+            return None
+        failed_attempts = int(match.group(4))
+        lock_type = match.group(5)
+        return user, lock_type, success, elapsed, failed_attempts
     return None
 
+# === Przetwarzanie linii loga ===
 def process_line(line):
     parsed = parse_log_line(line)
-    if parsed:
-        user = parsed["nick"]
-        lock = parsed["lock"]
-        success = parsed["success"]
-        elapsed = parsed["elapsed"]
+    if not parsed:
+        return
 
-        s = stats[user][lock]
-        if success:
-            s["success"] += 1
-            s["fail"] += s["fail"]
-            s["all"] += 1 + s["fail"]
-        else:
-            s["fail"] += 1
-            s["all"] += 1
-        s["times"].append(elapsed)
+    user, lock, success, elapsed, fail_count = parsed
+    stat = stats[user][lock]
 
+    if success:
+        stat['all'] += 1 + fail_count
+        stat['success'] += 1
+        stat['fail'] += fail_count
+        stat['total_time'] += elapsed
+    else:
+        stat['all'] += fail_count
+        stat['fail'] += fail_count
+
+# === Pobieranie i filtrowanie logów z FTP ===
 def fetch_logs():
+    global last_log
     logs = []
     try:
         with ftplib.FTP() as ftp:
             ftp.connect(FTP_HOST, FTP_PORT)
             ftp.login(FTP_USER, FTP_PASS)
-            ftp.cwd(FTP_DIR)
-            filenames = []
+            ftp.cwd(FTP_LOG_DIR)
 
-            ftp.retrlines('LIST', lambda x: filenames.append(x.split()[-1]))
-            for filename in filenames:
-                if not filename.endswith(".log"):
-                    continue
-                r = []
-                ftp.retrlines(f"RETR {filename}", r.append)
-                logs.append((filename, r))
+            files = []
+
+            def parse_list_line(line):
+                # Przykładowa linia LIST: -rw-r--r-- 1 user group 1234 Jan 01 12:34 gameplay_20250807.log
+                parts = line.split()
+                if len(parts) >= 9:
+                    filename = parts[-1]
+                    files.append(filename)
+
+            ftp.retrlines('LIST', parse_list_line)
+
+            log_files = sorted([f for f in files if f.startswith('gameplay_') and f.endswith('.log')])
+
+            for filename in log_files:
+                bio = BytesIO()
+                ftp.retrbinary(f"RETR {filename}", bio.write)
+                content = bio.getvalue().decode('utf-16le', errors='ignore')
+                logs.append((filename, content))
+
+            if log_files:
+                last_log = log_files[-1]
     except Exception as e:
-        print(f"Błąd FTP: {e}")
+        print(f"[ERROR] Błąd FTP podczas pobierania listy plików: {e}")
     return logs
 
-def generate_table_image(headers, rows, title="Statystyki"):
-    font_path = "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf"
-    font = ImageFont.truetype(font_path, 16)
-
-    padding_x = 20
-    padding_y = 10
-    cell_margin = 5
-
-    column_widths = [max(len(str(cell)) for cell in col) * 10 + padding_x for col in zip(headers, *rows)]
-
-    table_width = sum(column_widths) + cell_margin * (len(headers) + 1)
-    table_height = (len(rows) + 1) * (font.size + padding_y) + 40
-
-    image = Image.new("RGB", (table_width, table_height), "white")
-    draw = ImageDraw.Draw(image)
-
-    y = 20
-    x = cell_margin
-    for i, header in enumerate(headers):
-        draw.text((x, y), header, fill="black", font=font)
-        x += column_widths[i] + cell_margin
-
-    y += font.size + padding_y
-    for row in rows:
-        x = cell_margin
-        for i, cell in enumerate(row):
-            draw.text((x, y), str(cell), fill="black", font=font)
-            x += column_widths[i] + cell_margin
-        y += font.size + padding_y
-
-    output = BytesIO()
-    image.save(output, format="PNG")
-    output.seek(0)
-    return output
-
-def send_to_discord(image_data, webhook_url, filename="tabela.png"):
-    try:
-        files = {'file': (filename, image_data, 'image/png')}
-        response = requests.post(webhook_url, files=files)
-        if response.status_code >= 400:
-            print(f"❌ Błąd wysyłania obrazu do Discord: {response.status_code}")
-    except Exception as e:
-        print(f"❌ Wyjątek przy wysyłce obrazu do Discord: {e}")
-
-def generate_full_table_image():
-    headers = ["Nick"] + [f"{lock}" for lock in castle_order]
+# === Generowanie tabeli pełnej ===
+def generate_full_table():
+    headers = ['Nick', 'Zamek', 'Wszystkie', 'Udane', 'Nieudane', 'Skuteczność', 'Średni czas']
+    col_widths = [max(len(h), 10) for h in headers]
     rows = []
-    for nick, locks in stats.items():
-        row = [nick]
-        for lock in castle_order:
-            s = locks[lock]
-            row.append(f"{s['success']}/{s['all']}")
-        rows.append(row)
-    return generate_table_image(headers, rows, title="Pełna tabela")
 
-def generate_short_table_image():
-    headers = ["Nick", "Zamek", "Skuteczność", "Średni czas"]
-    rows = []
-    for nick, locks in stats.items():
-        for lock in castle_order:
-            s = locks[lock]
-            if s["all"] == 0:
+    for user in sorted(stats.keys()):
+        for lock in LOCK_ORDER:
+            data = stats[user].get(lock)
+            if not data or data['all'] == 0:
                 continue
-            success_rate = round(100 * s["success"] / s["all"], 2)
-            avg_time = round(sum(s["times"]) / len(s["times"]), 2) if s["times"] else 0
-            rows.append([nick, lock, f"{success_rate}%", f"{avg_time}s"])
-    return generate_table_image(headers, rows, title="Skrócona tabela")
+            skutecznosc = f"{(data['success'] / data['all']) * 100:.2f}%"
+            avg_time = f"{(data['total_time'] / data['success']):.2f}s" if data['success'] else "-"
+            row = [user, lock, str(data['all']), str(data['success']), str(data['fail']), skutecznosc, avg_time]
+            rows.append(row)
+            for i, cell in enumerate(row):
+                col_widths[i] = max(col_widths[i], len(cell))
 
-def generate_podium_table_image():
-    headers = ["🏆", "Nick", "Skuteczność"]
-    user_rates = []
-    for nick, locks in stats.items():
-        total_success = sum(s["success"] for s in locks.values())
-        total_all = sum(s["all"] for s in locks.values())
+    header = "| " + " | ".join(h.center(col_widths[i]) for i, h in enumerate(headers)) + " |"
+    separator = "|-" + "-|-".join("-" * col_widths[i] for i in range(len(headers))) + "-|"
+    table_rows = ["| " + " | ".join(row[i].center(col_widths[i]) for i in range(len(row))) + " |" for row in rows]
+    return "\n".join([header, separator] + table_rows) if rows else "| Brak danych |"
+
+# === Generowanie tabeli skróconej ===
+def generate_short_table():
+    headers = ['Nick', 'Zamek', 'Skuteczność', 'Średni czas']
+    col_widths = [max(len(h), 10) for h in headers]
+    rows = []
+
+    for user in sorted(stats.keys()):
+        for lock in LOCK_ORDER:
+            data = stats[user].get(lock)
+            if not data or data['all'] == 0:
+                continue
+            skutecznosc = f"{(data['success'] / data['all']) * 100:.2f}%"
+            avg_time = f"{(data['total_time'] / data['success']):.2f}s" if data['success'] else "-"
+            row = [user, lock, skutecznosc, avg_time]
+            rows.append(row)
+            for i, cell in enumerate(row):
+                col_widths[i] = max(col_widths[i], len(cell))
+
+    header = "| " + " | ".join(h.center(col_widths[i]) for i, h in enumerate(headers)) + " |"
+    separator = "|-" + "-|-".join("-" * col_widths[i] for i in range(len(headers))) + "-|"
+    table_rows = ["| " + " | ".join(row[i].center(col_widths[i]) for i in range(len(row))) + " |" for row in rows]
+    return "\n".join([header, separator] + table_rows) if rows else "| Brak danych |"
+
+# === Generowanie podium ===
+def generate_podium_table():
+    ranking = []
+    for user in stats:
+        total_success = sum(stats[user][lock]['success'] for lock in LOCK_ORDER)
+        total_all = sum(stats[user][lock]['all'] for lock in LOCK_ORDER)
         if total_all == 0:
             continue
-        success_rate = round(100 * total_success / total_all, 2)
-        user_rates.append((nick, success_rate))
-    user_rates.sort(key=lambda x: x[1], reverse=True)
+        skutecznosc = (total_success / total_all) * 100
+        ranking.append((user, skutecznosc))
 
-    medals = ["🥇", "🥈", "🥉"]
+    ranking.sort(key=lambda x: x[1], reverse=True)
+
+    headers = ['🏅', 'Nick', 'Skuteczność']
+    col_widths = [2, 10, 12]
     rows = []
-    for idx, (nick, rate) in enumerate(user_rates):
-        place = medals[idx] if idx < 3 else str(idx + 1)
-        rows.append([place, nick, f"{rate}%"])
-    return generate_table_image(headers, rows[:10], title="Podium")
 
+    for idx, (user, skutecznosc) in enumerate(ranking):
+        emoji = "🥇" if idx == 0 else "🥈" if idx == 1 else "🥉" if idx == 2 else str(idx + 1)
+        row = [emoji, user, f"{skutecznosc:.2f}%"]
+        for i, cell in enumerate(row):
+            col_widths[i] = max(col_widths[i], len(cell))
+        rows.append(row)
+
+    header = "| " + " | ".join(headers[i].center(col_widths[i]) for i in range(3)) + " |"
+    separator = "|-" + "-|-".join("-" * col_widths[i] for i in range(3)) + "-|"
+    table_rows = ["| " + " | ".join(row[i].center(col_widths[i]) for i in range(3)) + " |" for row in rows]
+    return "\n".join([header, separator] + table_rows) if rows else "| Brak danych |"
+
+# === Wysyłanie danych do Discorda ===
+def send_to_discord(table_full, table_short, table_podium):
+    webhooks = [
+        (DISCORD_WEBHOOK_FULL, table_full),
+        (DISCORD_WEBHOOK_SHORT, table_short),
+        (DISCORD_WEBHOOK_PODIUM, table_podium),
+    ]
+    for url, content in webhooks:
+        data = {
+            "content": "```\n" + content + "\n```"
+        }
+        try:
+            r = requests.post(url, json=data, timeout=10)
+            if r.status_code != 204:
+                print(f"[ERROR] Discord HTTP {r.status_code}: {r.text}")
+        except Exception as e:
+            print(f"[ERROR] Discord post failed: {e}")
+
+# === Przetwarzanie logów przy starcie ===
 def process_all_logs():
     print("🔁 Uruchamianie pełnego przetwarzania logów...")
     logs = fetch_logs()
-    for _, lines in logs:
-        for line in lines:
-            process_line(line)
-    send_all_tables()
+    for _, content in logs:
+        for line in content.splitlines():
+            if line not in known_lines:
+                process_line(line)
+                known_lines.add(line)
+    print("[INFO] Przetworzono wszystkie dostępne logi.")
 
-def send_all_tables():
-    send_to_discord(generate_full_table_image(), DISCORD_WEBHOOK_FULL, "pelna.png")
-    send_to_discord(generate_short_table_image(), DISCORD_WEBHOOK_SHORT, "skrocona.png")
-    send_to_discord(generate_podium_table_image(), DISCORD_WEBHOOK_PODIUM, "podium.png")
+    # Generuj i wyślij wszystkie tabele
+    table_full = generate_full_table()
+    table_short = generate_short_table()
+    table_podium = generate_podium_table()
+    print(table_full)
+    print(table_short)
+    print(table_podium)
+    send_to_discord(table_full, table_short, table_podium)
 
-def monitor_new_entries():
-    last_seen = {}
+# === Monitoring nowych wpisów ===
+def background_worker():
+    global last_log
+    print("🔁 Start wątku do monitorowania nowych linii w najnowszym pliku...")
     while True:
         try:
             logs = fetch_logs()
-            for filename, lines in logs:
-                pos = last_seen.get(filename, 0)
-                new_lines = lines[pos:]
-                for line in new_lines:
-                    process_line(line)
-                if new_lines:
-                    last_seen[filename] = len(lines)
-                    send_all_tables()
-        except Exception as e:
-            print(f"⛔ Błąd podczas monitorowania logów: {e}")
-        time.sleep(CHECK_INTERVAL)
+            current_log = None
+            for fname, content in logs:
+                if fname == last_log:
+                    current_log = content
+                    break
+            if current_log:
+                new_lines = []
+                for line in current_log.splitlines():
+                    if line not in known_lines:
+                        known_lines.add(line)
+                        process_line(line)
+                        new_lines.append(line)
 
+                if new_lines:
+                    print(f"[INFO] Wykryto {len(new_lines)} nowych wpisów.")
+                    table_full = generate_full_table()
+                    table_short = generate_short_table()
+                    table_podium = generate_podium_table()
+                    print(table_full)
+                    print(table_short)
+                    print(table_podium)
+                    send_to_discord(table_full, table_short, table_podium)
+        except Exception as e:
+            print(f"[ERROR] Błąd w tle: {e}")
+
+        time.sleep(60)
+
+# === Flask endpoint ===
 app = Flask(__name__)
 
-@app.route("/")
+@app.route("/", methods=["GET"])
 def index():
-    return "SCUM Lockpicking Stats Service"
+    return "Lockpicking stat collector is running."
 
+# === Start aplikacji ===
 if __name__ == "__main__":
-    threading.Thread(target=monitor_new_entries, daemon=True).start()
     process_all_logs()
+    threading.Thread(target=background_worker, daemon=True).start()
     app.run(host="0.0.0.0", port=10000)
