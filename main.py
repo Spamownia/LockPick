@@ -1,5 +1,3 @@
-# Zmiana: dodanie zabezpieczenia przed wielokrotnym deployem (tzn. wysyłką tabel przy starcie i w pętli, jeśli nie ma nowych wpisów)
-
 import os
 import time
 import ftplib
@@ -10,6 +8,8 @@ from datetime import datetime
 from collections import defaultdict
 from flask import Flask
 import requests
+import psycopg2
+import hashlib
 
 # === Dane FTP ===
 FTP_HOST = "195.179.226.218"
@@ -19,9 +19,9 @@ FTP_PASS = "LXNdGShY"
 FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 
 # === Discord Webhooki ===
-DISCORD_WEBHOOK_FULL = 'https://discord.com/api/webhooks/1396227086527762632/HDWBcc5rVBDbimFdh-fuE43iL8inA6YXpLuYG2a4cUmbF8RQyLqtohx-1pWaQMzBzXlf'
-DISCORD_WEBHOOK_SHORT = 'https://discord.com/api/webhooks/1403070347280126132/hcMfNpXKmnnHhdylhvqvqVMnRkqzdztLf0lSQ_Lo9gs2joaqUaU0KQGBmSN8Qp88ZYaH'
-DISCORD_WEBHOOK_PODIUM = 'https://discord.com/api/webhooks/1396229119456448573/PG0jkv4VBlihDwkibrn3jGZ0k516O47iTWb1dziuvoGVKVoqffLqm8GmPLbVHvpJtYhv'
+DISCORD_WEBHOOK_FULL = 'https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3'
+DISCORD_WEBHOOK_SHORT = 'https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3'
+DISCORD_WEBHOOK_PODIUM = 'https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3'
 
 # === Kolejność zamków ===
 LOCK_ORDER = ['VeryEasy', 'Basic', 'Medium', 'Advanced', 'DialLock']
@@ -33,9 +33,108 @@ stats = defaultdict(lambda: defaultdict(lambda: {
     'fail': 0,
     'total_time': 0.0
 }))
-known_lines = set()
+
 last_log = None
 already_deployed_once = False
+
+# --- Konfiguracja bazy Neon ---
+DB_CONFIG = {
+    'host': 'ep-hidden-band-a2ir2x2r-pooler.eu-central-1.aws.neon.tech',
+    'database': 'neondb',
+    'user': 'neondb_owner',
+    'password': 'npg_dRU1YCtxbh6v',
+    'sslmode': 'require'
+}
+
+def get_db_connection():
+    return psycopg2.connect(
+        host=DB_CONFIG['host'],
+        database=DB_CONFIG['database'],
+        user=DB_CONFIG['user'],
+        password=DB_CONFIG['password'],
+        sslmode=DB_CONFIG['sslmode']
+    )
+
+def init_db():
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS logs (
+                id SERIAL PRIMARY KEY,
+                hash TEXT UNIQUE,
+                user_nick TEXT,
+                lock_type TEXT,
+                success BOOLEAN,
+                elapsed FLOAT,
+                fail_count INT,
+                raw_line TEXT,
+                inserted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            """)
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );
+            """)
+        conn.commit()
+
+def line_hash(line: str) -> str:
+    return hashlib.sha256(line.encode('utf-8')).hexdigest()
+
+def is_line_processed(line: str) -> bool:
+    h = line_hash(line)
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM logs WHERE hash = %s", (h,))
+            return cur.fetchone() is not None
+
+def mark_line_processed(line: str, user, lock_type, success, elapsed, fail_count):
+    h = line_hash(line)
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO logs(hash, user_nick, lock_type, success, elapsed, fail_count, raw_line)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (hash) DO NOTHING
+            """, (h, user, lock_type, success, elapsed, fail_count, line))
+        conn.commit()
+
+def load_stats_from_db():
+    global stats
+    stats.clear()
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT user_nick, lock_type, success, elapsed, fail_count FROM logs")
+            rows = cur.fetchall()
+            for user, lock, success, elapsed, fail_count in rows:
+                stat = stats[user][lock]
+                if success:
+                    stat['all'] += 1 + fail_count
+                    stat['success'] += 1
+                    stat['fail'] += fail_count
+                    stat['total_time'] += elapsed
+                else:
+                    stat['all'] += fail_count
+                    stat['fail'] += fail_count
+
+def get_already_deployed_once() -> bool:
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value FROM state WHERE key = 'already_deployed_once'")
+            row = cur.fetchone()
+            if row:
+                return row[0] == '1'
+    return False
+
+def set_already_deployed_once(value: bool):
+    with get_db_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO state(key, value) VALUES ('already_deployed_once', %s)
+                ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """, ('1' if value else '0',))
+        conn.commit()
 
 def parse_log_line(line):
     match = re.search(r'User: (.+?) \([0-9, ]+\).*?Success: (Yes|No).*?Elapsed time: ([\d.]+).*?Failed attempts: (\d+).*?Lock type: (\w+)', line)
@@ -55,8 +154,12 @@ def parse_log_line(line):
 def process_line(line):
     parsed = parse_log_line(line)
     if not parsed:
-        return
+        return False
     user, lock, success, elapsed, fail_count = parsed
+    if is_line_processed(line):
+        return False
+    # Zapis do bazy i lokalna aktualizacja stats
+    mark_line_processed(line, user, lock, success, elapsed, fail_count)
     stat = stats[user][lock]
     if success:
         stat['all'] += 1 + fail_count
@@ -66,6 +169,7 @@ def process_line(line):
     else:
         stat['all'] += fail_count
         stat['fail'] += fail_count
+    return True
 
 def fetch_logs():
     global last_log
@@ -175,15 +279,18 @@ def send_to_discord(table_full, table_short, table_podium):
 
 def process_all_logs():
     print("🔁 Uruchamianie pełnego przetwarzania logów...")
+    init_db()
     logs = fetch_logs()
+    any_new = False
     for _, content in logs:
         for line in content.splitlines():
-            if line not in known_lines:
-                process_line(line)
-                known_lines.add(line)
+            if process_line(line):
+                any_new = True
+    load_stats_from_db()
     print("[INFO] Przetworzono wszystkie dostępne logi.")
     global already_deployed_once
-    if not already_deployed_once:
+    already_deployed_once = get_already_deployed_once()
+    if not already_deployed_once and any_new:
         table_full = generate_full_table()
         table_short = generate_short_table()
         table_podium = generate_podium_table()
@@ -191,6 +298,7 @@ def process_all_logs():
         print(table_short)
         print(table_podium)
         send_to_discord(table_full, table_short, table_podium)
+        set_already_deployed_once(True)
         already_deployed_once = True
 
 def background_worker():
@@ -205,14 +313,13 @@ def background_worker():
                     current_log = content
                     break
             if current_log:
-                new_lines = []
+                new_lines_count = 0
                 for line in current_log.splitlines():
-                    if line not in known_lines:
-                        known_lines.add(line)
-                        process_line(line)
-                        new_lines.append(line)
-                if new_lines:
-                    print(f"[INFO] Wykryto {len(new_lines)} nowych wpisów.")
+                    if process_line(line):
+                        new_lines_count += 1
+                if new_lines_count > 0:
+                    print(f"[INFO] Wykryto {new_lines_count} nowych wpisów.")
+                    load_stats_from_db()
                     table_full = generate_full_table()
                     table_short = generate_short_table()
                     table_podium = generate_podium_table()
