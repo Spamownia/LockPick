@@ -19,9 +19,9 @@ FTP_PASS = "LXNdGShY"
 FTP_LOG_DIR = "/SCUM/Saved/SaveFiles/Logs/"
 
 # === Discord Webhooki ===
-DISCORD_WEBHOOK_FULL = 'https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3'
-DISCORD_WEBHOOK_SHORT = 'https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3'
-DISCORD_WEBHOOK_PODIUM = 'https://discord.com/api/webhooks/1396229686475886704/Mp3CbZdHEob4tqsPSvxWJfZ63-Ao9admHCvX__XdT5c-mjYxizc7tEvb08xigXI5mVy3'
+DISCORD_WEBHOOK_FULL = 'https://discord.com/api/webhooks/1396227086527762632/HDWBcc5rVBDbimFdh-fuE43iL8inA6YXpLuYG2a4cUmbF8RQyLqtohx-1pWaQMzBzXlf'
+DISCORD_WEBHOOK_SHORT = 'https://discord.com/api/webhooks/1403070347280126132/hcMfNpXKmnnHhdylhvqvqVMnRkqzdztLf0lSQ_Lo9gs2joaqUaU0KQGBmSN8Qp88ZYaH'
+DISCORD_WEBHOOK_PODIUM = 'https://discord.com/api/webhooks/1396229119456448573/PG0jkv4VBlihDwkibrn3jGZ0k516O47iTWb1dziuvoGVKVoqffLqm8GmPLbVHvpJtYhv'
 
 # === Kolejność zamków ===
 LOCK_ORDER = ['VeryEasy', 'Basic', 'Medium', 'Advanced', 'DialLock']
